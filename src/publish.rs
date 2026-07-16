@@ -25,6 +25,37 @@ impl PublicationSelection {
     fn any(self) -> bool {
         self.image || self.npm || self.github
     }
+
+    fn from_commands(commands: &[PlannedCommand]) -> Result<Self> {
+        let mut selection = Self::default();
+        for command in commands {
+            if !matches!(command.mutation, MutationKind::RemotePublish) {
+                return Err(ReleaseError::Manifest(
+                    "publication plan contains a non-publishing command".to_owned(),
+                ));
+            }
+            let selected = match command.id.as_str() {
+                "publish-server-image" => &mut selection.image,
+                "publish-npm" => &mut selection.npm,
+                "publish-github" => &mut selection.github,
+                _ => {
+                    return Err(ReleaseError::Manifest(
+                        "publication plan contains an unknown remote command".to_owned(),
+                    ));
+                }
+            };
+            if *selected {
+                return Err(ReleaseError::Manifest(
+                    "publication plan contains a duplicate destination".to_owned(),
+                ));
+            }
+            *selected = true;
+        }
+        if !selection.any() {
+            return Err(ReleaseError::NoPublicationSelected);
+        }
+        Ok(selection)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,7 +118,8 @@ impl PublicationPlan {
     ///
     /// Returns an error when credentials are absent, source repositories are
     /// dirty or mismatched, artifacts are invalid, or a publisher fails.
-    pub fn execute(&self, loaded: &LoadedManifest, selection: PublicationSelection) -> Result<()> {
+    pub fn execute(&self, loaded: &LoadedManifest) -> Result<()> {
+        let selection = PublicationSelection::from_commands(&self.commands)?;
         if selection.image && !self.credentials.docker {
             return Err(ReleaseError::CredentialsUnavailable("Docker registry"));
         }

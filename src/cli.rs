@@ -160,7 +160,7 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let plan = PublicationPlan::create(&loaded, &release_dir, selection)?;
             if execute {
-                plan.execute(&loaded, selection)?;
+                plan.execute(&loaded)?;
             }
             print_json(&plan)?;
         }

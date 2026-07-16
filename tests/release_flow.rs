@@ -122,6 +122,14 @@ fn assemble_generates_binary_archives_npm_wrapper_and_hash_manifest() {
         MutationKind::RemotePublish
     ));
 
+    let mut blocked = preview;
+    blocked.credentials.github = false;
+    blocked.commands[0].program = "dirextalk-test-must-not-execute".to_owned();
+    assert!(matches!(
+        blocked.execute(&loaded),
+        Err(ReleaseError::CredentialsUnavailable("GitHub"))
+    ));
+
     fs::write(
         fixture
             .root
