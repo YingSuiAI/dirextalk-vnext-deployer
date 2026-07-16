@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "release": {
+    "version": "0.1.0-alpha.1",
+    "source_date_epoch": 1784246400
+  },
+  "server": {
+    "repository": "../dirextalk-vnext-server",
+    "dockerfile": "docker/release/Dockerfile",
+    "image": "dirextalk/vent",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ]
+  },
+  "deployer": {
+    "repository": ".",
+    "package": "dirextalk-vnext-deployer",
+    "binary": "dirextalk-vnext-deployer"
+  },
+  "connector": {
+    "repository": "../dirextalk-agent-connector",
+    "module": "./cmd/dirextalk-agent-connector",
+    "binary": "dirextalk-agent-connector"
+  },
+  "targets": [
+    {
+      "id": "windows-x64",
+      "rust_target": "x86_64-pc-windows-gnu",
+      "rust_toolchain": "1.97.0-x86_64-pc-windows-gnu",
+      "rust_native": true,
+      "goos": "windows",
+      "goarch": "amd64",
+      "node_platform": "win32",
+      "node_arch": "x64",
+      "archive": "zip"
+    },
+    {
+      "id": "linux-x64",
+      "rust_target": "x86_64-unknown-linux-gnu",
+      "rust_native": true,
+      "goos": "linux",
+      "goarch": "amd64",
+      "node_platform": "linux",
+      "node_arch": "x64",
+      "archive": "tar_gz"
+    },
+    {
+      "id": "linux-arm64",
+      "rust_target": "aarch64-unknown-linux-gnu",
+      "rust_native": true,
+      "goos": "linux",
+      "goarch": "arm64",
+      "node_platform": "linux",
+      "node_arch": "arm64",
+      "archive": "tar_gz"
+    },
+    {
+      "id": "macos-arm64",
+      "rust_target": "aarch64-apple-darwin",
+      "rust_native": true,
+      "goos": "darwin",
+      "goarch": "arm64",
+      "node_platform": "darwin",
+      "node_arch": "arm64",
+      "archive": "tar_gz"
+    }
+  ],
+  "npm": {
+    "package": "@dirextalk/vnext-deployer",
+    "access": "public"
+  },
+  "github": {
+    "repository": "YingSuiAI/dirextalk-vnext-deployer",
+    "tag_prefix": "v"
+  }
+}

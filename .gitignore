@@ -1,0 +1,16 @@
+/target/
+/artifacts/
+/dist/
+/.codegraph/
+/.idea/
+/.run/
+/.worktrees/
+*.log
+*.tmp
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
