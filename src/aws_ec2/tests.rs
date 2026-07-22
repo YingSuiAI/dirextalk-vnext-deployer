@@ -1,76 +1,132 @@
 use std::{
     fs,
     io::Cursor,
+    path::Path,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::Serialize;
 use serde_json::Value;
 use tempfile::TempDir;
 
 use super::{
     bundle::{InstallRequest, InstalledReceipt, ReceiptState, StackFile, StackManifest, hash},
+    provision::{HostReadyReceipt, ProvisionRequest},
     store::Store,
     *,
 };
 
-const INSTALLER: &str = "dirextalk-vnext-stack/usr/local/libexec/dirextalk/install-vnext";
-const READER: &str = "dirextalk-vnext-stack/usr/local/libexec/dirextalk/read-vnext-receipt";
+const STACK_INSTALLER: &str = "scripts/production-stack/install.sh";
 
-fn append(builder: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32, bytes: &[u8]) {
-    let mut header = tar::Header::new_gnu();
+fn canonical(value: &impl Serialize) -> Vec<u8> {
+    let mut bytes =
+        serde_json::to_vec(&serde_json::to_value(value).expect("value")).expect("canonical JSON");
+    bytes.push(b'\n');
+    bytes
+}
+
+fn append_directory(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mode(0o555);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, format!("{path}/"), Cursor::new([]))
+        .expect("append directory");
+}
+
+fn append_file(builder: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32, bytes: &[u8]) {
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(tar::EntryType::Regular);
     header.set_mode(mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
     header.set_size(u64::try_from(bytes.len()).expect("size"));
     header.set_cksum();
     builder
         .append_data(&mut header, path, Cursor::new(bytes))
-        .expect("append fixture");
+        .expect("append file");
 }
 
-fn fixture(version: &str, server_digest: char) -> (TempDir, AwsEc2Manifest) {
+fn fixture_with_directories(
+    version: &str,
+    server_digest: char,
+    include_all_directories: bool,
+) -> (TempDir, AwsEc2Manifest) {
     let dir = TempDir::new().expect("tempdir");
-    let installer = b"#!/bin/sh\nexit 0\n";
-    let reader = b"#!/bin/sh\nexit 0\n";
-    let mut files = vec![
+    let stack_installer = b"#!/bin/sh\nexit 0\n";
+    let compose = b"services: {}\n";
+    let host_installer = b"#!/usr/bin/env python3\nprint('install')\n";
+    let host_provisioner = b"#!/usr/bin/env python3\nprint('provision')\n";
+    let receipt_reader = b"#!/usr/bin/env python3\nprint('{}')\n";
+    let files = vec![
         StackFile {
-            path: INSTALLER.into(),
-            sha256: hash(installer),
-            mode: 0o555,
+            path: "docker/production/docker-compose.yml".into(),
+            sha256: hash(compose),
+            mode: "0444".into(),
         },
         StackFile {
-            path: READER.into(),
-            sha256: hash(reader),
-            mode: 0o555,
+            path: STACK_INSTALLER.into(),
+            sha256: hash(stack_installer),
+            mode: "0555".into(),
         },
     ];
-    files.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest = StackManifest {
         schema: "dirextalk.vnext-stack-bundle".into(),
         schema_version: 1,
         version: version.into(),
         source_commit: "d".repeat(40),
         target: "linux-amd64".into(),
-        server: format!(
+        server_image: format!(
             "dirextalk/vnet-server@sha256:{}",
             server_digest.to_string().repeat(64)
         ),
-        migrator: format!("dirextalk/vnet-server@sha256:{}", "c".repeat(64)),
-        installer_sha256: hash(installer),
+        migrator_image: format!("dirextalk/vnet-server@sha256:{}", "c".repeat(64)),
+        installer_sha256: hash(stack_installer),
         files,
     };
-    let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest");
     let mut tar = tar::Builder::new(Vec::new());
-    append(&mut tar, INSTALLER, 0o555, installer);
-    append(&mut tar, READER, 0o555, reader);
-    append(
+    append_directory(&mut tar, "dirextalk-vnext-stack");
+    if include_all_directories {
+        append_directory(&mut tar, "dirextalk-vnext-stack/docker");
+        append_directory(&mut tar, "dirextalk-vnext-stack/docker/production");
+        append_directory(&mut tar, "dirextalk-vnext-stack/scripts");
+        append_directory(&mut tar, "dirextalk-vnext-stack/scripts/production-stack");
+    }
+    append_file(
         &mut tar,
         "dirextalk-vnext-stack/manifest.json",
         0o444,
-        &manifest_bytes,
+        &canonical(&manifest),
     );
-    let bytes = tar.into_inner().expect("tar");
-    let bundle_path = dir.path().join("vnext.tar");
-    fs::write(&bundle_path, &bytes).expect("bundle");
+    append_file(
+        &mut tar,
+        "dirextalk-vnext-stack/docker/production/docker-compose.yml",
+        0o444,
+        compose,
+    );
+    append_file(
+        &mut tar,
+        "dirextalk-vnext-stack/scripts/production-stack/install.sh",
+        0o555,
+        stack_installer,
+    );
+    let bundle = tar.into_inner().expect("tar");
+    let bundle_path = dir.path().join("dirextalk-vnext.bundle");
+    let host_installer_path = dir.path().join("install-vnext");
+    let host_provisioner_path = dir.path().join("provision-vnext");
+    let receipt_reader_path = dir.path().join("read-vnext-receipt");
+    fs::write(&bundle_path, &bundle).expect("bundle");
+    fs::write(&host_installer_path, host_installer).expect("host installer");
+    fs::write(&host_provisioner_path, host_provisioner).expect("host provisioner");
+    fs::write(&receipt_reader_path, receipt_reader).expect("receipt reader");
     let outer = AwsEc2Manifest {
         schema_version: 1,
         target: "x6".into(),
@@ -80,17 +136,30 @@ fn fixture(version: &str, server_digest: char) -> (TempDir, AwsEc2Manifest) {
         instance_type: "t3.small".into(),
         disk_gib: 30,
         operator_ssh_cidr: "203.0.113.9/32".into(),
-        stack_bundle_sha256: hash(&bytes),
+        stack_bundle_sha256: hash(&bundle),
         stack_bundle_path: bundle_path,
+        host_installer_path,
+        host_installer_sha256: hash(host_installer),
+        host_provisioner_path,
+        host_provisioner_sha256: hash(host_provisioner),
+        receipt_reader_path,
+        receipt_reader_sha256: hash(receipt_reader),
         release_version: version.into(),
         source_commit: "d".repeat(40),
-        server_image: manifest.server,
-        migrator_image: manifest.migrator,
+        server_image: manifest.server_image,
+        migrator_image: manifest.migrator_image,
+        postgres_image: format!("postgres@sha256:{}", "1".repeat(64)),
+        caddy_image: format!("caddy@sha256:{}", "2".repeat(64)),
+        probe_image: format!("curlimages/curl@sha256:{}", "3".repeat(64)),
         ubuntu_ami_owner: UBUNTU_OWNER.into(),
         ubuntu_ami_pattern: UBUNTU_PATTERN.into(),
         key_name: "x6-key".into(),
     };
     (dir, outer)
+}
+
+fn fixture(version: &str, server_digest: char) -> (TempDir, AwsEc2Manifest) {
+    fixture_with_directories(version, server_digest, true)
 }
 
 struct Never(AtomicUsize);
@@ -141,15 +210,14 @@ fn receipt_for(request: &InstallRequest, state: ReceiptState) -> InstalledReceip
         server_image: request.server_image.clone(),
         migrator_image: request.migrator_image.clone(),
         previous_receipt_sha256: request.previous_receipt_sha256.clone(),
-        installed_at_ms: 1,
+        installed_at_ms: 0,
         receipt_sha256: String::new(),
     };
-    let mut canonical: Value = serde_json::to_value(&receipt).expect("value");
-    canonical
-        .as_object_mut()
+    let mut body: Value = serde_json::to_value(&receipt).expect("value");
+    body.as_object_mut()
         .expect("object")
         .remove("receipt_sha256");
-    receipt.receipt_sha256 = hash(&serde_json::to_vec(&canonical).expect("canonical"));
+    receipt.receipt_sha256 = hash(&canonical(&body));
     receipt
 }
 
@@ -158,18 +226,29 @@ fn bundle_manifest_and_dry_run_are_digest_bound_without_effects() {
     let (dir, manifest) = fixture("1.2.3", 'a');
     let plan = plan(&manifest, Some(100)).expect("plan");
     assert_eq!(plan.region, REGION);
-    assert_eq!(plan.ingress.len(), 3);
+    assert_eq!(plan.ingress.len(), 4);
+    assert!(plan.ingress.iter().any(|rule| rule.from_port == 80));
     assert!(
         plan.ingress
             .iter()
-            .any(|rule| { rule.from_port == 22 && rule.cidr == "203.0.113.9/32" })
+            .any(|rule| rule.from_port == 22 && rule.cidr == "203.0.113.9/32")
     );
     let executor = Never(AtomicUsize::new(0));
     let state =
-        apply(&manifest, &dir.path().join("state"), 100, false, &executor).expect("dry-run state");
+        apply(&manifest, &dir.path().join("state"), 100, false, &executor).expect("dry run");
     assert_eq!(state.phase, LifecyclePhase::Planned);
     assert_eq!(executor.0.load(Ordering::Relaxed), 0);
     state.verify().expect("integrity-sealed state");
+}
+
+#[test]
+fn missing_derived_directory_and_helper_tamper_fail_closed() {
+    let (_dir, missing_directory) = fixture_with_directories("1.2.3", 'a', false);
+    assert!(missing_directory.bundle().is_err());
+
+    let (_dir, helper_tamper) = fixture("1.2.3", 'a');
+    fs::write(&helper_tamper.host_installer_path, b"tampered").expect("tamper helper");
+    assert!(helper_tamper.bundle().is_err());
 }
 
 #[test]
@@ -219,18 +298,22 @@ fn registry_failures_are_classified_without_echoing_secrets() {
 }
 
 #[test]
-fn receipt_is_bound_to_request_and_canonical_self_hash() {
+fn request_and_receipt_match_canonical_host_contract() {
     let (_dir, manifest) = fixture("1.2.3", 'a');
     let facts = manifest.bundle().expect("facts");
-    let request = InstallRequest::new("x6", "x6.example.invalid", &facts, None);
+    let request = InstallRequest::new("x6.example.invalid", &facts, None);
+    assert_eq!(request.target, "linux-amd64");
+    assert_eq!(
+        request.canonical_bytes().expect("request"),
+        canonical(&request)
+    );
     let mut receipt = receipt_for(&request, ReceiptState::Installed);
-    let bytes = serde_json::to_vec(&receipt).expect("receipt");
-    InstalledReceipt::parse_and_verify(&bytes, &request, ReceiptState::Installed)
+    InstalledReceipt::parse_and_verify(&canonical(&receipt), &request, ReceiptState::Installed)
         .expect("valid receipt");
     receipt.server_image = format!("dirextalk/vnet-server@sha256:{}", "f".repeat(64));
     assert!(
         InstalledReceipt::parse_and_verify(
-            &serde_json::to_vec(&receipt).expect("bad receipt"),
+            &canonical(&receipt),
             &request,
             ReceiptState::Installed,
         )
@@ -239,15 +322,105 @@ fn receipt_is_bound_to_request_and_canonical_self_hash() {
 }
 
 #[test]
+fn provision_request_and_ready_receipt_are_exact_and_self_authenticating() {
+    let (dir, manifest) = fixture("1.2.3", 'a');
+    let facts = manifest.bundle().expect("facts");
+    let mut state = apply(
+        &manifest,
+        &dir.path().join("state"),
+        100,
+        false,
+        &Never(AtomicUsize::new(0)),
+    )
+    .expect("dry state");
+    state.private_ipv4 = Some("10.0.0.7".into());
+    let request = ProvisionRequest::new(&manifest, &state, &facts).expect("request");
+    let request_bytes = request.canonical_bytes().expect("canonical request");
+    assert_eq!(request_bytes, canonical(&request));
+    assert_eq!(
+        ProvisionRequest::parse_and_verify(&request_bytes).expect("parsed request"),
+        request
+    );
+    assert_eq!(request.target, "x6");
+    assert_eq!(request.private_ipv4, "10.0.0.7");
+
+    let mut ready = HostReadyReceipt {
+        schema: "dirextalk.vnext-host-provision-ready".into(),
+        schema_version: 1,
+        state: "ready".into(),
+        request_sha256: request.sha256().expect("request digest"),
+        target: request.target.clone(),
+        domain: request.domain.clone(),
+        tenant_id: request.tenant_id.clone(),
+        indexer_id: request.indexer_id.clone(),
+        release_version: request.release_version.clone(),
+        bundle_sha256: request.bundle_sha256.clone(),
+        compose_sha256: request.compose_sha256.clone(),
+        receipt_sha256: String::new(),
+    };
+    let mut body = serde_json::to_value(&ready).expect("receipt body");
+    body.as_object_mut()
+        .expect("receipt object")
+        .remove("receipt_sha256");
+    ready.receipt_sha256 = hash(&canonical(&body));
+    HostReadyReceipt::parse_and_verify(&canonical(&ready), &request).expect("ready receipt");
+    ready.compose_sha256 = "f".repeat(64);
+    assert!(HostReadyReceipt::parse_and_verify(&canonical(&ready), &request).is_err());
+}
+
+#[test]
+fn cloud_init_fits_ec2_limit_and_contains_no_helpers_or_provision_secrets() {
+    let (dir, manifest) = fixture("1.2.3", 'a');
+    let facts = manifest.bundle().expect("facts");
+    let mut state = apply(
+        &manifest,
+        &dir.path().join("state"),
+        100,
+        false,
+        &Never(AtomicUsize::new(0)),
+    )
+    .expect("dry state");
+    state.ami = Some(AmiRecord {
+        image_id: "ami-0123456789abcdef0".into(),
+        name: "ubuntu-noble".into(),
+        creation_date: "2026-01-01T00:00:00Z".into(),
+        owner_id: UBUNTU_OWNER.into(),
+        architecture: "x86_64".into(),
+        root_device_type: "ebs".into(),
+        virtualization_type: "hvm".into(),
+    });
+    let user_data = workflow::cloud_init(&state).expect("cloud-init");
+    assert!(user_data.len() <= 16 * 1024);
+    for helper in [
+        &facts.host_installer,
+        &facts.host_provisioner,
+        &facts.receipt_reader,
+    ] {
+        assert!(!user_data.contains(&STANDARD.encode(helper)));
+        assert!(!user_data.contains(std::str::from_utf8(helper).expect("fixture helper UTF-8")));
+    }
+    for forbidden in [
+        REMOTE_INSTALLER,
+        REMOTE_PROVISIONER,
+        REMOTE_RECEIPT_READER,
+        state.tenant_id.as_str(),
+        state.indexer_id.as_str(),
+        state.domain.as_str(),
+    ] {
+        assert!(!user_data.contains(forbidden));
+    }
+}
+
+#[test]
 fn update_uses_explicit_digest_and_cross_version_fails_closed() {
     let (old_dir, old) = fixture("1.2.3", 'a');
     let old_facts = old.bundle().expect("old facts");
-    let old_request = InstallRequest::new("x6", "x6.example.invalid", &old_facts, None);
+    let old_request = InstallRequest::new("x6.example.invalid", &old_facts, None);
     let state_dir = old_dir.path().join("state");
     let mut state =
         apply(&old, &state_dir, 100, false, &Never(AtomicUsize::new(0))).expect("state");
     state.account_id = Some("123456789012".into());
-    state.current = Some(BundleRecord::from_facts(&old_facts));
+    state.current = Some(BundleRecord::from_facts(&old_facts, &old));
     state.current_receipt = Some(receipt_for(&old_request, ReceiptState::Installed));
     state.current_bundle_suffix = Some("current.bundle".into());
     state.current_request_suffix = Some("current.request".into());
@@ -268,6 +441,61 @@ fn update_uses_explicit_digest_and_cross_version_fails_closed() {
         error
             .to_string()
             .contains("cross-version update is unsupported")
+    );
+}
+
+#[test]
+fn real_server_bundle_5bf0090_parses_and_plans() {
+    let server = Path::new("/home/adam/dirextalk/dirextalk-vnext-server");
+    let bundle = server.join("target/production-release/dirextalk-vnext.bundle");
+    let installer = server.join("scripts/production-stack/host/install-vnext");
+    let reader = server.join("scripts/production-stack/host/read-vnext-receipt");
+    let provisioner = server.join("scripts/production-stack/host/provision-vnext");
+    assert!(bundle.is_file() && installer.is_file() && provisioner.is_file() && reader.is_file());
+    let manifest = AwsEc2Manifest {
+        schema_version: 1,
+        target: "x6".into(),
+        provider: PROVIDER.into(),
+        region: REGION.into(),
+        domain: "x6.example.invalid".into(),
+        instance_type: "t3.small".into(),
+        disk_gib: 30,
+        operator_ssh_cidr: "203.0.113.9/32".into(),
+        stack_bundle_sha256:
+            "5539fe5a2c1a836e352fcf6216378ca10391de6dcd8821240d3e50c1db2a2275".into(),
+        stack_bundle_path: bundle,
+        host_installer_path: installer,
+        host_installer_sha256:
+            "7deda8b33531bef1f1564f0b68b07ff12d6a2deceaf312cf98529998a207cc84".into(),
+        host_provisioner_path: provisioner,
+        host_provisioner_sha256:
+            "21a67bea150a2466a7ce22f0f2cdb234fde901539ea62a18a1471616b3e645c3".into(),
+        receipt_reader_path: reader,
+        receipt_reader_sha256:
+            "0d4ddcc5fdf4906d010a441c33031a1c16530f5d6ab3e66db005c1c7f7b8f17b".into(),
+        release_version: "0.1.0".into(),
+        source_commit: "5bf0090621c90a68936ecf174e96a0e20654f688".into(),
+        server_image:
+            "dirextalk/vnet-server@sha256:c396239cd8df60fef0c7e1e320f03c032fc634febfdee4e3700c122518698e74".into(),
+        migrator_image:
+            "dirextalk/vnet-server@sha256:7f630952d9651db0b3a488ea174de6eb6f5d75a2d35a8e27343b51ffd0a3cc5e".into(),
+        postgres_image:
+            "postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15".into(),
+        caddy_image:
+            "caddy@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c".into(),
+        probe_image:
+            "curlimages/curl@sha256:9a1ed35addb45476afa911696297f8e115993df459278ed036182dd2cd22b67b".into(),
+        ubuntu_ami_owner: UBUNTU_OWNER.into(),
+        ubuntu_ami_pattern: UBUNTU_PATTERN.into(),
+        key_name: "x6-key".into(),
+    };
+    assert_eq!(
+        manifest.bundle().expect("real bundle").manifest.files.len(),
+        17
+    );
+    assert_eq!(
+        plan(&manifest, Some(100)).expect("real plan").ingress.len(),
+        4
     );
 }
 

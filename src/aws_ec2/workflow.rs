@@ -9,14 +9,16 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::bundle::{
-    BundleFacts, InstallRequest, InstalledReceipt, hash, installer_base64, receipt_reader_base64,
-};
+use super::bundle::{BundleFacts, InstallRequest, InstalledReceipt, hash};
+use super::provision::{HostReadyReceipt, ProvisionRequest};
 use super::store::Store;
 use super::{
     AWS, AmiRecord, AwsEc2Manifest, AwsExecutor, BundleRecord, CURL, Ec2State, EipRecord,
     FixedCommand, GETENT, HEALTH_PATH, HostKeyRecord, InfrastructureRecord, KeyRecord,
-    LifecyclePhase, OwnedRecordSet, REGION, REMOTE_BUNDLE, REMOTE_INSTALLER, REMOTE_RECEIPT_READER,
+    LifecyclePhase, OwnedRecordSet, REGION, REMOTE_BUNDLE, REMOTE_INSTALLER,
+    REMOTE_INSTALLER_ATOMIC, REMOTE_INSTALLER_UPLOAD, REMOTE_PROVISION_REQUEST, REMOTE_PROVISIONER,
+    REMOTE_PROVISIONER_ATOMIC, REMOTE_PROVISIONER_UPLOAD, REMOTE_READY_RECEIPT,
+    REMOTE_RECEIPT_READER, REMOTE_RECEIPT_READER_ATOMIC, REMOTE_RECEIPT_READER_UPLOAD,
     REMOTE_REQUEST, ReceiptState, RegistryExecutor, SCP, SSH, SSH_KEYGEN, SSH_KEYSCAN,
     StatusReport, UBUNTU_OWNER, UBUNTU_PATTERN, VerifyReport, contract, enforce_cost_guard,
     expected_tags, resolve_latest_digest,
@@ -34,6 +36,7 @@ const USER_DATA_SUFFIX: &str = "cloud-init.yaml";
 const PRIVATE_KEY_SUFFIX: &str = "id_ed25519";
 const PUBLIC_KEY_SUFFIX: &str = "id_ed25519.pub";
 const KNOWN_HOSTS_SUFFIX: &str = "known_hosts";
+const PROVISION_REQUEST_SUFFIX: &str = "current.provision";
 
 pub fn apply(
     manifest: &AwsEc2Manifest,
@@ -62,12 +65,16 @@ pub fn apply(
     resolve_ami(&store, &mut state, executor)?;
     ensure_key(&store, &mut state, manifest, executor)?;
     ensure_security_group(&store, &mut state, manifest, executor)?;
-    ensure_instance(&store, &mut state, manifest, &facts, executor)?;
+    ensure_instance(&store, &mut state, manifest, executor)?;
     ensure_eip(&store, &mut state, executor)?;
     ensure_dns(&store, &mut state, executor)?;
     ensure_host_key(&store, &mut state, executor)?;
+    ensure_host_helpers(&store, &mut state, manifest, &facts, executor)?;
     if state.current.is_none() {
         install_initial(&store, &mut state, manifest, &facts, executor)?;
+    }
+    if state.host_ready_receipt.is_none() {
+        provision_initial(&store, &mut state, manifest, &facts, executor)?;
     }
     let report = verify_live_locked(&store, &mut state, manifest, executor)?;
     state.phase = LifecyclePhase::Verified;
@@ -105,11 +112,13 @@ fn new_state(
         account_id: None,
         region: REGION.into(),
         domain: manifest.domain.clone(),
+        tenant_id: Uuid::now_v7().to_string(),
+        indexer_id: Uuid::now_v7().to_string(),
         ownership_tags,
         monthly_estimate_cents: estimate,
         max_monthly_usd,
         infrastructure: InfrastructureRecord::from_manifest(manifest),
-        desired: BundleRecord::from_facts(facts),
+        desired: BundleRecord::from_facts(facts, manifest),
         current: None,
         previous: None,
         ami: None,
@@ -117,6 +126,7 @@ fn new_state(
         vpc_id: None,
         security_group_id: None,
         instance_id: None,
+        private_ipv4: None,
         volume_id: None,
         eip: None,
         dns: None,
@@ -124,10 +134,12 @@ fn new_state(
         current_receipt: None,
         previous_receipt: None,
         rollback_receipt: None,
+        host_ready_receipt: None,
         current_bundle_suffix: None,
         current_request_suffix: None,
         previous_bundle_suffix: None,
         previous_request_suffix: None,
+        provision_request_suffix: None,
         phase: LifecyclePhase::Planned,
         pending_effect: None,
         retained_volume: false,
@@ -145,7 +157,7 @@ fn ensure_apply_identity(
         || state.region != manifest.region
         || state.domain != manifest.domain
         || state.infrastructure != InfrastructureRecord::from_manifest(manifest)
-        || state.desired != BundleRecord::from_facts(facts)
+        || state.desired != BundleRecord::from_facts(facts, manifest)
         || state
             .key
             .as_ref()
@@ -647,6 +659,7 @@ fn describe_owned_security_groups(
 
 fn ingress_permissions(manifest: &AwsEc2Manifest) -> Value {
     json!([
+        {"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk ACME HTTP challenge"}]},
         {"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk public HTTPS"}]},
         {"IpProtocol":"tcp","FromPort":9443,"ToPort":9445,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk Agent Control TLS"}]},
         {"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":manifest.operator_ssh_cidr,"Description":"Dirextalk operator SSH"}]}
@@ -713,12 +726,11 @@ fn ensure_instance(
     store: &Store,
     state: &mut Ec2State,
     manifest: &AwsEc2Manifest,
-    facts: &BundleFacts,
     executor: &dyn AwsExecutor,
 ) -> Result<()> {
     let mut instances = describe_owned_instances(state, executor)?;
     if instances.is_empty() {
-        let user_data = cloud_init(state, facts)?;
+        let user_data = cloud_init(state)?;
         let user_data_path = store.write_artifact(USER_DATA_SUFFIX, user_data.as_bytes(), 0o600)?;
         let ami = state
             .ami
@@ -795,6 +807,13 @@ fn ensure_instance(
         return Err(ReleaseError::OperationConflict);
     }
     let instance_id = json_string(instance, "InstanceId")?;
+    let private_ipv4 = json_string(instance, "PrivateIpAddress")?;
+    if !private_ipv4
+        .parse::<Ipv4Addr>()
+        .is_ok_and(|address| address.is_private())
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
     let mappings = instance["BlockDeviceMappings"]
         .as_array()
         .filter(|items| items.len() == 1)
@@ -809,6 +828,7 @@ fn ensure_instance(
         .ok_or_else(|| contract("instance root volume is missing"))?
         .to_owned();
     state.instance_id = Some(instance_id.clone());
+    state.private_ipv4 = Some(private_ipv4);
     state.volume_id = Some(volume_id.clone());
     persist(store, state)?;
     for (id, waiter) in [
@@ -884,7 +904,7 @@ fn describe_owned_instances(state: &Ec2State, executor: &dyn AwsExecutor) -> Res
         .collect())
 }
 
-fn cloud_init(state: &Ec2State, facts: &BundleFacts) -> Result<String> {
+pub(super) fn cloud_init(state: &Ec2State) -> Result<String> {
     let ami = state
         .ami
         .as_ref()
@@ -903,16 +923,9 @@ printf 'DTXHK01 %s {} {} %s %s\n' "$INSTANCE" "$KEY" "$KEYSHA" > /dev/console
 "#,
         state.client_token_sha256, ami.image_id
     );
-    let tool_record = json!({
-        "installer_sha256": facts.manifest.installer_sha256,
-        "receipt_reader_sha256": facts.receipt_reader_sha256,
-    });
     Ok(format!(
-        "#cloud-config\npackage_update: true\npackages:\n  - ca-certificates\n  - curl\n  - zstd\nwrite_files:\n  - path: {REMOTE_INSTALLER}\n    owner: root:root\n    permissions: '0555'\n    encoding: b64\n    content: {}\n  - path: {REMOTE_RECEIPT_READER}\n    owner: root:root\n    permissions: '0555'\n    encoding: b64\n    content: {}\n  - path: /usr/local/libexec/dirextalk/attest-vnext-host-key\n    owner: root:root\n    permissions: '0555'\n    encoding: b64\n    content: {}\n  - path: /var/lib/dirextalk/bootstrap-tools.json\n    owner: root:root\n    permissions: '0444'\n    encoding: b64\n    content: {}\nruncmd:\n  - [ /usr/local/libexec/dirextalk/attest-vnext-host-key ]\n",
-        installer_base64(facts),
-        receipt_reader_base64(facts),
+        "#cloud-config\npackage_update: true\npackages:\n  - ca-certificates\n  - curl\n  - docker.io\n  - docker-compose-v2\n  - openssl\nwrite_files:\n  - path: /usr/local/libexec/dirextalk/attest-vnext-host-key\n    owner: root:root\n    permissions: '0555'\n    encoding: b64\n    content: {}\nruncmd:\n  - [ /usr/bin/systemctl, enable, --now, docker.service ]\n  - [ /usr/local/libexec/dirextalk/attest-vnext-host-key ]\n",
         STANDARD.encode(attestor.as_bytes()),
-        STANDARD.encode(serde_json::to_vec(&tool_record)?),
     ))
 }
 
@@ -1368,6 +1381,428 @@ fn decode_canonical_base64(value: &str, name: &str) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
+struct HostHelperSpec<'a> {
+    label: &'static str,
+    local: &'a Path,
+    sha256: &'a str,
+    size: usize,
+    upload: &'static str,
+    upload_name: &'static str,
+    atomic: &'static str,
+    atomic_name: &'static str,
+    installed: &'static str,
+    installed_name: &'static str,
+}
+
+struct RemoteFileMetadata {
+    kind: String,
+    owner: String,
+    group: String,
+    mode: String,
+    links: String,
+    size: usize,
+    path: String,
+}
+
+fn ensure_host_helpers(
+    store: &Store,
+    state: &mut Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let helpers = [
+        HostHelperSpec {
+            label: "host-installer",
+            local: &manifest.host_installer_path,
+            sha256: &facts.host_installer_sha256,
+            size: facts.host_installer.len(),
+            upload: REMOTE_INSTALLER_UPLOAD,
+            upload_name: "install-vnext.upload",
+            atomic: REMOTE_INSTALLER_ATOMIC,
+            atomic_name: ".install-vnext.new",
+            installed: REMOTE_INSTALLER,
+            installed_name: "install-vnext",
+        },
+        HostHelperSpec {
+            label: "host-provisioner",
+            local: &manifest.host_provisioner_path,
+            sha256: &facts.host_provisioner_sha256,
+            size: facts.host_provisioner.len(),
+            upload: REMOTE_PROVISIONER_UPLOAD,
+            upload_name: "provision-vnext.upload",
+            atomic: REMOTE_PROVISIONER_ATOMIC,
+            atomic_name: ".provision-vnext.new",
+            installed: REMOTE_PROVISIONER,
+            installed_name: "provision-vnext",
+        },
+        HostHelperSpec {
+            label: "receipt-reader",
+            local: &manifest.receipt_reader_path,
+            sha256: &facts.receipt_reader_sha256,
+            size: facts.receipt_reader.len(),
+            upload: REMOTE_RECEIPT_READER_UPLOAD,
+            upload_name: "read-vnext-receipt.upload",
+            atomic: REMOTE_RECEIPT_READER_ATOMIC,
+            atomic_name: ".read-vnext-receipt.new",
+            installed: REMOTE_RECEIPT_READER,
+            installed_name: "read-vnext-receipt",
+        },
+    ];
+    for helper in &helpers {
+        ensure_host_helper(store, state, helper, executor)?;
+    }
+    Ok(())
+}
+
+fn ensure_host_helper(
+    store: &Store,
+    state: &mut Ec2State,
+    helper: &HostHelperSpec<'_>,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    if let Some(metadata) = inspect_remote_file(
+        state,
+        store,
+        executor,
+        &format!("inspect-installed-{}", helper.label),
+        "/usr/local/libexec/dirextalk",
+        helper.installed_name,
+    )? {
+        require_remote_metadata(
+            &metadata,
+            helper.installed,
+            "root",
+            "root",
+            "555",
+            helper.size,
+        )?;
+        verify_remote_helper_hash(
+            state,
+            store,
+            executor,
+            &format!("verify-installed-{}", helper.label),
+            helper.installed,
+            helper.sha256,
+            true,
+        )?;
+        return Ok(());
+    }
+
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            &format!("clear-upload-{}", helper.label),
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/rm",
+                "--force",
+                "--",
+                helper.upload,
+            ],
+            true,
+            30,
+        )?,
+        executor,
+    )?;
+    run_effect(
+        store,
+        state,
+        &scp_command(
+            &format!("stage-{}", helper.label),
+            state,
+            store,
+            helper.local,
+            helper.upload,
+        )?,
+        executor,
+    )?;
+    let uploaded = inspect_remote_file(
+        state,
+        store,
+        executor,
+        &format!("inspect-uploaded-{}", helper.label),
+        "/home/ubuntu",
+        helper.upload_name,
+    )?
+    .ok_or(ReleaseError::OperationConflict)?;
+    if uploaded.kind != "f"
+        || uploaded.owner != "ubuntu"
+        || uploaded.group != "ubuntu"
+        || uploaded.links != "1"
+        || uploaded.size != helper.size
+        || uploaded.path != helper.upload
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    verify_remote_helper_hash(
+        state,
+        store,
+        executor,
+        &format!("verify-uploaded-{}", helper.label),
+        helper.upload,
+        helper.sha256,
+        false,
+    )?;
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            &format!("protect-uploaded-{}", helper.label),
+            state,
+            store,
+            ["/usr/bin/chmod", "0400", helper.upload],
+            true,
+            30,
+        )?,
+        executor,
+    )?;
+    let protected = inspect_remote_file(
+        state,
+        store,
+        executor,
+        &format!("inspect-protected-{}", helper.label),
+        "/home/ubuntu",
+        helper.upload_name,
+    )?
+    .ok_or(ReleaseError::OperationConflict)?;
+    require_remote_metadata(
+        &protected,
+        helper.upload,
+        "ubuntu",
+        "ubuntu",
+        "400",
+        helper.size,
+    )?;
+
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            &format!("clear-atomic-{}", helper.label),
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/rm",
+                "--force",
+                "--",
+                helper.atomic,
+            ],
+            true,
+            30,
+        )?,
+        executor,
+    )?;
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            &format!("prepare-atomic-{}", helper.label),
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/install",
+                "--owner=root",
+                "--group=root",
+                "--mode=0555",
+                "--no-target-directory",
+                helper.upload,
+                helper.atomic,
+            ],
+            true,
+            30,
+        )?,
+        executor,
+    )?;
+    let atomic = inspect_remote_file(
+        state,
+        store,
+        executor,
+        &format!("inspect-atomic-{}", helper.label),
+        "/usr/local/libexec/dirextalk",
+        helper.atomic_name,
+    )?
+    .ok_or(ReleaseError::OperationConflict)?;
+    require_remote_metadata(&atomic, helper.atomic, "root", "root", "555", helper.size)?;
+    verify_remote_helper_hash(
+        state,
+        store,
+        executor,
+        &format!("verify-atomic-{}", helper.label),
+        helper.atomic,
+        helper.sha256,
+        true,
+    )?;
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            &format!("activate-{}", helper.label),
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/mv",
+                "--no-clobber",
+                "--no-target-directory",
+                "--",
+                helper.atomic,
+                helper.installed,
+            ],
+            true,
+            30,
+        )?,
+        executor,
+    )?;
+    let installed = inspect_remote_file(
+        state,
+        store,
+        executor,
+        &format!("reconcile-installed-{}", helper.label),
+        "/usr/local/libexec/dirextalk",
+        helper.installed_name,
+    )?
+    .ok_or(ReleaseError::OperationConflict)?;
+    require_remote_metadata(
+        &installed,
+        helper.installed,
+        "root",
+        "root",
+        "555",
+        helper.size,
+    )?;
+    verify_remote_helper_hash(
+        state,
+        store,
+        executor,
+        &format!("reconcile-hash-{}", helper.label),
+        helper.installed,
+        helper.sha256,
+        true,
+    )
+}
+
+fn inspect_remote_file(
+    state: &Ec2State,
+    store: &Store,
+    executor: &dyn AwsExecutor,
+    id: &str,
+    parent: &str,
+    name: &str,
+) -> Result<Option<RemoteFileMetadata>> {
+    let output = executor.run(&ssh_command(
+        id,
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/find",
+            parent,
+            "-maxdepth",
+            "1",
+            "-mindepth",
+            "1",
+            "-name",
+            name,
+            "-printf",
+            "%y %U %G %m %n %s %p\\n",
+        ],
+        false,
+        30,
+    )?)?;
+    let trimmed = output.stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.lines().count() != 1 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let fields = trimmed.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 7 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let size = fields[5]
+        .parse::<usize>()
+        .map_err(|_| ReleaseError::OperationConflict)?;
+    Ok(Some(RemoteFileMetadata {
+        kind: fields[0].to_owned(),
+        owner: fields[1].to_owned(),
+        group: fields[2].to_owned(),
+        mode: fields[3].to_owned(),
+        links: fields[4].to_owned(),
+        size,
+        path: fields[6].to_owned(),
+    }))
+}
+
+fn require_remote_metadata(
+    metadata: &RemoteFileMetadata,
+    path: &str,
+    owner: &str,
+    group: &str,
+    mode: &str,
+    size: usize,
+) -> Result<()> {
+    if metadata.kind != "f"
+        || metadata.owner != owner
+        || metadata.group != group
+        || metadata.mode != mode
+        || metadata.links != "1"
+        || metadata.size != size
+        || metadata.path != path
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_remote_helper_hash(
+    state: &Ec2State,
+    store: &Store,
+    executor: &dyn AwsExecutor,
+    id: &str,
+    path: &str,
+    expected: &str,
+    sudo: bool,
+) -> Result<()> {
+    let output = if sudo {
+        executor.run(&ssh_command(
+            id,
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/sha256sum",
+                path,
+            ],
+            false,
+            30,
+        )?)?
+    } else {
+        executor.run(&ssh_command(
+            id,
+            state,
+            store,
+            ["/usr/bin/sha256sum", path],
+            false,
+            30,
+        )?)?
+    };
+    verify_single_remote_hash(&output.stdout, path, expected)
+}
+
 fn install_initial(
     store: &Store,
     state: &mut Ec2State,
@@ -1380,7 +1815,7 @@ fn install_initial(
         &manifest.stack_bundle_path,
         &facts.bundle_sha256,
     )?;
-    let request = InstallRequest::new(&state.target, &state.domain, facts, None);
+    let request = InstallRequest::new(&state.domain, facts, None);
     store.write_artifact(APPLY_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
     let receipt = stage_install_read_receipt(
         store,
@@ -1391,10 +1826,144 @@ fn install_initial(
         ReceiptState::Installed,
         executor,
     )?;
-    state.current = Some(BundleRecord::from_facts(facts));
+    state.current = Some(BundleRecord::from_facts(facts, manifest));
     state.current_receipt = Some(receipt);
     state.current_bundle_suffix = Some(APPLY_BUNDLE_SUFFIX.into());
     state.current_request_suffix = Some(APPLY_REQUEST_SUFFIX.into());
+    state.phase = LifecyclePhase::ProvisionPending;
+    persist(store, state)
+}
+
+fn provision_initial(
+    store: &Store,
+    state: &mut Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let request = ProvisionRequest::new(manifest, state, facts)?;
+    let request_bytes = request.canonical_bytes()?;
+    let request_sha = hash(&request_bytes);
+    let local = store.write_artifact(PROVISION_REQUEST_SUFFIX, &request_bytes, 0o600)?;
+    state.provision_request_suffix = Some(PROVISION_REQUEST_SUFFIX.into());
+    state.phase = LifecyclePhase::Provisioning;
+    persist(store, state)?;
+
+    let remote = executor.run(&ssh_command(
+        "inspect-fixed-provision-request",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/find",
+            "/home/ubuntu",
+            "-maxdepth",
+            "1",
+            "-type",
+            "f",
+            "-name",
+            "dirextalk-vnext.provision",
+            "-printf",
+            "%u %g %m %s %p\\n",
+        ],
+        false,
+        30,
+    )?)?;
+    if remote.stdout.is_empty() {
+        run_effect(
+            store,
+            state,
+            &scp_command(
+                "stage-exact-provision-request",
+                state,
+                store,
+                &local,
+                REMOTE_PROVISION_REQUEST,
+            )?,
+            executor,
+        )?;
+        let staged = executor.run(&ssh_command(
+            "verify-staged-provision-request",
+            state,
+            store,
+            ["/usr/bin/sha256sum", REMOTE_PROVISION_REQUEST],
+            false,
+            30,
+        )?)?;
+        verify_single_remote_hash(&staged.stdout, REMOTE_PROVISION_REQUEST, &request_sha)?;
+        for (id, argv) in [
+            (
+                "own-fixed-provision-request",
+                [
+                    "/usr/bin/sudo",
+                    "--non-interactive",
+                    "/usr/bin/chown",
+                    "root:root",
+                    REMOTE_PROVISION_REQUEST,
+                ],
+            ),
+            (
+                "mode-fixed-provision-request",
+                [
+                    "/usr/bin/sudo",
+                    "--non-interactive",
+                    "/usr/bin/chmod",
+                    "0400",
+                    REMOTE_PROVISION_REQUEST,
+                ],
+            ),
+        ] {
+            run_effect(
+                store,
+                state,
+                &ssh_command(id, state, store, argv, true, 30)?,
+                executor,
+            )?;
+        }
+    } else {
+        let fields = remote.stdout.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 5
+            || fields[0] != "root"
+            || fields[1] != "root"
+            || fields[2] != "400"
+            || fields[3].parse::<usize>().ok() != Some(request_bytes.len())
+            || fields[4] != REMOTE_PROVISION_REQUEST
+        {
+            return Err(ReleaseError::OperationConflict);
+        }
+        let staged = executor.run(&ssh_command(
+            "verify-owned-provision-request",
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/sha256sum",
+                REMOTE_PROVISION_REQUEST,
+            ],
+            false,
+            30,
+        )?)?;
+        verify_single_remote_hash(&staged.stdout, REMOTE_PROVISION_REQUEST, &request_sha)?;
+    }
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            "run-fixed-host-provisioner",
+            state,
+            store,
+            ["/usr/bin/sudo", "--non-interactive", REMOTE_PROVISIONER],
+            true,
+            900,
+        )?,
+        executor,
+    )?;
+    let ready = read_host_ready_receipt(state, store, &request, executor)?;
+    state.host_ready_receipt = Some(ready);
+    state.phase = LifecyclePhase::HostReady;
+    persist(store, state)?;
     state.phase = LifecyclePhase::Installed;
     persist(store, state)
 }
@@ -1438,6 +2007,37 @@ fn stage_install_read_receipt(
         executor,
     )?;
     verify_remote_hashes(&remote_hashes.stdout, &bundle_sha, &request_sha)?;
+    for (id, command) in [
+        (
+            "own-fixed-staged-install-inputs",
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/chown",
+                "root:root",
+                REMOTE_BUNDLE,
+                REMOTE_REQUEST,
+            ],
+        ),
+        (
+            "mode-fixed-staged-install-inputs",
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/chmod",
+                "0400",
+                REMOTE_BUNDLE,
+                REMOTE_REQUEST,
+            ],
+        ),
+    ] {
+        run_effect(
+            store,
+            state,
+            &ssh_command(id, state, store, command, true, 30)?,
+            executor,
+        )?;
+    }
     run_effect(
         store,
         state,
@@ -1482,6 +2082,82 @@ fn verify_remote_hashes(output: &str, bundle_sha: &str, request_sha: &str) -> Re
     Ok(())
 }
 
+fn verify_single_remote_hash(output: &str, path: &str, expected: &str) -> Result<()> {
+    let mut fields = output.split_ascii_whitespace();
+    let digest = fields.next().unwrap_or_default();
+    let actual_path = fields.next().unwrap_or_default().trim_start_matches('*');
+    if fields.next().is_some() || digest != expected || actual_path != path {
+        return Err(contract("remote staged material digest mismatch"));
+    }
+    Ok(())
+}
+
+fn read_host_ready_receipt(
+    state: &Ec2State,
+    store: &Store,
+    request: &ProvisionRequest,
+    executor: &dyn AwsExecutor,
+) -> Result<HostReadyReceipt> {
+    executor.run(&ssh_command(
+        "verify-host-ready-receipt-regular-file",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/test",
+            "-f",
+            REMOTE_READY_RECEIPT,
+        ],
+        false,
+        30,
+    )?)?;
+    let metadata = executor.run(&ssh_command(
+        "verify-host-ready-receipt-metadata",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/stat",
+            "--format=%u %g %a %h %s",
+            REMOTE_READY_RECEIPT,
+        ],
+        false,
+        30,
+    )?)?;
+    let fields = metadata.stdout.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5
+        || fields[0] != "0"
+        || fields[1] != "0"
+        || fields[2] != "600"
+        || fields[3] != "1"
+        || fields[4]
+            .parse::<usize>()
+            .ok()
+            .is_none_or(|size| size == 0 || size > 64 * 1024)
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let output = executor.run(&ssh_command(
+        "read-sanitized-host-ready-receipt",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/cat",
+            REMOTE_READY_RECEIPT,
+        ],
+        false,
+        30,
+    )?)?;
+    if fields[4].parse::<usize>().ok() != Some(output.stdout.len()) {
+        return Err(ReleaseError::OperationConflict);
+    }
+    HostReadyReceipt::parse_and_verify(output.stdout.as_bytes(), request)
+}
+
 fn scp_command(
     id: &str,
     state: &Ec2State,
@@ -1496,6 +2172,7 @@ fn scp_command(
         .ok_or_else(|| contract("EIP state is missing"))?;
     let private = store.artifact_path(PRIVATE_KEY_SUFFIX)?;
     let known_hosts = store.artifact_path(KNOWN_HOSTS_SUFFIX)?;
+    let local = fs::canonicalize(local).map_err(crate::error::io_error(local))?;
     Ok(FixedCommand::new(
         id,
         SCP,
@@ -1511,6 +2188,7 @@ fn scp_command(
             "StrictHostKeyChecking=yes".into(),
             "-o".into(),
             format!("UserKnownHostsFile={}", known_hosts.display()),
+            "--".into(),
             local.display().to_string(),
             format!("ubuntu@{ip}:{remote}"),
         ],
@@ -1630,7 +2308,33 @@ fn verify_live_locked(
     {
         return Err(contract("remote installed receipt changed unexpectedly"));
     }
+    let provision_suffix = state
+        .provision_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("durable host provision request is absent"))?;
+    let provision_bytes = store.read_artifact(provision_suffix, 64 * 1024)?;
+    let provision = ProvisionRequest::parse_and_verify(&provision_bytes)?;
+    let previous_ready = state
+        .host_ready_receipt
+        .as_ref()
+        .ok_or_else(|| contract("host ready receipt state is absent"))?;
+    if provision.sha256()? != previous_ready.request_sha256
+        || provision.target != state.target
+        || provision.domain != state.domain
+        || provision.tenant_id != state.tenant_id
+        || provision.indexer_id != state.indexer_id
+        || Some(provision.private_ipv4.as_str()) != state.private_ipv4.as_deref()
+    {
+        return Err(contract(
+            "durable host provision request changed unexpectedly",
+        ));
+    }
+    let ready = read_host_ready_receipt(state, store, &provision, executor)?;
+    if ready.receipt_sha256 != previous_ready.receipt_sha256 {
+        return Err(contract("remote host ready receipt changed unexpectedly"));
+    }
     state.current_receipt = Some(receipt.clone());
+    state.host_ready_receipt = Some(ready);
     persist(store, state)?;
     Ok(VerifyReport {
         target: state.target.clone(),
@@ -1771,8 +2475,21 @@ pub fn update(
             "cross-version update is unsupported until migration compatibility evidence is available",
         ));
     }
-    if BundleRecord::from_facts(&facts) == prior_bundle {
+    let candidate = BundleRecord::from_facts(&facts, manifest);
+    if candidate == prior_bundle {
         return Ok(state);
+    }
+    if candidate.compose_sha256 != prior_bundle.compose_sha256
+        || candidate.postgres_image != prior_bundle.postgres_image
+        || candidate.caddy_image != prior_bundle.caddy_image
+        || candidate.probe_image != prior_bundle.probe_image
+        || candidate.host_installer_sha256 != prior_bundle.host_installer_sha256
+        || candidate.host_provisioner_sha256 != prior_bundle.host_provisioner_sha256
+        || candidate.receipt_reader_sha256 != prior_bundle.receipt_reader_sha256
+    {
+        return Err(contract(
+            "update cannot change immutable host-provision or host-helper inputs",
+        ));
     }
     if !execute {
         return Ok(state);
@@ -1801,7 +2518,6 @@ pub fn update(
         &facts.bundle_sha256,
     )?;
     let request = InstallRequest::new(
-        &state.target,
         &state.domain,
         &facts,
         Some(prior_receipt.receipt_sha256.clone()),
@@ -1811,7 +2527,7 @@ pub fn update(
     state.previous_receipt = Some(prior_receipt.clone());
     state.previous_bundle_suffix = Some(PREVIOUS_BUNDLE_SUFFIX.into());
     state.previous_request_suffix = Some(PREVIOUS_REQUEST_SUFFIX.into());
-    state.desired = BundleRecord::from_facts(&facts);
+    state.desired = candidate.clone();
     state.phase = LifecyclePhase::UpdateStaged;
     persist(&store, &mut state)?;
     let update_result = (|| -> Result<()> {
@@ -1826,7 +2542,7 @@ pub fn update(
             ReceiptState::Installed,
             executor,
         )?;
-        state.current = Some(BundleRecord::from_facts(&facts));
+        state.current = Some(candidate.clone());
         state.current_receipt = Some(receipt);
         state.current_bundle_suffix = Some(NEXT_BUNDLE_SUFFIX.into());
         state.current_request_suffix = Some(NEXT_REQUEST_SUFFIX.into());
@@ -1864,12 +2580,7 @@ fn rollback_update(
         || previous_receipt.receipt_sha256.clone(),
         |receipt| receipt.receipt_sha256.clone(),
     );
-    let request = request_from_record(
-        &state.target,
-        &state.domain,
-        previous,
-        Some(rollback_previous),
-    );
+    let request = request_from_record(&state.domain, previous, Some(rollback_previous));
     store.write_artifact(ROLLBACK_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
     state.phase = LifecyclePhase::RollbackStaged;
     persist(store, state)?;
@@ -1896,7 +2607,6 @@ fn rollback_update(
 }
 
 fn request_from_record(
-    target: &str,
     domain: &str,
     record: &BundleRecord,
     previous_receipt_sha256: Option<String>,
@@ -1904,7 +2614,7 @@ fn request_from_record(
     InstallRequest {
         schema: "dirextalk.vnext-install-request".into(),
         schema_version: 1,
-        target: target.into(),
+        target: "linux-amd64".into(),
         domain: domain.into(),
         version: record.version.clone(),
         source_commit: record.source_commit.clone(),

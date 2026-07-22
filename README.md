@@ -104,12 +104,11 @@ operator output is written to state or printed.
 
 ## Current boundary
 
-This foundation owns release artifact planning, assembly, guarded publication,
-and Unix-only offline durable ownership/lifecycle evidence. Production host
-installation, migration execution, rollback execution, service management, and
-remote Connector enrollment remain later typed CLI stages. They must consume the
-fenced durable state and fixed actions without an arbitrary command or
-shell-script escape hatch.
+The generic offline deployment foundation owns release artifact planning,
+assembly, guarded publication, and Unix-only durable ownership evidence. Its
+Connector transport remains separate from the AWS EC2 lifecycle below. Both
+surfaces consume fenced durable state and fixed actions without an arbitrary
+command or shell-script escape hatch.
 
 ## Single-node AWS EC2 lifecycle
 
@@ -118,12 +117,26 @@ prints the closed action set and conservative monthly cost ceiling.
 `ec2-apply`/`ec2-resume`,
 `ec2-update`, and `ec2-destroy` remain dry runs unless `--execute` is present.
 The manifest requires exact runtime and migrator images from the single
-authorized repository `dirextalk/vnet-server@sha256:<64>`, with independent
-digests, plus a digest-bound stack bundle.
+authorized repository `dirextalk/vnet-server@sha256:<64>`, digest-pinned
+Postgres, Caddy, and probe images, a deterministic uncompressed USTAR stack
+bundle, and three external host helpers with independent SHA-256 bindings.
 Apply requires `--max-monthly-usd`, generates a per-operation Ed25519 key,
 pins the host key against an instance/client-token/AMI-bound EC2 console
-attestation, and transfers only the fixed bundle and request paths. State and
-key material live in a locked 0700 directory as 0600 integrity-sealed files.
+attestation, then stages the installer, provisioner, and receipt reader over
+that pinned SSH channel. Cloud-init contains only package setup, Docker
+enablement, and the small console attestor and stays below EC2's 16 KiB raw
+user-data limit. Remote helper paths are fixed and accepted on resume only with
+the exact digest, regular-file type, root ownership, `0555` mode, and link count
+before use.
+
+The release installer consumes only fixed root-owned `0400` bundle/request
+paths. Initial host provisioning consumes
+`/home/ubuntu/dirextalk-vnext.provision`, materializes production config,
+secrets, TLS, and services, and publishes the root-owned `0600`
+`/var/lib/dirextalk-vnext/host-provision/ready.json`. Apply and every later
+verify validate the canonical self-hashed release and host-ready receipts before
+accepting HTTPS health. State and key material live in a locked 0700 directory
+as 0600 integrity-sealed files.
 Destroy re-reads ownership tags before every destructive effect, retains the
 root EBS volume by default, and requires a separate exact volume-ID fence to
 purge it. Use the same manifest shape for `x6`, `x7`, or `x8`.
@@ -134,7 +147,9 @@ fixed command `docker buildx imagetools inspect` for
 as canonical `sha256:<64>`. The tag is comparison-only and is never consulted
 by apply or update. Updates consume only the explicitly supplied immutable
 bundle and image digests; this stage fails closed on cross-version updates
-until migration-history compatibility evidence is available. Docker
+until migration-history compatibility evidence is available. Same-version
+updates preserve the installed production compose, dependency-image, and
+host-helper identities; changing those requires a fresh host lifecycle. Docker
 credentials, command stderr, and registry tokens are neither printed nor
 persisted.
 

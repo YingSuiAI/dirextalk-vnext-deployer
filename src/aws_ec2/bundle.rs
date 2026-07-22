@@ -1,11 +1,13 @@
 use std::{
-    collections::BTreeMap,
-    fs,
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
     io::{Cursor, Read},
     path::{Component, Path},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,14 +15,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{ReleaseError, Result, error::io_error};
 
-const MAX_BUNDLE: u64 = 512 * 1024 * 1024;
-const MAX_EXPANDED: u64 = 1024 * 1024 * 1024;
-const MAX_ENTRY: u64 = 256 * 1024 * 1024;
+const MAX_BUNDLE: u64 = 32 * 1024 * 1024;
+const MAX_MANIFEST: u64 = 1024 * 1024;
+const MAX_HELPER: u64 = 1024 * 1024;
+const MAX_MEMBERS: usize = 256;
+const ROOT_NAME: &str = "dirextalk-vnext-stack";
 const ROOT: &str = "dirextalk-vnext-stack/";
 const MANIFEST_PATH: &str = "dirextalk-vnext-stack/manifest.json";
-const INSTALLER_PATH: &str = "dirextalk-vnext-stack/usr/local/libexec/dirextalk/install-vnext";
-const RECEIPT_READER_PATH: &str =
-    "dirextalk-vnext-stack/usr/local/libexec/dirextalk/read-vnext-receipt";
+const STACK_INSTALLER_PATH: &str = "scripts/production-stack/install.sh";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -30,8 +32,8 @@ pub struct StackManifest {
     pub version: String,
     pub source_commit: String,
     pub target: String,
-    pub server: String,
-    pub migrator: String,
+    pub server_image: String,
+    pub migrator_image: String,
     pub installer_sha256: String,
     pub files: Vec<StackFile>,
 }
@@ -41,15 +43,19 @@ pub struct StackManifest {
 pub struct StackFile {
     pub path: String,
     pub sha256: String,
-    pub mode: u32,
+    pub mode: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct BundleFacts {
     pub bundle_sha256: String,
     pub manifest_sha256: String,
+    pub compose_sha256: String,
     pub manifest: StackManifest,
-    pub installer: Vec<u8>,
+    pub host_installer: Vec<u8>,
+    pub host_installer_sha256: String,
+    pub host_provisioner: Vec<u8>,
+    pub host_provisioner_sha256: String,
     pub receipt_reader: Vec<u8>,
     pub receipt_reader_sha256: String,
 }
@@ -98,7 +104,17 @@ pub enum ReceiptState {
     RolledBack,
 }
 
-pub fn load_bundle(path: &Path, expected_sha256: &str) -> Result<BundleFacts> {
+#[allow(clippy::too_many_arguments)]
+pub fn load_bundle(
+    path: &Path,
+    expected_sha256: &str,
+    host_installer_path: &Path,
+    expected_host_installer_sha256: &str,
+    host_provisioner_path: &Path,
+    expected_host_provisioner_sha256: &str,
+    receipt_reader_path: &Path,
+    expected_receipt_reader_sha256: &str,
+) -> Result<BundleFacts> {
     let metadata = fs::symlink_metadata(path).map_err(io_error(path))?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_BUNDLE {
         return Err(ReleaseError::UnsafeFile(path.to_owned()));
@@ -108,87 +124,123 @@ pub fn load_bundle(path: &Path, expected_sha256: &str) -> Result<BundleFacts> {
     if actual_bundle != expected_sha256 {
         return Err(ReleaseError::SourceMismatch(path.to_owned()));
     }
-    let tar_bytes = if encoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(encoded))
-            .map_err(|_| deployment("bundle zstd header is invalid"))?;
-        let mut expanded = Vec::new();
-        decoder
-            .by_ref()
-            .take(MAX_EXPANDED + 1)
-            .read_to_end(&mut expanded)
-            .map_err(io_error(path))?;
-        if expanded.len() as u64 > MAX_EXPANDED {
-            return Err(deployment("expanded bundle exceeds the fixed limit"));
-        }
-        expanded
-    } else {
-        encoded
-    };
-    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
-    let mut entries = BTreeMap::<String, (u32, Vec<u8>)>::new();
+    let mut archive = tar::Archive::new(Cursor::new(encoded));
+    let mut entries = BTreeMap::<String, (String, Vec<u8>)>::new();
+    let mut directories = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut total = 0_u64;
+    let mut member_count = 0_usize;
     for entry in archive.entries().map_err(io_error(path))? {
         let mut entry = entry.map_err(io_error(path))?;
+        member_count += 1;
+        if member_count > MAX_MEMBERS {
+            return Err(deployment("bundle contains too many members"));
+        }
         let header = entry.header();
-        if !header.entry_type().is_file() {
-            return Err(deployment("bundle contains a non-regular entry"));
+        if header.as_ustar().is_none()
+            || header.uid().map_err(io_error(path))? != 0
+            || header.gid().map_err(io_error(path))? != 0
+            || header.mtime().map_err(io_error(path))? != 0
+        {
+            return Err(deployment(
+                "bundle member metadata is not deterministic USTAR",
+            ));
         }
         let path_value = entry.path().map_err(io_error(path))?.into_owned();
-        validate_archive_path(&path_value)?;
-        let name = path_value
+        let raw_name = path_value
             .to_str()
             .ok_or_else(|| deployment("bundle path is not UTF-8"))?
             .to_owned();
-        if !name.starts_with(ROOT) || name.ends_with('/') || entries.contains_key(&name) {
-            return Err(deployment("bundle root or entry uniqueness is invalid"));
+        let name = raw_name.trim_end_matches('/');
+        validate_archive_name(name)?;
+        if !seen.insert(name.to_owned()) {
+            return Err(deployment("bundle member path is duplicated"));
         }
         let size = entry.size();
-        if size == 0 || size > MAX_ENTRY {
-            return Err(deployment("bundle entry size is invalid"));
+        let mode = header.mode().map_err(io_error(path))? & 0o7777;
+        if header.entry_type().is_dir() {
+            if raw_name != format!("{name}/") || size != 0 || mode != 0o555 {
+                return Err(deployment("bundle directory metadata is invalid"));
+            }
+            directories.insert(name.to_owned());
+        } else if header.entry_type().is_file() {
+            if raw_name != name || !matches!(mode, 0o444 | 0o555) || size > MAX_BUNDLE {
+                return Err(deployment("bundle file metadata is invalid"));
+            }
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| deployment("bundle payload size overflow"))?;
+            if total > MAX_BUNDLE {
+                return Err(deployment("bundle payload exceeds the fixed limit"));
+            }
+            let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
+            entry
+                .by_ref()
+                .take(size + 1)
+                .read_to_end(&mut bytes)
+                .map_err(io_error(path))?;
+            if bytes.len() as u64 != size {
+                return Err(deployment("bundle entry length mismatch"));
+            }
+            entries.insert(name.to_owned(), (format!("{mode:04o}"), bytes));
+        } else {
+            return Err(deployment("bundle contains a link or special member"));
         }
-        let mode = entry.header().mode().map_err(io_error(path))? & 0o7777;
-        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
-        entry
-            .by_ref()
-            .take(MAX_ENTRY + 1)
-            .read_to_end(&mut bytes)
-            .map_err(io_error(path))?;
-        if bytes.len() as u64 != size {
-            return Err(deployment("bundle entry length mismatch"));
-        }
-        entries.insert(name, (mode, bytes));
     }
     let (manifest_mode, manifest_bytes) = entries
         .remove(MANIFEST_PATH)
         .ok_or_else(|| deployment("bundle manifest is missing"))?;
-    if manifest_mode != 0o444 && manifest_mode != 0o644 {
-        return Err(deployment("bundle manifest mode must be 0444 or 0644"));
+    if manifest_mode != "0444" || manifest_bytes.len() as u64 > MAX_MANIFEST {
+        return Err(deployment("bundle manifest mode or size is invalid"));
     }
     let manifest: StackManifest = serde_json::from_slice(&manifest_bytes)?;
-    validate_manifest(&manifest, &entries)?;
-    let installer = entries
-        .get(INSTALLER_PATH)
-        .map(|(_, bytes)| bytes.clone())
-        .ok_or_else(|| deployment("fixed installer is absent from bundle"))?;
-    let receipt_reader = entries
-        .get(RECEIPT_READER_PATH)
-        .map(|(_, bytes)| bytes.clone())
-        .ok_or_else(|| deployment("fixed receipt reader is absent from bundle"))?;
-    let reader_sha = hash(&receipt_reader);
+    if canonical_json(&manifest)? != manifest_bytes {
+        return Err(deployment("bundle manifest is not canonical JSON"));
+    }
+    validate_manifest(&manifest, &entries, &directories)?;
+    let compose_sha256 = manifest
+        .files
+        .iter()
+        .find(|file| file.path == "docker/production/docker-compose.yml")
+        .map(|file| file.sha256.clone())
+        .ok_or_else(|| deployment("bundle omits the fixed production compose file"))?;
+    let host_installer = read_hash_bound_helper(
+        host_installer_path,
+        expected_host_installer_sha256,
+        "host installer",
+    )?;
+    let receipt_reader = read_hash_bound_helper(
+        receipt_reader_path,
+        expected_receipt_reader_sha256,
+        "receipt reader",
+    )?;
+    let host_provisioner = read_hash_bound_helper(
+        host_provisioner_path,
+        expected_host_provisioner_sha256,
+        "host provisioner",
+    )?;
     Ok(BundleFacts {
         bundle_sha256: actual_bundle,
         manifest_sha256: hash(&manifest_bytes),
+        compose_sha256,
         manifest,
-        installer,
+        host_installer,
+        host_installer_sha256: expected_host_installer_sha256.to_owned(),
+        host_provisioner,
+        host_provisioner_sha256: expected_host_provisioner_sha256.to_owned(),
         receipt_reader,
-        receipt_reader_sha256: reader_sha,
+        receipt_reader_sha256: expected_receipt_reader_sha256.to_owned(),
     })
 }
 
-fn validate_archive_path(path: &Path) -> Result<()> {
-    if path.is_absolute()
+fn validate_archive_name(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
+        || (value != ROOT_NAME && !value.starts_with(ROOT))
     {
         return Err(deployment("bundle contains an unsafe path"));
     }
@@ -197,7 +249,8 @@ fn validate_archive_path(path: &Path) -> Result<()> {
 
 fn validate_manifest(
     manifest: &StackManifest,
-    entries: &BTreeMap<String, (u32, Vec<u8>)>,
+    entries: &BTreeMap<String, (String, Vec<u8>)>,
+    directories: &BTreeSet<String>,
 ) -> Result<()> {
     if manifest.schema != "dirextalk.vnext-stack-bundle" || manifest.schema_version != 1 {
         return Err(deployment("bundle manifest schema is unsupported"));
@@ -207,81 +260,157 @@ fn validate_manifest(
         return Err(deployment("bundle target must be linux-amd64"));
     }
     commit(&manifest.source_commit)?;
-    image(&manifest.server, "bundle server")?;
-    image(&manifest.migrator, "bundle migrator")?;
+    exact_server_image(&manifest.server_image, "bundle server_image")?;
+    exact_server_image(&manifest.migrator_image, "bundle migrator_image")?;
     digest(&manifest.installer_sha256, "bundle installer")?;
     if manifest.files.len() != entries.len() {
         return Err(deployment("bundle file index is not exhaustive"));
     }
     let mut previous = None::<&str>;
     for file in &manifest.files {
-        validate_string_path(&file.path)?;
+        validate_relative_path(&file.path)?;
         if previous.is_some_and(|old| old >= file.path.as_str()) {
             return Err(deployment("bundle file index must be strictly sorted"));
         }
         previous = Some(&file.path);
         digest(&file.sha256, "bundle file")?;
-        if file.mode != 0o444 && file.mode != 0o555 {
+        if file.mode != "0444" && file.mode != "0555" {
             return Err(deployment("bundle file mode is outside the fixed policy"));
         }
+        let archive_path = format!("{ROOT}{}", file.path);
         let (mode, bytes) = entries
-            .get(&file.path)
+            .get(&archive_path)
             .ok_or_else(|| deployment("bundle file index references a missing entry"))?;
-        if *mode != file.mode || hash(bytes) != file.sha256 {
+        if mode != &file.mode || hash(bytes) != file.sha256 {
             return Err(deployment("bundle file metadata or digest mismatch"));
         }
+    }
+    let expected_files = manifest
+        .files
+        .iter()
+        .map(|file| format!("{ROOT}{}", file.path))
+        .collect::<BTreeSet<_>>();
+    if entries.keys().cloned().collect::<BTreeSet<_>>() != expected_files {
+        return Err(deployment("bundle file set differs from its manifest"));
+    }
+    if required_directories(&expected_files) != *directories {
+        return Err(deployment("bundle directory set differs from its manifest"));
     }
     let installer = manifest
         .files
         .iter()
-        .find(|file| file.path == INSTALLER_PATH)
+        .find(|file| file.path == STACK_INSTALLER_PATH)
         .ok_or_else(|| deployment("bundle file index omits the fixed installer"))?;
-    if installer.mode != 0o555 || installer.sha256 != manifest.installer_sha256 {
+    if installer.mode != "0555" || installer.sha256 != manifest.installer_sha256 {
         return Err(deployment("fixed installer binding is invalid"));
-    }
-    let reader = manifest
-        .files
-        .iter()
-        .find(|file| file.path == RECEIPT_READER_PATH)
-        .ok_or_else(|| deployment("bundle file index omits the fixed receipt reader"))?;
-    if reader.mode != 0o555 {
-        return Err(deployment("fixed receipt reader mode must be 0555"));
     }
     Ok(())
 }
 
-fn validate_string_path(path: &str) -> Result<()> {
-    validate_archive_path(Path::new(path))?;
-    if !path.starts_with(ROOT) || path == MANIFEST_PATH || path.ends_with('/') {
+fn validate_relative_path(value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || value.ends_with('/')
+    {
         return Err(deployment("bundle file index path is invalid"));
     }
     Ok(())
 }
 
+fn required_directories(files: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut result = BTreeSet::from([ROOT_NAME.to_owned()]);
+    for file in files {
+        let mut current = Path::new(file).parent();
+        while let Some(directory) = current {
+            let value = directory.to_string_lossy();
+            if value == "." || value.is_empty() {
+                break;
+            }
+            result.insert(value.into_owned());
+            if directory == Path::new(ROOT_NAME) {
+                break;
+            }
+            current = directory.parent();
+        }
+    }
+    result
+}
+
+pub(super) fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(&serde_json::to_value(value)?)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn exact_server_image(value: &str, name: &str) -> Result<()> {
+    image(value, name)?;
+    if !value.starts_with("dirextalk/vnet-server@sha256:") {
+        return Err(deployment(&format!("{name} repository is not allowed")));
+    }
+    Ok(())
+}
+
+fn read_hash_bound_helper(path: &Path, expected_sha256: &str, name: &str) -> Result<Vec<u8>> {
+    digest(expected_sha256, name)?;
+    let before = fs::symlink_metadata(path).map_err(io_error(path))?;
+    if !before.is_file() || before.len() == 0 || before.len() > MAX_HELPER {
+        return Err(ReleaseError::UnsafeFile(path.to_owned()));
+    }
+    #[cfg(unix)]
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path);
+    #[cfg(not(unix))]
+    let opened = OpenOptions::new().read(true).open(path);
+    let mut file = opened.map_err(io_error(path))?;
+    let opened_metadata = file.metadata().map_err(io_error(path))?;
+    if !opened_metadata.is_file() || opened_metadata.len() != before.len() {
+        return Err(ReleaseError::UnsafeFile(path.to_owned()));
+    }
+    #[cfg(unix)]
+    if (opened_metadata.dev(), opened_metadata.ino()) != (before.dev(), before.ino()) {
+        return Err(ReleaseError::UnsafeFile(path.to_owned()));
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_HELPER + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error(path))?;
+    let after = file.metadata().map_err(io_error(path))?;
+    if bytes.is_empty()
+        || bytes.len() as u64 > MAX_HELPER
+        || after.len() != opened_metadata.len()
+        || hash(&bytes) != expected_sha256
+    {
+        return Err(ReleaseError::SourceMismatch(path.to_owned()));
+    }
+    Ok(bytes)
+}
+
 impl InstallRequest {
-    pub fn new(
-        target: &str,
-        domain: &str,
-        facts: &BundleFacts,
-        previous_receipt_sha256: Option<String>,
-    ) -> Self {
+    pub fn new(domain: &str, facts: &BundleFacts, previous_receipt_sha256: Option<String>) -> Self {
         Self {
             schema: "dirextalk.vnext-install-request".into(),
             schema_version: 1,
-            target: target.into(),
+            target: facts.manifest.target.clone(),
             domain: domain.into(),
             version: facts.manifest.version.clone(),
             source_commit: facts.manifest.source_commit.clone(),
             bundle_sha256: facts.bundle_sha256.clone(),
             manifest_sha256: facts.manifest_sha256.clone(),
-            server_image: facts.manifest.server.clone(),
-            migrator_image: facts.manifest.migrator.clone(),
+            server_image: facts.manifest.server_image.clone(),
+            migrator_image: facts.manifest.migrator_image.clone(),
             previous_receipt_sha256,
         }
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
-        let bytes = serde_json::to_vec(self)?;
+        let bytes = canonical_json(self)?;
         if bytes.len() > 64 * 1024 {
             return Err(deployment("install request exceeds the fixed limit"));
         }
@@ -311,7 +440,6 @@ impl InstalledReceipt {
             || receipt.server_image != expected.server_image
             || receipt.migrator_image != expected.migrator_image
             || receipt.previous_receipt_sha256 != expected.previous_receipt_sha256
-            || receipt.installed_at_ms == 0
         {
             return Err(deployment("installed receipt binding mismatch"));
         }
@@ -321,19 +449,13 @@ impl InstalledReceipt {
             .as_object_mut()
             .ok_or_else(|| deployment("installed receipt is not an object"))?
             .remove("receipt_sha256");
-        if hash(&serde_json::to_vec(&canonical)?) != receipt.receipt_sha256 {
+        if hash(&canonical_json(&canonical)?) != receipt.receipt_sha256
+            || bytes != canonical_json(&receipt)?
+        {
             return Err(deployment("installed receipt integrity mismatch"));
         }
         Ok(receipt)
     }
-}
-
-pub fn installer_base64(facts: &BundleFacts) -> String {
-    STANDARD.encode(&facts.installer)
-}
-
-pub fn receipt_reader_base64(facts: &BundleFacts) -> String {
-    STANDARD.encode(&facts.receipt_reader)
 }
 
 pub fn hash(bytes: &[u8]) -> String {

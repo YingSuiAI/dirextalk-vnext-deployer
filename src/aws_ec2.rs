@@ -2,6 +2,7 @@
 #![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
 mod bundle;
+mod provision;
 mod store;
 mod workflow;
 
@@ -22,6 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{ReleaseError, Result, error::io_error};
 use bundle::{BundleFacts, InstalledReceipt, ReceiptState, digest, image, load_bundle};
+use provision::HostReadyReceipt;
 
 pub use workflow::{apply, destroy, status, status_with_registry, update, verify};
 
@@ -41,8 +43,19 @@ pub(super) const DOCKER: &str = "docker";
 pub(super) const DOCKER_HUB_LATEST: &str = "docker.io/dirextalk/vnet-server:latest";
 pub(super) const REMOTE_BUNDLE: &str = "/home/ubuntu/dirextalk-vnext.bundle";
 pub(super) const REMOTE_REQUEST: &str = "/home/ubuntu/dirextalk-vnext.request";
+pub(super) const REMOTE_PROVISION_REQUEST: &str = "/home/ubuntu/dirextalk-vnext.provision";
+pub(super) const REMOTE_INSTALLER_UPLOAD: &str = "/home/ubuntu/install-vnext.upload";
+pub(super) const REMOTE_PROVISIONER_UPLOAD: &str = "/home/ubuntu/provision-vnext.upload";
+pub(super) const REMOTE_RECEIPT_READER_UPLOAD: &str = "/home/ubuntu/read-vnext-receipt.upload";
 pub(super) const REMOTE_INSTALLER: &str = "/usr/local/libexec/dirextalk/install-vnext";
+pub(super) const REMOTE_PROVISIONER: &str = "/usr/local/libexec/dirextalk/provision-vnext";
 pub(super) const REMOTE_RECEIPT_READER: &str = "/usr/local/libexec/dirextalk/read-vnext-receipt";
+pub(super) const REMOTE_INSTALLER_ATOMIC: &str = "/usr/local/libexec/dirextalk/.install-vnext.new";
+pub(super) const REMOTE_PROVISIONER_ATOMIC: &str =
+    "/usr/local/libexec/dirextalk/.provision-vnext.new";
+pub(super) const REMOTE_RECEIPT_READER_ATOMIC: &str =
+    "/usr/local/libexec/dirextalk/.read-vnext-receipt.new";
+pub(super) const REMOTE_READY_RECEIPT: &str = "/var/lib/dirextalk-vnext/host-provision/ready.json";
 pub(super) const HEALTH_PATH: &str = "/healthz";
 pub(super) const MAX_OUTPUT: u64 = 256 * 1024;
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,10 +81,19 @@ pub struct AwsEc2Manifest {
     pub operator_ssh_cidr: String,
     pub stack_bundle_sha256: String,
     pub stack_bundle_path: PathBuf,
+    pub host_installer_path: PathBuf,
+    pub host_installer_sha256: String,
+    pub host_provisioner_path: PathBuf,
+    pub host_provisioner_sha256: String,
+    pub receipt_reader_path: PathBuf,
+    pub receipt_reader_sha256: String,
     pub release_version: String,
     pub source_commit: String,
     pub server_image: String,
     pub migrator_image: String,
+    pub postgres_image: String,
+    pub caddy_image: String,
+    pub probe_image: String,
     pub ubuntu_ami_owner: String,
     pub ubuntu_ami_pattern: String,
     pub key_name: String,
@@ -106,6 +128,9 @@ impl AwsEc2Manifest {
         }
         operator_cidr(&self.operator_ssh_cidr)?;
         digest(&self.stack_bundle_sha256, "stack bundle")?;
+        digest(&self.host_installer_sha256, "host installer")?;
+        digest(&self.host_provisioner_sha256, "host provisioner")?;
+        digest(&self.receipt_reader_sha256, "receipt reader")?;
         Version::parse(&self.release_version)
             .map_err(|_| contract("release_version must be SemVer"))?;
         bundle::commit(&self.source_commit)?;
@@ -115,6 +140,9 @@ impl AwsEc2Manifest {
             "dirextalk/vnet-server",
             "migrator_image",
         )?;
+        exact_image(&self.postgres_image, "postgres", "postgres_image")?;
+        exact_image(&self.caddy_image, "caddy", "caddy_image")?;
+        exact_image(&self.probe_image, "curlimages/curl", "probe_image")?;
         if self.ubuntu_ami_owner != UBUNTU_OWNER || self.ubuntu_ami_pattern != UBUNTU_PATTERN {
             return Err(contract(
                 "Ubuntu AMI owner/pattern must be the Canonical 24.04 amd64 allowlist",
@@ -125,11 +153,20 @@ impl AwsEc2Manifest {
     }
 
     pub(super) fn bundle(&self) -> Result<BundleFacts> {
-        let facts = load_bundle(&self.stack_bundle_path, &self.stack_bundle_sha256)?;
+        let facts = load_bundle(
+            &self.stack_bundle_path,
+            &self.stack_bundle_sha256,
+            &self.host_installer_path,
+            &self.host_installer_sha256,
+            &self.host_provisioner_path,
+            &self.host_provisioner_sha256,
+            &self.receipt_reader_path,
+            &self.receipt_reader_sha256,
+        )?;
         if facts.manifest.version != self.release_version
             || facts.manifest.source_commit != self.source_commit
-            || facts.manifest.server != self.server_image
-            || facts.manifest.migrator != self.migrator_image
+            || facts.manifest.server_image != self.server_image
+            || facts.manifest.migrator_image != self.migrator_image
         {
             return Err(contract(
                 "deployment manifest does not match the digest-bound stack manifest",
@@ -384,6 +421,7 @@ pub fn plan(manifest: &AwsEc2Manifest, max_monthly_usd: Option<u32>) -> Result<E
             ("allocate-associate-eip", AWS, true),
             ("create-dns", AWS, true),
             ("pin-host-key", SSH_KEYSCAN, false),
+            ("stage-host-helpers", SCP, true),
             ("stage-bundle", SCP, true),
             ("install", SSH, true),
             ("verify-receipt", SSH, false),
@@ -422,6 +460,13 @@ pub(super) fn ingress_rules(manifest: &AwsEc2Manifest) -> Vec<IngressRule> {
     vec![
         IngressRule {
             protocol: "tcp".into(),
+            from_port: 80,
+            to_port: 80,
+            cidr: "0.0.0.0/0".into(),
+            purpose: "public ACME HTTP challenge".into(),
+        },
+        IngressRule {
+            protocol: "tcp".into(),
             from_port: 443,
             to_port: 443,
             cidr: "0.0.0.0/0".into(),
@@ -456,6 +501,9 @@ pub enum LifecyclePhase {
     EipReady,
     DnsReady,
     HostKeyPinned,
+    ProvisionPending,
+    Provisioning,
+    HostReady,
     Installed,
     Verified,
     UpdateStaged,
@@ -476,9 +524,15 @@ pub struct BundleRecord {
     pub source_commit: String,
     pub bundle_sha256: String,
     pub manifest_sha256: String,
+    pub compose_sha256: String,
     pub server_image: String,
     pub migrator_image: String,
+    pub postgres_image: String,
+    pub caddy_image: String,
+    pub probe_image: String,
     pub installer_sha256: String,
+    pub host_installer_sha256: String,
+    pub host_provisioner_sha256: String,
     pub receipt_reader_sha256: String,
 }
 
@@ -507,15 +561,21 @@ impl InfrastructureRecord {
 }
 
 impl BundleRecord {
-    pub(super) fn from_facts(facts: &BundleFacts) -> Self {
+    pub(super) fn from_facts(facts: &BundleFacts, manifest: &AwsEc2Manifest) -> Self {
         Self {
             version: facts.manifest.version.clone(),
             source_commit: facts.manifest.source_commit.clone(),
             bundle_sha256: facts.bundle_sha256.clone(),
             manifest_sha256: facts.manifest_sha256.clone(),
-            server_image: facts.manifest.server.clone(),
-            migrator_image: facts.manifest.migrator.clone(),
+            compose_sha256: facts.compose_sha256.clone(),
+            server_image: facts.manifest.server_image.clone(),
+            migrator_image: facts.manifest.migrator_image.clone(),
+            postgres_image: manifest.postgres_image.clone(),
+            caddy_image: manifest.caddy_image.clone(),
+            probe_image: manifest.probe_image.clone(),
             installer_sha256: facts.manifest.installer_sha256.clone(),
+            host_installer_sha256: facts.host_installer_sha256.clone(),
+            host_provisioner_sha256: facts.host_provisioner_sha256.clone(),
             receipt_reader_sha256: facts.receipt_reader_sha256.clone(),
         }
     }
@@ -586,6 +646,8 @@ pub struct Ec2State {
     pub account_id: Option<String>,
     pub region: String,
     pub domain: String,
+    pub tenant_id: String,
+    pub indexer_id: String,
     pub ownership_tags: BTreeMap<String, String>,
     pub monthly_estimate_cents: u64,
     pub max_monthly_usd: u32,
@@ -598,6 +660,7 @@ pub struct Ec2State {
     pub vpc_id: Option<String>,
     pub security_group_id: Option<String>,
     pub instance_id: Option<String>,
+    pub private_ipv4: Option<String>,
     pub volume_id: Option<String>,
     pub eip: Option<EipRecord>,
     pub dns: Option<OwnedRecordSet>,
@@ -605,10 +668,12 @@ pub struct Ec2State {
     pub current_receipt: Option<InstalledReceipt>,
     pub previous_receipt: Option<InstalledReceipt>,
     pub rollback_receipt: Option<InstalledReceipt>,
+    pub host_ready_receipt: Option<HostReadyReceipt>,
     pub current_bundle_suffix: Option<String>,
     pub current_request_suffix: Option<String>,
     pub previous_bundle_suffix: Option<String>,
     pub previous_request_suffix: Option<String>,
+    pub provision_request_suffix: Option<String>,
     pub phase: LifecyclePhase,
     #[serde(default)]
     pub pending_effect: Option<String>,
@@ -638,7 +703,14 @@ impl Ec2State {
         }
         let operation = uuid::Uuid::parse_str(&self.operation_id)
             .map_err(|_| ReleaseError::StateUnsafe(PathBuf::from("EC2 state")))?;
+        let tenant = uuid::Uuid::parse_str(&self.tenant_id)
+            .map_err(|_| ReleaseError::StateUnsafe(PathBuf::from("EC2 state")))?;
+        let indexer = uuid::Uuid::parse_str(&self.indexer_id)
+            .map_err(|_| ReleaseError::StateUnsafe(PathBuf::from("EC2 state")))?;
         if operation.get_version_num() != 7
+            || tenant.get_version_num() != 7
+            || indexer.get_version_num() != 7
+            || self.tenant_id == self.indexer_id
             || self.client_token != self.operation_id
             || self.client_token_sha256 != bundle::hash(self.client_token.as_bytes())
             || self.max_monthly_usd == 0
@@ -670,6 +742,14 @@ impl Ec2State {
         }) {
             return Err(ReleaseError::StateUnsafe(PathBuf::from("EC2 state")));
         }
+        if self.private_ipv4.as_ref().is_some_and(|value| {
+            value
+                .parse::<Ipv4Addr>()
+                .ok()
+                .is_none_or(|address| !address.is_private())
+        }) {
+            return Err(ReleaseError::StateUnsafe(PathBuf::from("EC2 state")));
+        }
         Ok(())
     }
 }
@@ -693,7 +773,10 @@ fn validate_bundle_record(record: &BundleRecord) -> Result<()> {
     for (value, name) in [
         (&record.bundle_sha256, "state bundle"),
         (&record.manifest_sha256, "state manifest"),
+        (&record.compose_sha256, "state compose"),
         (&record.installer_sha256, "state installer"),
+        (&record.host_installer_sha256, "state host installer"),
+        (&record.host_provisioner_sha256, "state host provisioner"),
         (&record.receipt_reader_sha256, "state receipt reader"),
     ] {
         digest(value, name)?;
@@ -707,7 +790,10 @@ fn validate_bundle_record(record: &BundleRecord) -> Result<()> {
         &record.migrator_image,
         "dirextalk/vnet-server",
         "state migrator image",
-    )
+    )?;
+    exact_image(&record.postgres_image, "postgres", "state postgres image")?;
+    exact_image(&record.caddy_image, "caddy", "state caddy image")?;
+    exact_image(&record.probe_image, "curlimages/curl", "state probe image")
 }
 
 #[derive(Clone, Debug, Serialize)]
