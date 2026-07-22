@@ -3,6 +3,10 @@
 pub mod archive;
 pub mod aws_ec2;
 pub mod cli;
+#[cfg(unix)]
+pub mod connector_apply;
+#[cfg(not(unix))]
+#[path = "connector_apply_unsupported.rs"]
 pub mod connector_apply;
 pub mod deployment;
 mod digest;

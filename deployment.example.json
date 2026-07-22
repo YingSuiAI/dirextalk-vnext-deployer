@@ -11,7 +11,7 @@
       "host": {
         "tenant_id": "018f856e-e0bd-71d2-9428-58d50cf77eaf",
         "host_id": "018f856e-e0bd-72d2-9428-58d50cf77eaf",
-        "owner_id": "018f856e-e0bd-73d2-9428-58d50cf77eaf",
+        "owner_id": "dtxi1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "host_credential_id": "018f856e-e0bd-74d2-9428-58d50cf77eaf"
       }
     },
@@ -21,7 +21,7 @@
       "host": {
         "tenant_id": "018f856e-e0bd-71d2-9428-58d50cf77eaf",
         "host_id": "018f856e-e0bd-72d2-9428-58d50cf77eaf",
-        "owner_id": "018f856e-e0bd-73d2-9428-58d50cf77eaf",
+        "owner_id": "dtxi1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "host_credential_id": "018f856e-e0bd-74d2-9428-58d50cf77eaf"
       },
       "connectors": [{
