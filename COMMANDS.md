@@ -14,13 +14,18 @@ Run from the repository root.
 | deployment contract validation | `cargo run --locked -- deployment-validate --manifest deployment.example.json` |
 | deployment dry-run plan | `cargo run --locked -- deployment-plan --manifest deployment.example.json` |
 | deployment status readback | `cargo run --locked -- deployment-status --operation-id <uuid>` |
+| Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
 
 `build` only executes commands when `--execute` is supplied. `publish` also
 requires `--execute` plus one or more destination flags.
 
-Deployment commands are offline contract/state operations only. No production
-transport, privileged migrator, service mutation, provider activation,
-deployment, or X3/X4/X5 acceptance is implemented or claimed.
+`deployment-connector-apply` is the sole production local Connector-host
+transport. It requires root and `--execute`, persists its local lifecycle
+record before every effect, and invokes only the fixed no-argument Host
+Supervisor executable. It accepts no remote command, path in the protocol,
+environment, URL, or shell. The handoff must be a root-owned, no-follow `0600`
+regular file; output and durable state retain only digests and sanitized Host
+responses. It is not an SSH/cloud transport.
 `deployment-validate` and `deployment-plan` are cross-platform;
 `deployment-status` is Unix-only and fails closed as unsupported elsewhere.
 

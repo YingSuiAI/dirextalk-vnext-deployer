@@ -88,6 +88,18 @@ migrator, service mutation, provider activation, deployment, or X3/X4/X5
 acceptance is implemented or claimed. See
 [references/deployment-manifest.md](references/deployment-manifest.md).
 
+## Local Connector-host lifecycle
+
+`deployment-connector-apply --execute` is a closed, root-only local transport
+for one Connector target. It validates the existing deployment manifest and
+Server-issued Connector plan, reads the protected handoff, config, and three
+CA files, then persists `.dirextalk-connector-execution-state` before each
+fixed Host Supervisor V2/V1 effect. It invokes only
+`/usr/local/libexec/dirextalk/dtx-agent-host-supervisor` with no arguments.
+It performs V2 prepare, ordinary V1 start, independent V1 Running observation,
+and V2 finalize. No secret handoff, enrollment token, bearer, raw receipt, or
+operator output is written to state or printed.
+
 ## Current boundary
 
 This foundation owns release artifact planning, assembly, guarded publication,

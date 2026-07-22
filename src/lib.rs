@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod cli;
+pub mod connector_apply;
 pub mod deployment;
 mod digest;
 pub mod error;

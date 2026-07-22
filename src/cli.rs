@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::{
     archive::assemble,
+    connector_apply::{ConnectorApplyInputs, apply},
     deployment::{DeploymentManifest, DeploymentPlan, DeploymentStateStore, DeploymentTarget},
     error::Result,
     manifest::LoadedManifest,
@@ -98,6 +99,27 @@ enum Commands {
         #[arg(long)]
         operation_id: String,
     },
+    /// Apply one Server-issued Connector bootstrap plan on this Connector host.
+    DeploymentConnectorApply {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        handoff: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        enrollment_ca: PathBuf,
+        #[arg(long)]
+        control_ca: PathBuf,
+        #[arg(long)]
+        issuer_ca: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 /// Execute a parsed CLI command.
@@ -106,6 +128,7 @@ enum Commands {
 ///
 /// Returns an error when validation, planning, local artifact work, or an
 /// explicitly confirmed publication fails.
+#[allow(clippy::too_many_lines)]
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Validate { manifest } => {
@@ -193,6 +216,34 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Commands::DeploymentStatus { operation_id } => {
             print_json(&DeploymentStateStore::fixed()?.read(&operation_id)?)?;
+        }
+        Commands::DeploymentConnectorApply {
+            manifest,
+            target,
+            plan,
+            handoff,
+            config,
+            enrollment_ca,
+            control_ca,
+            issuer_ca,
+            execute,
+        } => {
+            if !execute {
+                return Err(crate::error::ReleaseError::Deployment(
+                    "deployment-connector-apply requires --execute".into(),
+                ));
+            }
+            let result = apply(ConnectorApplyInputs {
+                manifest,
+                target,
+                plan,
+                handoff,
+                config,
+                enrollment_ca,
+                control_ca,
+                issuer_ca,
+            })?;
+            print_json(&result)?;
         }
     }
     Ok(())
