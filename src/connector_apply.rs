@@ -1436,11 +1436,37 @@ fn valid_https_origin(value: &str) -> bool {
     value.strip_prefix("https://").is_some_and(valid_dns_name)
 }
 fn valid_endpoint(value: &str, server_name: &str) -> bool {
-    let Some(authority) = value.strip_prefix("https://") else {
+    let Some(rest) = value.strip_prefix("https://") else {
         return false;
     };
-    let host = authority.strip_suffix('/').unwrap_or(authority);
-    !host.is_empty() && host == server_name && valid_dns_name(host)
+    if rest.bytes().any(|byte| matches!(byte, b'?' | b'#')) {
+        return false;
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    if !matches!(path, "" | "/") || authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if authority.matches(':').count() > 1 || host != server_name || !valid_dns_name(host) {
+        return false;
+    }
+    let Some(port) = port else {
+        return true;
+    };
+    if port.is_empty()
+        || (port.len() > 1 && port.starts_with('0'))
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    port.parse::<u32>()
+        .is_ok_and(|port| (1..=65_535).contains(&port) && port != 443)
 }
 fn valid_mcp_url(value: &str) -> bool {
     value
@@ -1603,6 +1629,55 @@ mod tests {
             .expect("utf8")
             .replace("\"prepared\"", "\"issued\"");
         assert!(parse_plan(changed.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn endpoint_accepts_canonical_optional_port_only() {
+        for endpoint in [
+            "https://enroll.example",
+            "https://enroll.example/",
+            "https://enroll.example:1",
+            "https://enroll.example:8443/",
+            "https://enroll.example:65535",
+        ] {
+            assert!(valid_endpoint(endpoint, "enroll.example"), "{endpoint}");
+        }
+        for endpoint in [
+            "https://enroll.example:0",
+            "https://enroll.example:0443",
+            "https://enroll.example:443",
+            "https://enroll.example:65536",
+            "https://enroll.example:",
+            "https://user@enroll.example",
+            "https://enroll.example/bootstrap",
+            "https://enroll.example/?token=secret",
+            "https://enroll.example#fragment",
+        ] {
+            assert!(!valid_endpoint(endpoint, "enroll.example"), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn canonical_plan_accepts_explicit_enrollment_and_control_ports() {
+        let changed = String::from_utf8(PLAN.to_vec())
+            .expect("utf8")
+            .replace(
+                "\"enrollment_url\":\"https://enroll.example/\"",
+                "\"enrollment_url\":\"https://enroll.example:8443/\"",
+            )
+            .replace(
+                "\"control_url\":\"https://control.example\"",
+                "\"control_url\":\"https://control.example:9443\"",
+            );
+        let parsed = parse_plan(changed.as_bytes()).expect("canonical plan with ports");
+        assert_eq!(
+            parsed.connector.trust.enrollment_url,
+            "https://enroll.example:8443/"
+        );
+        assert_eq!(
+            parsed.connector.trust.control_url,
+            "https://control.example:9443"
+        );
     }
 
     #[test]
