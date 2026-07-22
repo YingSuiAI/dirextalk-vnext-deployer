@@ -299,13 +299,14 @@ fn apply_with(inputs: ConnectorApplyInputs, operator: &dyn Operator) -> Result<A
             .prepared_receipt_sha256
             .clone()
             .ok_or_else(|| ReleaseError::Deployment("missing prepared receipt".into()))?;
+        let finalize_material = finalize_material(&plan, &handoff)?;
         let response = invoke_v2(
             operator,
             &record,
             "finalize_connector_material",
             rev.desired,
             rev.observed,
-            &material,
+            &finalize_material,
             Some(receipt),
         )?;
         let (_, finalized, summary) = v2_result(&response, "finalized")?;
@@ -376,6 +377,25 @@ fn material(c: &[u8], e: &[u8], co: &[u8], i: &[u8], p: &[u8], h: &[u8]) -> Resu
     }
     Ok(out)
 }
+fn finalize_material(plan: &[u8], handoff: &[u8]) -> Result<Vec<u8>> {
+    if plan.is_empty() || handoff.is_empty() || plan.len() > 65_536 || handoff.len() > 65_536 {
+        return Err(ReleaseError::Deployment("invalid finalize material".into()));
+    }
+    let fields: [&[u8]; 6] = [&[], &[], &[], &[], plan, handoff];
+    let mut out = Vec::new();
+    out.extend_from_slice(b"DTXBMT01");
+    for field in fields {
+        out.extend_from_slice(
+            &(u32::try_from(field.len())
+                .map_err(|_| ReleaseError::Deployment("material too large".into()))?)
+            .to_be_bytes(),
+        );
+    }
+    for field in fields {
+        out.extend_from_slice(field);
+    }
+    Ok(out)
+}
 fn invoke_v2(
     operator: &dyn Operator,
     r: &ConnectorExecutionRecordV1,
@@ -385,7 +405,7 @@ fn invoke_v2(
     material: &[u8],
     receipt: Option<String>,
 ) -> Result<Value> {
-    let header = json!({"protocol":"dirextalk.host-control.operator.v2","tenant_id":r.tenant_id,"host_id":r.host_id,"host_operation_id":if op=="prepare_connector_material" {&r.prepare_host_operation_id} else {&r.finalize_host_operation_id},"expected_desired_revision":desired,"expected_observed_revision":observed,"connector_id":r.connector_id,"adapter":r.adapter,"approved_release_sha256":r.release_sha256,"lifecycle_operation_id":r.lifecycle_operation_id,"platform_target":platform()?,"expiry_millis":r.expiry_millis,"plan_sha256":r.plan_sha256,"handoff_sha256":r.handoff_sha256,"config_sha256":r.config_sha256,"enrollment_ca_sha256":r.enrollment_ca_sha256,"control_ca_sha256":r.control_ca_sha256,"issuer_ca_sha256":r.issuer_ca_sha256,"lifecycle_material_sha256":r.material_sha256,"payload_sha256":r.material_sha256,"prepared_receipt_sha256":receipt,"operation":op});
+    let header = json!({"protocol":"dirextalk.host-control.operator.v2","tenant_id":r.tenant_id,"host_id":r.host_id,"host_operation_id":if op=="prepare_connector_material" {&r.prepare_host_operation_id} else {&r.finalize_host_operation_id},"expected_desired_revision":desired,"expected_observed_revision":observed,"connector_id":r.connector_id,"adapter":r.adapter,"approved_release_sha256":r.release_sha256,"lifecycle_operation_id":r.lifecycle_operation_id,"platform_target":platform()?,"expiry_millis":r.expiry_millis,"plan_sha256":r.plan_sha256,"handoff_sha256":r.handoff_sha256,"config_sha256":r.config_sha256,"enrollment_ca_sha256":r.enrollment_ca_sha256,"control_ca_sha256":r.control_ca_sha256,"issuer_ca_sha256":r.issuer_ca_sha256,"lifecycle_material_sha256":r.material_sha256,"payload_sha256":hash(material),"prepared_receipt_sha256":receipt,"operation":op});
     let header = serde_json::to_vec(&header)?;
     let mut frame = Vec::new();
     frame.extend_from_slice(b"DTXHC02\0");
