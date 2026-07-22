@@ -72,6 +72,18 @@ fn ed25519_fingerprint_matches_aws_padding_and_openssh_prefix() {
     );
 }
 
+#[test]
+fn console_output_accepts_aws_cli_raw_text_and_canonical_blob_json() {
+    let raw = "boot\nDTXHK01 instance token ami ssh-ed25519 key\nready\n";
+    assert_eq!(workflow::decode_console_output(raw).expect("raw"), raw);
+    let encoded = STANDARD.encode(raw);
+    assert_eq!(
+        workflow::decode_console_output(&encoded).expect("encoded"),
+        raw
+    );
+    assert!(workflow::decode_console_output("not encoded and no attestation").is_err());
+}
+
 fn append_directory(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
     let mut header = tar::Header::new_ustar();
     header.set_entry_type(tar::EntryType::Directory);

@@ -1368,11 +1368,9 @@ fn ensure_host_key(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecut
     let encoded_output = value["Output"]
         .as_str()
         .ok_or_else(|| contract("EC2 console output is missing"))?;
-    let output_bytes = decode_canonical_base64(encoded_output, "EC2 console output")?;
-    let output = std::str::from_utf8(&output_bytes)
-        .map_err(|_| contract("EC2 console output is not UTF-8"))?;
+    let output = decode_console_output(encoded_output)?;
     let attestation =
-        parse_console_host_key(output, instance_id, &state.client_token_sha256, ami_id)?;
+        parse_console_host_key(&output, instance_id, &state.client_token_sha256, ami_id)?;
     let ip = state
         .eip
         .as_ref()
@@ -1405,6 +1403,14 @@ fn ensure_host_key(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecut
     });
     state.phase = LifecyclePhase::HostKeyPinned;
     persist(store, state)
+}
+
+pub(super) fn decode_console_output(value: &str) -> Result<String> {
+    if value.lines().any(|line| line.starts_with("DTXHK01 ")) {
+        return Ok(value.to_owned());
+    }
+    let decoded = decode_canonical_base64(value, "EC2 console output")?;
+    String::from_utf8(decoded).map_err(|_| contract("EC2 console output is not UTF-8"))
 }
 
 fn parse_console_host_key(
