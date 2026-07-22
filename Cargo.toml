@@ -17,6 +17,7 @@ name = "dirextalk-vnext-deployer"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22.1"
 clap = { version = "4.6.2", features = ["derive"] }
 flate2 = "1.1.9"
 hex = "0.4.3"
@@ -28,6 +29,7 @@ tar = "0.4.46"
 thiserror = "2.0.18"
 uuid = { version = "1.22.0", features = ["v7"] }
 zip = { version = "8.3.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zstd = "0.13.3"
 
 [target.'cfg(unix)'.dependencies]
 fs2 = "0.4.3"

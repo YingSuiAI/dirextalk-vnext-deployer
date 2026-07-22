@@ -114,27 +114,31 @@ shell-script escape hatch.
 ## Single-node AWS EC2 lifecycle
 
 `ec2-plan` validates one immutable Ubuntu 24.04 amd64 node in `ap-east-1` and
-prints fixed `aws`, `ssh`, and `scp` argv. `ec2-apply`/`ec2-resume`,
+prints the closed action set and conservative monthly cost ceiling.
+`ec2-apply`/`ec2-resume`,
 `ec2-update`, and `ec2-destroy` remain dry runs unless `--execute` is present.
-The manifest requires the exact `dirextalk/vnet-server@sha256:<64>` image and
-stack bundle digest, a 0600 private key, and a pinned host key. State is a
-0600 integrity-sealed journal; status redacts credentials and destroy only
-touches resources recorded as Dirextalk-owned. Use the same manifest shape for
-`x6`, `x7`, or `x8` (see `aws-ec2.example.json`). No AWS credentials are read
-from files or persisted; the standard AWS environment/profile is inherited by
-the fixed `aws` process.
+The manifest requires exact `dirextalk/vnet-server@sha256:<64>` and
+`dirextalk/vnet-migrator@sha256:<64>` images plus a digest-bound stack bundle.
+Apply requires `--max-monthly-usd`, generates a per-operation Ed25519 key,
+pins the host key against an instance/client-token/AMI-bound EC2 console
+attestation, and transfers only the fixed bundle and request paths. State and
+key material live in a locked 0700 directory as 0600 integrity-sealed files.
+Destroy re-reads ownership tags before every destructive effect, retains the
+root EBS volume by default, and requires a separate exact volume-ID fence to
+purge it. Use the same manifest shape for `x6`, `x7`, or `x8`.
 
-`ec2-status` and `ec2-update` perform one bounded, read-only Docker Hub
-discovery using the fixed command `docker buildx imagetools inspect` for
+`ec2-status` performs one bounded, read-only Docker Hub discovery using the
+fixed command `docker buildx imagetools inspect` for
 `docker.io/dirextalk/vnet-server:latest`. Its JSON manifest digest must parse
-as canonical `sha256:<64>`. The tag is comparison-only: apply/update state and
-the digest-bound installer contract accept only
-`dirextalk/vnet-server@sha256:<64>`, and update refuses a manifest whose exact
-digest does not match the registry readback. Docker credentials, command
-stderr, and registry tokens are neither printed nor persisted.
+as canonical `sha256:<64>`. The tag is comparison-only and is never consulted
+by apply or update. Updates consume only the explicitly supplied immutable
+bundle and image digests; this stage fails closed on cross-version updates
+until migration-history compatibility evidence is available. Docker
+credentials, command stderr, and registry tokens are neither printed nor
+persisted.
 
 ```text
-cargo run --locked -- ec2-plan --manifest aws-ec2.example.json
+cargo run --locked -- ec2-plan --manifest aws-ec2.example.json --max-monthly-usd 100
 cargo run --locked -- ec2-plan --manifest aws-ec2-x7.example.json
 cargo run --locked -- ec2-plan --manifest aws-ec2-x8.example.json
 ```

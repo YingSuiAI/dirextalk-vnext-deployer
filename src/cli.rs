@@ -127,8 +127,8 @@ enum Commands {
     Ec2Plan {
         #[arg(long)]
         manifest: PathBuf,
-        #[arg(long, default_value = ".dirextalk-ec2-state")]
-        state_dir: PathBuf,
+        #[arg(long)]
+        max_monthly_usd: Option<u32>,
     },
     /// Apply or resume one AWS EC2 node; requires explicit --execute.
     Ec2Apply {
@@ -136,6 +136,8 @@ enum Commands {
         manifest: PathBuf,
         #[arg(long, default_value = ".dirextalk-ec2-state")]
         state_dir: PathBuf,
+        #[arg(long)]
+        max_monthly_usd: u32,
         #[arg(long)]
         execute: bool,
     },
@@ -145,6 +147,8 @@ enum Commands {
         manifest: PathBuf,
         #[arg(long, default_value = ".dirextalk-ec2-state")]
         state_dir: PathBuf,
+        #[arg(long)]
+        max_monthly_usd: u32,
         #[arg(long)]
         execute: bool,
     },
@@ -179,6 +183,10 @@ enum Commands {
         state_dir: PathBuf,
         #[arg(long)]
         execute: bool,
+        #[arg(long)]
+        purge_volume: bool,
+        #[arg(long, requires = "purge_volume")]
+        purge_volume_id: Option<String>,
     },
 }
 
@@ -307,24 +315,30 @@ pub fn run(cli: Cli) -> Result<()> {
             })?;
             print_json(&result)?;
         }
-        Commands::Ec2Plan { manifest, .. } => {
+        Commands::Ec2Plan {
+            manifest,
+            max_monthly_usd,
+        } => {
             let m = AwsEc2Manifest::load(&manifest)?;
-            print_json(&aws_ec2::plan(&m)?)?;
+            print_json(&aws_ec2::plan(&m, max_monthly_usd)?)?;
         }
         Commands::Ec2Apply {
             manifest,
             state_dir,
+            max_monthly_usd,
             execute,
         }
         | Commands::Ec2Resume {
             manifest,
             state_dir,
+            max_monthly_usd,
             execute,
         } => {
             let m = AwsEc2Manifest::load(&manifest)?;
             print_json(&aws_ec2::apply(
                 &m,
                 &state_dir,
+                max_monthly_usd,
                 execute,
                 &ProductionAwsExecutor,
             )?)?;
@@ -334,7 +348,7 @@ pub fn run(cli: Cli) -> Result<()> {
             state_dir,
         } => {
             let m = AwsEc2Manifest::load(&manifest)?;
-            print_json(&aws_ec2::status_with_executor(
+            print_json(&aws_ec2::status_with_registry(
                 &m,
                 &state_dir,
                 &ProductionRegistryExecutor,
@@ -345,7 +359,7 @@ pub fn run(cli: Cli) -> Result<()> {
             state_dir,
         } => {
             let m = AwsEc2Manifest::load(&manifest)?;
-            print_json(&aws_ec2::verify(&m, &state_dir)?)?;
+            print_json(&aws_ec2::verify(&m, &state_dir, &ProductionAwsExecutor)?)?;
         }
         Commands::Ec2Update {
             manifest,
@@ -358,19 +372,22 @@ pub fn run(cli: Cli) -> Result<()> {
                 &state_dir,
                 execute,
                 &ProductionAwsExecutor,
-                &ProductionRegistryExecutor,
             )?)?;
         }
         Commands::Ec2Destroy {
             manifest,
             state_dir,
             execute,
+            purge_volume,
+            purge_volume_id,
         } => {
             let m = AwsEc2Manifest::load(&manifest)?;
             print_json(&aws_ec2::destroy(
                 &m,
                 &state_dir,
                 execute,
+                purge_volume,
+                purge_volume_id.as_deref(),
                 &ProductionAwsExecutor,
             )?)?;
         }

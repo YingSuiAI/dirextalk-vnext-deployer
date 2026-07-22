@@ -15,9 +15,10 @@ Run from the repository root.
 | deployment dry-run plan | `cargo run --locked -- deployment-plan --manifest deployment.example.json` |
 | deployment status readback | `sudo cargo run --locked -- deployment-status --operation-id <uuid>` |
 | EC2 lifecycle plan (x6/x7/x8) | `cargo run --locked -- ec2-plan --manifest aws-ec2.example.json` |
-| EC2 apply/resume (explicit mutation) | `cargo run --locked -- ec2-apply --manifest aws-ec2.example.json --execute` |
+| EC2 apply/resume (explicit mutation) | `cargo run --locked -- ec2-apply --manifest aws-ec2.example.json --max-monthly-usd 100 --execute` |
 | EC2 status/verify | `cargo run --locked -- ec2-status --manifest aws-ec2.example.json` / `cargo run --locked -- ec2-verify --manifest aws-ec2.example.json` |
 | EC2 update/destroy (explicit mutation) | `cargo run --locked -- ec2-update --manifest aws-ec2.example.json --execute` / `cargo run --locked -- ec2-destroy --manifest aws-ec2.example.json --execute` |
+| EC2 retained-volume purge (separate exact fence) | `cargo run --locked -- ec2-destroy --manifest aws-ec2.example.json --purge-volume --purge-volume-id vol-... --execute` |
 | Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
 
 `build` only executes commands when `--execute` is supplied. `publish` also
@@ -36,10 +37,11 @@ sanitized Host responses. It is not an SSH/cloud transport.
 `deployment-validate` and `deployment-plan` are cross-platform;
 `deployment-status` is Unix-only and fails closed as unsupported elsewhere.
 
-`ec2-status` and `ec2-update` resolve Docker Hub `latest` through the fixed
-read-only `docker buildx imagetools inspect` argv. They parse only a canonical
-manifest `sha256:<64>` and compare it to the exact
-`dirextalk/vnet-server@sha256:<64>` manifest value; `latest` is never installed.
+`ec2-status` resolves Docker Hub `latest` through the fixed
+read-only `docker buildx imagetools inspect` argv. It parses only a canonical
+manifest `sha256:<64>` and compare it to the installed immutable
+`dirextalk/vnet-server@sha256:<64>` receipt; `latest` is never installed or
+used to gate `ec2-update`.
 
 On Windows without Visual C++ Build Tools, use the repository's development
 wrapper, for example `powershell -File scripts\cargo.ps1 test --locked`. It
