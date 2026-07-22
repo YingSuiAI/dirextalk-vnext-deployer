@@ -917,6 +917,24 @@ enum V2Reply {
     Success(V2Result),
     MaterialRequired,
 }
+
+fn surface_rejection_code(generic: &'static str, code: &str) -> ReleaseError {
+    if stable_rejection_code(code) {
+        ReleaseError::Deployment(format!("{generic}: {code}"))
+    } else {
+        deployment(generic)
+    }
+}
+
+fn stable_rejection_code(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (3..=64).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_uppercase)
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
 fn invoke_v2(operator: &dyn Operator, header: &V2Header, payload: &[u8]) -> Result<V2Reply> {
     let response: V2Response =
         decode_strict(&operator.invoke(frame(*b"DTXHC02\0", header, payload)?)?)?;
@@ -928,9 +946,10 @@ fn invoke_v2(operator: &dyn Operator, header: &V2Header, payload: &[u8]) -> Resu
         (ResponseStatus::Rejected, None, Some(code)) if code == "MATERIAL_REQUIRED" => {
             Ok(V2Reply::MaterialRequired)
         }
-        (ResponseStatus::Rejected, None, Some(_)) => {
-            Err(deployment("Host Supervisor rejected V2 operation"))
-        }
+        (ResponseStatus::Rejected, None, Some(code)) => Err(surface_rejection_code(
+            "Host Supervisor rejected V2 operation",
+            &code,
+        )),
         _ => Err(deployment("invalid V2 response shape")),
     }
 }
@@ -944,8 +963,11 @@ fn invoke_v1(operator: &dyn Operator, request: &V1Request) -> Result<V1Result> {
     match (response.status, response.result, response.error) {
         (ResponseStatus::Succeeded, Some(result), None) => Ok(result),
         (ResponseStatus::Rejected, None, Some(error)) => {
-            let _ = (&error.code, error.current_revision);
-            Err(deployment("Host Supervisor rejected V1 operation"))
+            let _ = error.current_revision;
+            Err(surface_rejection_code(
+                "Host Supervisor rejected V1 operation",
+                &error.code,
+            ))
         }
         _ => Err(deployment("invalid V1 response shape")),
     }
@@ -1759,6 +1781,65 @@ mod tests {
         ));
         let frames = operator.frames.lock().expect("frames");
         assert_eq!(&frames[0][frames[0].len() - 4..], &0u32.to_be_bytes());
+    }
+
+    #[test]
+    fn stable_rejection_codes_are_surfaced_without_arbitrary_text() {
+        assert!(stable_rejection_code("HOST_BUSY"));
+        assert!(stable_rejection_code("A12"));
+        assert!(!stable_rejection_code("abnormal"));
+        assert!(!stable_rejection_code("NO"));
+        assert!(!stable_rejection_code("HOST-BUSY"));
+        assert!(!stable_rejection_code("HOST_BUSY\nsecret"));
+
+        let plan = parse_plan(PLAN).expect("plan");
+        let record = record(&plan);
+        let header = v2_header(
+            &record,
+            V2Operation::PrepareConnectorMaterial,
+            record.initial_revision,
+            &[],
+        )
+        .expect("header");
+        let operator = QueueOperator {
+            responses: Mutex::new(VecDeque::from([
+                br#"{"protocol":"dirextalk.host-control.operator.v2","status":"rejected","error":"HOST_BUSY"}"#.to_vec(),
+            ])),
+            frames: Mutex::new(Vec::new()),
+        };
+        let Err(error) = invoke_v2(&operator, &header, &[]) else {
+            panic!("rejected response unexpectedly succeeded")
+        };
+        assert_eq!(
+            error.to_string(),
+            "deployment contract error: Host Supervisor rejected V2 operation: HOST_BUSY"
+        );
+
+        let operator = QueueOperator {
+            responses: Mutex::new(VecDeque::from([
+                br#"{"protocol":"dirextalk.host-control.operator.v2","status":"rejected","error":"HOST_BUSY\nsecret"}"#.to_vec(),
+            ])),
+            frames: Mutex::new(Vec::new()),
+        };
+        let Err(error) = invoke_v2(&operator, &header, &[]) else {
+            panic!("rejected response unexpectedly succeeded")
+        };
+        assert_eq!(
+            error.to_string(),
+            "deployment contract error: Host Supervisor rejected V2 operation"
+        );
+
+        let operator = QueueOperator {
+            responses: Mutex::new(VecDeque::from([
+                br#"{"protocol":"dirextalk.host-control.operator.v1","status":"rejected","result":null,"error":{"code":"HOST_BUSY","current_revision":null}}"#.to_vec(),
+            ])),
+            frames: Mutex::new(Vec::new()),
+        };
+        let error = invoke_v1(&operator, &V1Request::snapshot(&plan)).expect_err("rejected");
+        assert_eq!(
+            error.to_string(),
+            "deployment contract error: Host Supervisor rejected V1 operation: HOST_BUSY"
+        );
     }
 
     #[test]
