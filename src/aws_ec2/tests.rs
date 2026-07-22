@@ -30,6 +30,35 @@ fn canonical(value: &impl Serialize) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn derived_public_key_accepts_openssh_comment_only_when_identity_matches() {
+    let key = STANDARD.encode([7_u8; 32]);
+    let comment = "dirextalk:x6:019f89e7-47ef-7ed3-b8e8-de8d31e8f99e";
+    workflow::validate_derived_public_key(
+        &format!("ssh-ed25519 {key}\n"),
+        "ssh-ed25519",
+        &key,
+        comment,
+    )
+    .expect("comment-free output");
+    workflow::validate_derived_public_key(
+        &format!("ssh-ed25519 {key} {comment}\n"),
+        "ssh-ed25519",
+        &key,
+        comment,
+    )
+    .expect("OpenSSH comment output");
+    assert!(
+        workflow::validate_derived_public_key(
+            &format!("ssh-ed25519 {key} dirextalk:x7:different\n"),
+            "ssh-ed25519",
+            &key,
+            comment,
+        )
+        .is_err()
+    );
+}
+
 fn append_directory(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
     let mut header = tar::Header::new_ustar();
     header.set_entry_type(tar::EntryType::Directory);

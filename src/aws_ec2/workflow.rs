@@ -408,13 +408,12 @@ fn ensure_key(
                 15,
             ))?
             .stdout;
-        let derived_fields = derived.split_ascii_whitespace().collect::<Vec<_>>();
-        if derived_fields.len() != 2
-            || derived_fields[0] != public_fields[0]
-            || derived_fields[1] != public_fields[1]
-        {
-            return Err(ReleaseError::OperationConflict);
-        }
+        validate_derived_public_key(
+            &derived,
+            public_fields[0],
+            public_fields[1],
+            &expected_comment,
+        )?;
         let fingerprint = executor
             .run(&FixedCommand::new(
                 "fingerprint-local-ed25519-key",
@@ -489,6 +488,25 @@ fn ensure_key(
     state.key.as_mut().expect("key").imported = true;
     state.phase = LifecyclePhase::KeyReady;
     persist(store, state)
+}
+
+pub(super) fn validate_derived_public_key(
+    derived: &str,
+    expected_type: &str,
+    expected_key: &str,
+    expected_comment: &str,
+) -> Result<()> {
+    let fields = derived.split_ascii_whitespace().collect::<Vec<_>>();
+    if !(fields.len() == 2 || fields.len() == 3)
+        || fields[0] != expected_type
+        || fields[1] != expected_key
+        || fields
+            .get(2)
+            .is_some_and(|comment| *comment != expected_comment)
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(())
 }
 
 fn set_key_modes(private: &Path, public: &Path) -> Result<()> {
