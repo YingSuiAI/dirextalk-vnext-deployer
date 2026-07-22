@@ -2723,6 +2723,12 @@ mod tests {
             .claim(&manifest_for_record(&parent), &parent, &proof)
             .expect("parent claim");
         let instance = "018f856e-e0bd-72d2-9428-58d50cf77eaf";
+        assert!(
+            store
+                .read_connector_claim(parent.operation_id(), instance)
+                .expect("no claim read")
+                .is_none()
+        );
         let claim = ConnectorClaim::prepared(&parent, instance, None).expect("connector claim");
         store
             .claim_connector(&claim, &proof)

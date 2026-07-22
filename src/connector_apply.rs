@@ -316,9 +316,7 @@ fn apply_with(
     let proof = validate_host_evidence(&plan_host_tuple(&plan))?;
     let existing_claim =
         store.read_connector_claim(&inputs.operation_id, &plan.connector.instance_id)?;
-    if expired(plan.connector.expires_at_millis)? && existing_claim.is_none() {
-        return Err(deployment("expired plan cannot create a Connector claim"));
-    }
+    let plan_expired = expired(plan.connector.expires_at_millis)?;
     let mut preflight_files = if existing_claim.is_none() {
         Some(load_material_files(inputs, &plan, &plan_file.digest)?)
     } else {
@@ -393,13 +391,17 @@ fn apply_with(
     converge_deployment_projection(store, &mut operation, &record)?;
 
     if record.phase == Phase::Claimed {
-        let result = invoke_v2_recoverable(
-            operator,
-            &record,
-            V2Operation::PrepareConnectorMaterial,
-            inputs,
-            &plan,
-        )?;
+        let result = if plan_expired {
+            invoke_expired_unclaimed_proof(operator, &record)?
+        } else {
+            invoke_v2_recoverable(
+                operator,
+                &record,
+                V2Operation::PrepareConnectorMaterial,
+                inputs,
+                &plan,
+            )?
+        };
         if is_expired_unclaimed_prepare(&result) {
             record.phase = Phase::ExpiredUnclaimed;
             persist_record(&lease, &record)?;
@@ -884,6 +886,41 @@ fn invoke_v2_recoverable(
             }
         }
     }
+}
+
+/// Obtains the sole accepted expired-bootstrap proof without ever supplying material.
+fn invoke_expired_unclaimed_proof(
+    operator: &dyn Operator,
+    record: &ConnectorExecutionRecordV1,
+) -> Result<V2Result> {
+    let expected = record.initial_revision;
+    let empty = Vec::new();
+    let header = v2_header(
+        record,
+        V2Operation::PrepareConnectorMaterial,
+        expected,
+        &empty,
+    )?;
+    if digest(&serde_json::to_vec(&header)?) != record.prepare_replay_header_sha256 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let V2Reply::Success(result) = invoke_v2(operator, &header, &empty)? else {
+        return Err(deployment(
+            "expired Connector bootstrap requires header-only no-effect proof",
+        ));
+    };
+    let result = validate_v2_result(
+        result,
+        record,
+        V2Operation::PrepareConnectorMaterial,
+        expected,
+    )?;
+    if !is_expired_unclaimed_prepare(&result) {
+        return Err(deployment(
+            "expired Connector bootstrap requires exact expired-unclaimed proof",
+        ));
+    }
+    Ok(result)
 }
 
 fn v2_header(
@@ -1955,6 +1992,68 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn expired_planned_entry_uses_only_replayable_header_proof() {
+        let plan = parse_plan(PLAN).expect("plan");
+        let mut record = record(&plan);
+        let header = v2_header(
+            &record,
+            V2Operation::PrepareConnectorMaterial,
+            record.initial_revision,
+            &[],
+        )
+        .expect("header");
+        record.prepare_replay_header_sha256 = digest(&serde_json::to_vec(&header).expect("json"));
+        let response = format!(
+            "{{\"protocol\":\"{PROTOCOL_V2}\",\"status\":\"succeeded\",\"result\":{{\"operation\":\"prepare_connector_material\",\"application\":\"replayed\",\"disposition\":\"expired_unclaimed\",\"desired_revision\":1,\"observed_revision\":1,\"connector_id\":\"{}\",\"lifecycle_state\":\"expired_unclaimed\"}}}}",
+            record.connector_id,
+        );
+        let operator = QueueOperator {
+            responses: Mutex::new(VecDeque::from([
+                response.as_bytes().to_vec(),
+                response.into_bytes(),
+            ])),
+            frames: Mutex::new(Vec::new()),
+        };
+        assert!(is_expired_unclaimed_prepare(
+            &invoke_expired_unclaimed_proof(&operator, &record).expect("first proof")
+        ));
+        assert!(is_expired_unclaimed_prepare(
+            &invoke_expired_unclaimed_proof(&operator, &record).expect("replay proof")
+        ));
+        assert!(
+            operator
+                .frames
+                .lock()
+                .expect("frames")
+                .iter()
+                .all(|frame| frame[frame.len() - 4..] == [0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn expired_planned_entry_refuses_material_request() {
+        let plan = parse_plan(PLAN).expect("plan");
+        let mut record = record(&plan);
+        let header = v2_header(
+            &record,
+            V2Operation::PrepareConnectorMaterial,
+            record.initial_revision,
+            &[],
+        )
+        .expect("header");
+        record.prepare_replay_header_sha256 = digest(&serde_json::to_vec(&header).expect("json"));
+        let operator = QueueOperator {
+            responses: Mutex::new(VecDeque::from([
+                br#"{"protocol":"dirextalk.host-control.operator.v2","status":"rejected","error":"MATERIAL_REQUIRED"}"#.to_vec(),
+            ])),
+            frames: Mutex::new(Vec::new()),
+        };
+        assert!(invoke_expired_unclaimed_proof(&operator, &record).is_err());
+        let frames = operator.frames.lock().expect("frames");
+        assert_eq!(&frames[0][frames[0].len() - 4..], [0, 0, 0, 0]);
     }
 
     #[test]
