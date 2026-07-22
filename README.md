@@ -93,8 +93,10 @@ acceptance is implemented or claimed. See
 `deployment-connector-apply --execute` is a closed, root-only local transport
 for one Connector target. It validates the existing deployment manifest and
 Server-issued Connector plan, reads the protected handoff, config, and three
-CA files, then persists `.dirextalk-connector-execution-state` before each
-fixed Host Supervisor V2/V1 effect. It invokes only
+CA files, then advances the pre-existing canonical deployment operation and
+Connector claim in `/var/lib/dirextalk-vnext-deployer` before each fixed Host
+Supervisor V2/V1 effect. The Connector plan operation ID is correlation only;
+it is never substituted for deployment ownership. It invokes only
 `/usr/local/libexec/dirextalk/dtx-agent-host-supervisor` with no arguments.
 It performs V2 prepare, ordinary V1 start, independent V1 Running observation,
 and V2 finalize. No secret handoff, enrollment token, bearer, raw receipt, or

@@ -13,19 +13,22 @@ Run from the repository root.
 | native build plan | `cargo run --locked -- build --manifest release.example.json --target windows-x64` |
 | deployment contract validation | `cargo run --locked -- deployment-validate --manifest deployment.example.json` |
 | deployment dry-run plan | `cargo run --locked -- deployment-plan --manifest deployment.example.json` |
-| deployment status readback | `cargo run --locked -- deployment-status --operation-id <uuid>` |
-| Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
+| deployment status readback | `sudo cargo run --locked -- deployment-status --operation-id <uuid>` |
+| Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
 
 `build` only executes commands when `--execute` is supplied. `publish` also
 requires `--execute` plus one or more destination flags.
 
 `deployment-connector-apply` is the sole production local Connector-host
 transport. It requires root and `--execute`, persists its local lifecycle
-record before every effect, and invokes only the fixed no-argument Host
-Supervisor executable. It accepts no remote command, path in the protocol,
+record under the canonical deployment operation in the fixed root-owned
+`/var/lib/dirextalk-vnext-deployer` store before every effect, and invokes only
+the fixed no-argument Host Supervisor executable. It accepts no remote command,
+path in the protocol,
 environment, URL, or shell. The handoff must be a root-owned, no-follow `0600`
-regular file; output and durable state retain only digests and sanitized Host
-responses. It is not an SSH/cloud transport.
+regular file. Manifest, plan, config, and CA inputs must also be root-owned
+closed-mode regular files. Output and durable state retain only digests and
+sanitized Host responses. It is not an SSH/cloud transport.
 `deployment-validate` and `deployment-plan` are cross-platform;
 `deployment-status` is Unix-only and fails closed as unsupported elsewhere.
 

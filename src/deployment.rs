@@ -9,7 +9,7 @@ use std::{
 #[cfg(unix)]
 use fs2::FileExt;
 #[cfg(unix)]
-use rustix::fs::{Mode, OFlags, open};
+use rustix::fs::{AtFlags, Mode, OFlags, open, openat, renameat, unlinkat};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,7 +25,7 @@ use crate::error::{ReleaseError, Result, io_error};
 
 const MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(unix)]
-const STATE_DIR: &str = ".dirextalk-deployment-state";
+const STATE_DIR: &str = "/var/lib/dirextalk-vnext-deployer";
 const HOST_EVIDENCE_PATH: &str = "/etc/dirextalk/host-supervisor/host.json";
 #[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -41,7 +41,13 @@ impl DeploymentManifest {
     pub fn load(path: &Path) -> Result<Self> {
         require_safe_file(path, MAX_BYTES)?;
         let bytes = fs::read(path).map_err(io_error(path))?;
-        let manifest: DeploymentContract = serde_json::from_slice(&bytes)?;
+        Self::from_bytes(&bytes)
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || bytes.len() as u64 > MAX_BYTES {
+            return Err(contract("deployment manifest bytes are invalid"));
+        }
+        let manifest: DeploymentContract = serde_json::from_slice(bytes)?;
         manifest.validate()?;
         Ok(Self {
             manifest,
@@ -279,11 +285,11 @@ impl HostTuple {
         for (v, n) in [
             (&self.tenant_id, "tenant_id"),
             (&self.host_id, "host_id"),
-            (&self.owner_id, "owner_id"),
             (&self.host_credential_id, "host_credential_id"),
         ] {
             uuid(v, n)?;
         }
+        identity_id(&self.owner_id, "owner_id")?;
         Ok(())
     }
 }
@@ -658,6 +664,18 @@ impl OperationRecord {
     pub fn predecessor_operation_id(&self) -> Option<&str> {
         self.predecessor_operation_id.as_deref()
     }
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+    #[must_use]
+    pub const fn binding(&self) -> &OperationBinding {
+        &self.binding
+    }
+    #[must_use]
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
     pub fn planned(
         manifest: &DeploymentManifest,
         target: &str,
@@ -837,11 +855,28 @@ pub struct DeploymentStateStore;
 #[cfg(unix)]
 #[allow(clippy::missing_errors_doc)]
 impl DeploymentStateStore {
+    pub fn read_connector_claim(
+        &self,
+        operation_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<ConnectorClaim>> {
+        let path = self.connector_claim_path(instance_id, operation_id)?;
+        match Self::read_claim(&path) {
+            Ok(claim) => Ok(Some(claim)),
+            Err(ReleaseError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub fn fixed() -> Result<Self> {
+        if rustix::process::geteuid().as_raw() != 0 {
+            return Err(contract("fixed deployment state requires root"));
+        }
         Ok(Self {
-            root: std::env::current_dir()
-                .map_err(io_error("."))?
-                .join(STATE_DIR),
+            root: PathBuf::from(STATE_DIR),
         })
     }
     #[must_use]
@@ -925,6 +960,31 @@ impl DeploymentStateStore {
             return Err(ReleaseError::StateUnsafe(path));
         }
         Ok(record)
+    }
+    pub fn lock_connector_execution(
+        &self,
+        operation_id: &str,
+        instance_id: &str,
+    ) -> Result<ConnectorExecutionLease> {
+        uuid(operation_id, "operation_id")?;
+        uuid(instance_id, "instance_id")?;
+        let lock = self.lock(&format!("execution-{operation_id}"))?;
+        let operation = self.read(operation_id)?;
+        let owner = Self::read_connector_owner(&self.connector_owner_path(instance_id)?)?;
+        let claim = Self::read_claim(&self.connector_claim_path(instance_id, operation_id)?)?;
+        if owner.current_operation_id != operation_id
+            || owner.claim_identity_digest != connector_claim_identity_digest(&claim)?
+            || claim.operation_id != operation.operation_id
+        {
+            return Err(ReleaseError::OperationConflict);
+        }
+        Ok(ConnectorExecutionLease {
+            store: Self {
+                root: self.root.clone(),
+            },
+            operation_id: operation_id.to_owned(),
+            _lock: lock,
+        })
     }
     pub fn advance(&self, id: &str, phase: OperationPhase) -> Result<OperationRecord> {
         let (_lock, mut record) = self.lock_current(id)?;
@@ -1050,19 +1110,39 @@ impl DeploymentStateStore {
     }
     fn write_path<T: Serialize>(&self, path: &Path, record: &T) -> Result<()> {
         let bytes = serialize_bounded(record)?;
-        match Self::open_existing(path) {
+        self.ensure_root()?;
+        let name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| contract("invalid state filename"))?;
+        let root_fd = open(
+            &self.root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|e| io_error(&self.root)(std::io::Error::from(e)))?;
+        match openat(
+            &root_fd,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(std::io::Error::from)
+        {
             Ok(file) => Self::validate_open_state_file(path, &file)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(path)(error)),
         }
         let mut created = None;
         for _ in 0..32 {
-            let tmp = path.with_extension(format!(
-                "tmp.{}.{}",
+            let tmp = format!(
+                ".tmp.{}.{}",
                 std::process::id(),
                 TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            match open(
+            );
+            match openat(
+                &root_fd,
                 &tmp,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::from_raw_mode(0o600),
@@ -1072,20 +1152,20 @@ impl DeploymentStateStore {
                     break;
                 }
                 Err(rustix::io::Errno::EXIST) => {}
-                Err(e) => return Err(io_error(&tmp)(std::io::Error::from(e))),
+                Err(e) => return Err(io_error(self.root.join(&tmp))(std::io::Error::from(e))),
             }
         }
         let (tmp, mut f) =
             created.ok_or_else(|| contract("state temporary-name collision limit exceeded"))?;
         if let Err(error) = f.write_all(&bytes).and_then(|()| f.sync_all()) {
-            let _ = fs::remove_file(&tmp);
-            return Err(io_error(&tmp)(error));
+            let _ = unlinkat(&root_fd, &tmp, AtFlags::empty());
+            return Err(io_error(self.root.join(&tmp))(error));
         }
-        if let Err(error) = fs::rename(&tmp, path) {
-            let _ = fs::remove_file(&tmp);
-            return Err(io_error(path)(error));
+        if let Err(error) = renameat(&root_fd, &tmp, &root_fd, name) {
+            let _ = unlinkat(&root_fd, &tmp, AtFlags::empty());
+            return Err(io_error(path)(std::io::Error::from(error)));
         }
-        sync_dir(&self.root)?;
+        rustix::fs::fsync(&root_fd).map_err(|e| io_error(&self.root)(std::io::Error::from(e)))?;
         Ok(())
     }
     fn ensure_root(&self) -> Result<()> {
@@ -1169,6 +1249,48 @@ impl DeploymentStateStore {
 #[cfg(unix)]
 struct Lock {
     file: File,
+}
+
+#[cfg(unix)]
+pub struct ConnectorExecutionLease {
+    store: DeploymentStateStore,
+    operation_id: String,
+    _lock: Lock,
+}
+#[cfg(unix)]
+impl ConnectorExecutionLease {
+    /// Reads the exact durable execution projection, if one exists.
+    ///
+    /// # Errors
+    /// Returns an error when state is missing unsafely, malformed, or unreadable.
+    pub fn read(&self) -> Result<Option<Vec<u8>>> {
+        let path = self
+            .store
+            .root
+            .join(format!("connector-execution-{}.json", self.operation_id));
+        match DeploymentStateStore::read_secure(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(ReleaseError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    /// Atomically replaces the execution projection and fsyncs the state directory.
+    ///
+    /// # Errors
+    /// Returns an error when serialization or the protected atomic write fails.
+    pub fn write<T: Serialize>(&self, value: &T) -> Result<()> {
+        self.store.write_path(
+            &self
+                .store
+                .root
+                .join(format!("connector-execution-{}.json", self.operation_id)),
+            value,
+        )
+    }
 }
 #[cfg(unix)]
 impl Drop for Lock {
@@ -1332,6 +1454,14 @@ fn connector_claim_identity_digest(claim: &ConnectorClaim) -> Result<String> {
 #[cfg(unix)]
 #[allow(clippy::missing_errors_doc)]
 impl DeploymentStateStore {
+    pub fn prepare_connector_claim(
+        &self,
+        parent: &OperationRecord,
+        instance_id: &str,
+    ) -> Result<ConnectorClaim> {
+        let predecessor = self.connector_predecessor_for_parent(parent, instance_id)?;
+        ConnectorClaim::prepared(parent, instance_id, predecessor)
+    }
     pub fn claim_connector(
         &self,
         claim: &ConnectorClaim,
@@ -1592,6 +1722,22 @@ impl DeploymentStateStore {
         proof: &VerifiedHostBinding,
     ) -> Result<ConnectorClaim> {
         let _ = (self, claim, proof);
+        Err(durable_state_unsupported())
+    }
+    pub fn prepare_connector_claim(
+        &self,
+        parent: &OperationRecord,
+        instance_id: &str,
+    ) -> Result<ConnectorClaim> {
+        let _ = (self, parent, instance_id);
+        Err(durable_state_unsupported())
+    }
+    pub fn read_connector_claim(
+        &self,
+        operation_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<ConnectorClaim>> {
+        let _ = (self, operation_id, instance_id);
         Err(durable_state_unsupported())
     }
     pub fn observe_connector_handoff(&self, instance_id: &str) -> Result<ConnectorClaim> {
@@ -2085,17 +2231,6 @@ fn validate_state_metadata(mode: u32, owner: u32, expected_owner: u32) -> Result
     }
     Ok(())
 }
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<()> {
-    let fd = open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|error| io_error(path)(std::io::Error::from(error)))?;
-    let file: File = fd.into();
-    file.sync_all().map_err(io_error(path))
-}
 #[cfg(not(unix))]
 fn durable_state_unsupported() -> ReleaseError {
     contract("durable deployment state is unsupported off Unix")
@@ -2135,6 +2270,17 @@ fn uuid(s: &str, name: &str) -> Result<()> {
         })
     {
         return Err(contract(&format!("{name} must be a UUID")));
+    }
+    Ok(())
+}
+fn identity_id(value: &str, name: &str) -> Result<()> {
+    if value.len() != 57
+        || !value.starts_with("dtxi1")
+        || !value[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+    {
+        return Err(contract(&format!("{name} must be a stable IdentityId")));
     }
     Ok(())
 }
@@ -2181,6 +2327,7 @@ mod tests {
     const ID: &str = "018f856e-e0bd-71d2-9428-58d50cf77eaf";
     const SECOND_ID: &str = "018f856e-e0bd-77d2-9428-58d50cf77eaf";
     const THIRD_ID: &str = "018f856e-e0bd-78d2-9428-58d50cf77eaf";
+    const OWNER: &str = "dtxi1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn artifact() -> ImmutableArtifact {
@@ -2202,7 +2349,7 @@ mod tests {
                 host: HostTuple {
                     tenant_id: ID.into(),
                     host_id: ID.into(),
-                    owner_id: ID.into(),
+                    owner_id: OWNER.into(),
                     host_credential_id: ID.into(),
                 },
                 artifact,
@@ -2308,6 +2455,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn connector_execution_lease_serializes_and_recovers_fsynced_progress() {
+        let temp = TempDir::new().expect("temp");
+        let store = DeploymentStateStore::for_test(temp.path().join("state"));
+        let parent = connector_record();
+        let proof = VerifiedHostBinding(parent.binding.host.clone());
+        store
+            .claim(&manifest_for_record(&parent), &parent, &proof)
+            .expect("parent claim");
+        let instance = "018f856e-e0bd-72d2-9428-58d50cf77eaf";
+        let claim = ConnectorClaim::prepared(&parent, instance, None).expect("connector claim");
+        store
+            .claim_connector(&claim, &proof)
+            .expect("claim connector");
+        let first = store
+            .lock_connector_execution(parent.operation_id(), instance)
+            .expect("first lease");
+        first
+            .write(&serde_json::json!({"phase":"claimed"}))
+            .expect("durable progress");
+        assert!(matches!(
+            store.lock_connector_execution(parent.operation_id(), instance),
+            Err(ReleaseError::OperationLocked)
+        ));
+        drop(first);
+        let recovered = store
+            .lock_connector_execution(parent.operation_id(), instance)
+            .expect("recovered lease");
+        assert_eq!(
+            recovered.read().expect("read").expect("record"),
+            b"{\"phase\":\"claimed\"}\n"
+        );
+    }
+
     fn claim_connector_parent(
         store: &DeploymentStateStore,
         manifest: &DeploymentManifest,
@@ -2364,7 +2545,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: "018f856e-e0bd-72d2-9428-58d50cf77eaf".into(),
-            owner_id: "018f856e-e0bd-73d2-9428-58d50cf77eaf".into(),
+            owner_id: OWNER.into(),
             host_credential_id: "018f856e-e0bd-74d2-9428-58d50cf77eaf".into(),
         };
         DeploymentContract {
@@ -2439,6 +2620,16 @@ mod tests {
     #[test]
     fn manifest_v1_accepts_repeated_host_tuple_and_two_connectors() {
         assert!(manifest().validate().is_ok());
+    }
+
+    #[test]
+    fn host_owner_is_strict_stable_identity_not_uuid() {
+        let mut host = record().binding.host;
+        assert!(host.validate().is_ok());
+        host.owner_id = ID.into();
+        assert!(host.validate().is_err());
+        host.owner_id = "dtxi1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        assert!(host.validate().is_err());
     }
 
     #[test]
@@ -2729,7 +2920,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let path = temp.path().join("host.json");
@@ -2788,7 +2979,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let evidence = |service| ServiceReceiptEvidence {
@@ -2844,7 +3035,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let first = "018f856e-e0bd-72d2-9428-58d50cf77eaf";
@@ -2947,7 +3138,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let evidence = ServiceReceiptEvidence {
@@ -3012,7 +3203,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let e = |service| ServiceReceiptEvidence {
@@ -3080,7 +3271,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let e = |service| ServiceReceiptEvidence {
@@ -3147,7 +3338,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let service = ServiceReceiptEvidence {
@@ -3257,7 +3448,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         let service = ServiceReceiptEvidence {
@@ -3358,7 +3549,7 @@ mod tests {
         let mut extra_service = service;
         extra_service["extra"] = true.into();
         assert!(serde_json::from_value::<ReceiptService>(extra_service).is_err());
-        let root = serde_json::json!({"schema_version":1,"operation_id":ID,"manifest_digest":DIGEST,"binding":{"target":"node-a","host":{"tenant_id":ID,"host_id":ID,"owner_id":ID,"host_credential_id":ID},"workload":{"kind":"node","origin":"https://node.example.invalid","server_digest":DIGEST,"services":["node"]}},"artifact":{"version":"1.0.0","digest":DIGEST},"phase":"completed","last_proven_phase":"completed","outcome":"succeeded","services":[],"forward_migration":null,"integrity_digest":""});
+        let root = serde_json::json!({"schema_version":1,"operation_id":ID,"manifest_digest":DIGEST,"binding":{"target":"node-a","host":{"tenant_id":ID,"host_id":ID,"owner_id":OWNER,"host_credential_id":ID},"workload":{"kind":"node","origin":"https://node.example.invalid","server_digest":DIGEST,"services":["node"]}},"artifact":{"version":"1.0.0","digest":DIGEST},"phase":"completed","last_proven_phase":"completed","outcome":"succeeded","services":[],"forward_migration":null,"integrity_digest":""});
         let mut extra_root = root;
         extra_root["extra"] = true.into();
         assert!(serde_json::from_value::<DeploymentReceipt>(extra_root).is_err());
@@ -3495,7 +3686,7 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         assert!(validate_host_evidence_at(&link, &host).is_err());
@@ -3505,10 +3696,10 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
-        let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":ID,"host_credential_id":ID})).expect("json");
+        let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":OWNER,"host_credential_id":ID})).expect("json");
         assert!(parse_host_evidence(&bytes, &host).is_ok());
         assert!(parse_host_evidence(br#"{"schema_version":2}"#, &host).is_err());
     }
@@ -3526,11 +3717,11 @@ mod tests {
         let host = HostTuple {
             tenant_id: ID.into(),
             host_id: ID.into(),
-            owner_id: ID.into(),
+            owner_id: OWNER.into(),
             host_credential_id: ID.into(),
         };
         for field in ["tenant_id", "host_id", "owner_id", "host_credential_id"] {
-            let mut value = serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":ID,"host_credential_id":ID});
+            let mut value = serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":OWNER,"host_credential_id":ID});
             value[field] = "018f856e-e0bd-72d2-9428-58d50cf77eaf".into();
             let mut calls = 0;
             assert!(
@@ -3543,7 +3734,7 @@ mod tests {
             assert_eq!(calls, 0);
         }
         let mut calls = 0;
-        assert!(validate_then(parse_host_evidence(&serde_json::to_vec(&serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":ID,"host_credential_id":ID})).expect("json"),&host), |_| { calls+=1 }).is_ok());
+        assert!(validate_then(parse_host_evidence(&serde_json::to_vec(&serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":OWNER,"host_credential_id":ID})).expect("json"),&host), |_| { calls+=1 }).is_ok());
         assert_eq!(calls, 1);
     }
     #[test]
@@ -3562,7 +3753,7 @@ mod tests {
         );
         assert_eq!(calls, 0);
         assert!(!root.exists());
-        let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":ID,"host_credential_id":ID})).expect("json");
+        let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"tenant_id":ID,"host_id":ID,"owner_id":OWNER,"host_credential_id":ID})).expect("json");
         let valid = parse_host_evidence(&bytes, &host).expect("proof");
         claim_operation(&store, &record(), &valid).expect("claim");
         assert!(root.exists());

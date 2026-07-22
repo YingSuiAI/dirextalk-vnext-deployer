@@ -102,6 +102,8 @@ enum Commands {
     /// Apply one Server-issued Connector bootstrap plan on this Connector host.
     DeploymentConnectorApply {
         #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
         manifest: PathBuf,
         #[arg(long)]
         target: String,
@@ -218,6 +220,7 @@ pub fn run(cli: Cli) -> Result<()> {
             print_json(&DeploymentStateStore::fixed()?.read(&operation_id)?)?;
         }
         Commands::DeploymentConnectorApply {
+            operation_id,
             manifest,
             target,
             plan,
@@ -233,7 +236,8 @@ pub fn run(cli: Cli) -> Result<()> {
                     "deployment-connector-apply requires --execute".into(),
                 ));
             }
-            let result = apply(ConnectorApplyInputs {
+            let result = apply(&ConnectorApplyInputs {
+                operation_id,
                 manifest,
                 target,
                 plan,
