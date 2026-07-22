@@ -2479,7 +2479,8 @@ fn ssh_command<const N: usize>(
         .ok_or_else(|| contract("EIP state is missing"))?;
     let private = store.artifact_path(PRIVATE_KEY_SUFFIX)?;
     let known_hosts = store.artifact_path(KNOWN_HOSTS_SUFFIX)?;
-    let mut argv = vec![
+    let remote_command = render_remote_command(remote_argv)?;
+    let argv = vec![
         "-i".into(),
         private.display().to_string(),
         "-o".into(),
@@ -2491,9 +2492,25 @@ fn ssh_command<const N: usize>(
         "-o".into(),
         format!("UserKnownHostsFile={}", known_hosts.display()),
         format!("ubuntu@{ip}"),
+        remote_command,
     ];
-    argv.extend(remote_argv.into_iter().map(str::to_owned));
     Ok(FixedCommand::new(id, SSH, argv, mutation, timeout))
+}
+
+pub(super) fn render_remote_command<const N: usize>(remote_argv: [&str; N]) -> Result<String> {
+    let mut rendered = Vec::with_capacity(N);
+    for argument in remote_argv {
+        if argument.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(contract(
+                "remote command argument contains control characters",
+            ));
+        }
+        rendered.push(format!("'{}'", argument.replace('\'', "'\"'\"'")));
+    }
+    if rendered.is_empty() {
+        return Err(contract("remote command must not be empty"));
+    }
+    Ok(rendered.join(" "))
 }
 
 fn verify_live_locked(

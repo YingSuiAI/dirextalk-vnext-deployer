@@ -84,6 +84,23 @@ fn console_output_accepts_aws_cli_raw_text_and_canonical_blob_json() {
     assert!(workflow::decode_console_output("not encoded and no attestation").is_err());
 }
 
+#[test]
+fn remote_ssh_command_preserves_fixed_argument_boundaries() {
+    assert_eq!(
+        workflow::render_remote_command([
+            "/usr/bin/find",
+            "/usr/local/libexec/dirextalk",
+            "-printf",
+            "%y %U %G %m %n %s %p\\n",
+            "a'b",
+        ])
+        .expect("render"),
+        "'/usr/bin/find' '/usr/local/libexec/dirextalk' '-printf' '%y %U %G %m %n %s %p\\n' 'a'\"'\"'b'"
+    );
+    assert!(workflow::render_remote_command(["line\nbreak"]).is_err());
+    assert!(workflow::render_remote_command::<0>([]).is_err());
+}
+
 fn append_directory(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
     let mut header = tar::Header::new_ustar();
     header.set_entry_type(tar::EntryType::Directory);
