@@ -71,10 +71,28 @@ cargo run --locked -- publish --manifest release.example.json `
 See [references/release-manifest.md](references/release-manifest.md) for the
 artifact layout and non-secret configuration contract.
 
+## Offline deployment-contract foundation
+
+The separate `deployment.example.json` validates immutable artifact identities,
+logical HTTPS origins, and exact host bindings without changing the release
+manifest v1 contract. Its plan is deterministic and uses a closed action set.
+
+```text
+cargo run --locked -- deployment-validate --manifest deployment.example.json
+cargo run --locked -- deployment-plan --manifest deployment.example.json
+cargo run --locked -- deployment-status --operation-id <uuid>
+```
+
+This is strictly offline. No production remote transport, privileged production
+migrator, service mutation, provider activation, deployment, or X3/X4/X5
+acceptance is implemented or claimed. See
+[references/deployment-manifest.md](references/deployment-manifest.md).
+
 ## Current boundary
 
-This first vertical slice owns release artifact planning, assembly, and guarded
-publication. Host installation, resumable node operations, database migration,
-rollback, service management, and Connector instance lifecycle remain the next
-typed CLI stages. They must use durable operation state and fixed actions; they
-must not grow an arbitrary command or shell-script escape hatch.
+This foundation owns release artifact planning, assembly, guarded publication,
+and Unix-only offline durable ownership/lifecycle evidence. Production host
+installation, migration execution, rollback execution, service management, and
+remote Connector enrollment remain later typed CLI stages. They must consume the
+fenced durable state and fixed actions without an arbitrary command or
+shell-script escape hatch.

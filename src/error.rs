@@ -44,6 +44,14 @@ pub enum ReleaseError {
     Json(#[from] serde_json::Error),
     #[error("archive operation failed")]
     Zip(#[from] zip::result::ZipError),
+    #[error("deployment contract error: {0}")]
+    Deployment(String),
+    #[error("deployment state is malformed, tampered, or unsafe: {0}")]
+    StateUnsafe(PathBuf),
+    #[error("deployment operation identity conflicts with existing durable state")]
+    OperationConflict,
+    #[error("deployment operation is locked by another process")]
+    OperationLocked,
 }
 
 pub type Result<T> = std::result::Result<T, ReleaseError>;

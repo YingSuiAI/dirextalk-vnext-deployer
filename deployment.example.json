@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "server": { "version": "0.1.0", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "connector": { "version": "0.1.0", "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+  "targets": [
+    {
+      "id": "control",
+      "kind": "node",
+      "origin": "https://control.example.invalid",
+      "services": ["node", "agent_control"],
+      "host": {
+        "tenant_id": "018f856e-e0bd-71d2-9428-58d50cf77eaf",
+        "host_id": "018f856e-e0bd-72d2-9428-58d50cf77eaf",
+        "owner_id": "018f856e-e0bd-73d2-9428-58d50cf77eaf",
+        "host_credential_id": "018f856e-e0bd-74d2-9428-58d50cf77eaf"
+      }
+    },
+    {
+      "id": "connector-host-a",
+      "kind": "connector_host",
+      "host": {
+        "tenant_id": "018f856e-e0bd-71d2-9428-58d50cf77eaf",
+        "host_id": "018f856e-e0bd-72d2-9428-58d50cf77eaf",
+        "owner_id": "018f856e-e0bd-73d2-9428-58d50cf77eaf",
+        "host_credential_id": "018f856e-e0bd-74d2-9428-58d50cf77eaf"
+      },
+      "connectors": [{
+        "instance_id": "018f856e-e0bd-75d2-9428-58d50cf77eaf",
+        "adapter_kind": "codex",
+        "handoff_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }]
+    }
+  ]
+}

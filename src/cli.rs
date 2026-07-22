@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::{
     archive::assemble,
+    deployment::{DeploymentManifest, DeploymentPlan, DeploymentStateStore, DeploymentTarget},
     error::Result,
     manifest::LoadedManifest,
     plan::ReleasePlan,
@@ -81,6 +82,21 @@ enum Commands {
         publish_github: bool,
         #[arg(long)]
         execute: bool,
+    },
+    /// Strictly validate the offline deployment contract; never contacts a host.
+    DeploymentValidate {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Print the deterministic offline deployment action plan.
+    DeploymentPlan {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
+    /// Read one durable offline operation record from the fixed local state directory.
+    DeploymentStatus {
+        #[arg(long)]
+        operation_id: String,
     },
 }
 
@@ -163,6 +179,20 @@ pub fn run(cli: Cli) -> Result<()> {
                 plan.execute(&loaded)?;
             }
             print_json(&plan)?;
+        }
+        Commands::DeploymentValidate { manifest } => {
+            let loaded = DeploymentManifest::load(&manifest)?;
+            print_json(
+                &json!({"valid": true, "schema_version": loaded.contract().schema_version,
+                "manifest_digest": loaded.digest(), "targets": loaded.contract().targets.iter().map(DeploymentTarget::id).collect::<Vec<_>>() }),
+            )?;
+        }
+        Commands::DeploymentPlan { manifest } => {
+            let loaded = DeploymentManifest::load(&manifest)?;
+            print_json(&DeploymentPlan::create(&loaded))?;
+        }
+        Commands::DeploymentStatus { operation_id } => {
+            print_json(&DeploymentStateStore::fixed()?.read(&operation_id)?)?;
         }
     }
     Ok(())

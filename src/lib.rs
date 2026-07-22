@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod cli;
+pub mod deployment;
 mod digest;
 pub mod error;
 pub mod manifest;

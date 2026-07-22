@@ -40,3 +40,10 @@ not as a hidden source of credentials.
 Read [references/release-manifest.md](references/release-manifest.md) when
 editing a manifest, selecting targets, or preparing CI artifact paths.
 
+## Offline deployment contract
+
+For the durable deployment-contract foundation, use only
+`deployment-validate`, `deployment-plan`, and `deployment-status`. These commands
+are offline and do not provide `--execute`. Do not claim production transport,
+privileged migration, service mutation, provider activation, deployment, or
+X3/X4/X5 topology acceptance; all remain unimplemented.
