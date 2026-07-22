@@ -757,8 +757,7 @@ fn permissions_match(actual: &Value, expected: &Value) -> Result<bool> {
     let expected = expected
         .as_array()
         .ok_or_else(|| contract("expected security group permissions are malformed"))?;
-    Ok(actual.len() == expected.len()
-        && normalize_permissions(actual)? == normalize_permissions(expected)?)
+    Ok(normalize_permissions(actual)? == normalize_permissions(expected)?)
 }
 
 type PermissionTuple = (String, i64, i64, String, String);
@@ -776,31 +775,35 @@ fn normalize_permissions(items: &[Value]) -> Result<BTreeSet<PermissionTuple>> {
         }
         let ranges = item["IpRanges"]
             .as_array()
-            .filter(|ranges| ranges.len() == 1)
-            .ok_or_else(|| contract("security group ingress must have one IPv4 range"))?;
-        let tuple = (
-            item["IpProtocol"]
-                .as_str()
-                .filter(|protocol| *protocol == "tcp")
-                .ok_or_else(|| contract("security group protocol is invalid"))?
-                .to_owned(),
-            item["FromPort"]
-                .as_i64()
-                .ok_or_else(|| contract("security group from-port is invalid"))?,
-            item["ToPort"]
-                .as_i64()
-                .ok_or_else(|| contract("security group to-port is invalid"))?,
-            ranges[0]["CidrIp"]
-                .as_str()
-                .ok_or_else(|| contract("security group IPv4 range is invalid"))?
-                .to_owned(),
-            ranges[0]["Description"]
-                .as_str()
-                .ok_or_else(|| contract("security group description is invalid"))?
-                .to_owned(),
-        );
-        if !normalized.insert(tuple) {
-            return Err(contract("security group ingress contains duplicates"));
+            .filter(|ranges| !ranges.is_empty())
+            .ok_or_else(|| contract("security group ingress must have IPv4 ranges"))?;
+        let protocol = item["IpProtocol"]
+            .as_str()
+            .filter(|protocol| *protocol == "tcp")
+            .ok_or_else(|| contract("security group protocol is invalid"))?;
+        let from_port = item["FromPort"]
+            .as_i64()
+            .ok_or_else(|| contract("security group from-port is invalid"))?;
+        let to_port = item["ToPort"]
+            .as_i64()
+            .ok_or_else(|| contract("security group to-port is invalid"))?;
+        for range in ranges {
+            let tuple = (
+                protocol.to_owned(),
+                from_port,
+                to_port,
+                range["CidrIp"]
+                    .as_str()
+                    .ok_or_else(|| contract("security group IPv4 range is invalid"))?
+                    .to_owned(),
+                range["Description"]
+                    .as_str()
+                    .ok_or_else(|| contract("security group description is invalid"))?
+                    .to_owned(),
+            );
+            if !normalized.insert(tuple) {
+                return Err(contract("security group ingress contains duplicates"));
+            }
         }
     }
     Ok(normalized)
@@ -3687,7 +3690,7 @@ mod tests {
                 {"CidrIp":"10.0.0.0/8","Description":"extra"}
             ]}
         ]);
-        assert!(permissions_match(&extra, &expected).is_err());
+        assert!(!permissions_match(&extra, &expected).expect("extra range is not an exact match"));
     }
 
     #[test]

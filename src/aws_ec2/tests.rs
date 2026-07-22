@@ -310,12 +310,20 @@ impl RebindExecutor {
             json!({"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk public HTTPS"}]}),
             json!({"IpProtocol":"tcp","FromPort":9443,"ToPort":9445,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk Agent Control TLS"}]}),
         ];
-        if matches!(shape, SshIngressShape::Old | SshIngressShape::Both) {
-            rules.push(json!({"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"203.0.113.9/32","Description":"Dirextalk operator SSH"}]}));
-        }
-        if matches!(shape, SshIngressShape::New | SshIngressShape::Both) {
-            rules.push(json!({"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"198.51.100.7/32","Description":"Dirextalk operator SSH"}]}));
-        }
+        let operator_ranges = match shape {
+            SshIngressShape::Old => {
+                vec![json!({"CidrIp":"203.0.113.9/32","Description":"Dirextalk operator SSH"})]
+            }
+            SshIngressShape::Both => vec![
+                json!({"CidrIp":"203.0.113.9/32","Description":"Dirextalk operator SSH"}),
+                json!({"CidrIp":"198.51.100.7/32","Description":"Dirextalk operator SSH"}),
+            ],
+            SshIngressShape::New => {
+                vec![json!({"CidrIp":"198.51.100.7/32","Description":"Dirextalk operator SSH"})]
+            }
+        };
+        rules
+            .push(json!({"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":operator_ranges}));
         Value::Array(rules)
     }
 }
