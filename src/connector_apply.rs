@@ -99,6 +99,7 @@ struct ConnectorExecutionRecordV1 {
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Claimed,
+    ExpiredUnclaimed,
     Prepared,
     Started,
     Running,
@@ -328,6 +329,7 @@ fn apply_with(
     if !matches!(
         claim.phase(),
         ConnectorClaimPhase::Prepared
+            | ConnectorClaimPhase::ExpiredUnclaimed
             | ConnectorClaimPhase::HandoffObserved
             | ConnectorClaimPhase::Released
     ) {
@@ -376,6 +378,13 @@ fn apply_with(
         persist_record(&lease, &record)?;
         record
     };
+    if record.phase == Phase::ExpiredUnclaimed {
+        if claim.phase() != ConnectorClaimPhase::ExpiredUnclaimed {
+            let _ = store.expire_unclaimed_connector_claim(&record.connector_id)?;
+        }
+        let _ = store.expire_unclaimed_operation(&record.operation_id, &record.connector_id)?;
+        return Err(reissue_required());
+    }
     if (claim.phase() == ConnectorClaimPhase::Released && record.phase != Phase::Finalized)
         || (claim.phase() == ConnectorClaimPhase::HandoffObserved && record.phase == Phase::Claimed)
     {
@@ -391,6 +400,13 @@ fn apply_with(
             inputs,
             &plan,
         )?;
+        if is_expired_unclaimed_prepare(&result) {
+            record.phase = Phase::ExpiredUnclaimed;
+            persist_record(&lease, &record)?;
+            let _ = store.expire_unclaimed_connector_claim(&record.connector_id)?;
+            let _ = store.expire_unclaimed_operation(&record.operation_id, &record.connector_id)?;
+            return Err(reissue_required());
+        }
         record.prepare_result = Some(result);
         record.phase = Phase::Prepared;
         persist_record(&lease, &record)?;
@@ -484,7 +500,7 @@ fn converge_deployment_projection(
 
 const fn phase_rank(phase: Phase) -> u8 {
     match phase {
-        Phase::Claimed => 0,
+        Phase::Claimed | Phase::ExpiredUnclaimed => 0,
         Phase::Prepared => 1,
         Phase::Started => 2,
         Phase::Running => 3,
@@ -715,6 +731,7 @@ enum V2Application {
 enum LifecycleState {
     Prepared,
     Finalized,
+    ExpiredUnclaimed,
 }
 
 struct MaterialFiles {
@@ -1063,6 +1080,21 @@ fn validate_v2_result(
     operation: V2Operation,
     prior: Revision,
 ) -> Result<V2Result> {
+    if operation == V2Operation::PrepareConnectorMaterial
+        && result.operation == operation
+        && result.connector_id == record.connector_id
+        && result.lifecycle_state == LifecycleState::ExpiredUnclaimed
+        && matches!(
+            result.application,
+            V2Application::Applied | V2Application::Replayed
+        )
+        && result.disposition == Disposition::ExpiredUnclaimed
+        && result.revision() == prior
+        && result.prepared_receipt_sha256.is_none()
+        && result.finalized_receipt_sha256.is_none()
+    {
+        return Ok(result);
+    }
     let expected_state = match operation {
         V2Operation::PrepareConnectorMaterial => LifecycleState::Prepared,
         V2Operation::FinalizeConnectorMaterial => LifecycleState::Finalized,
@@ -1106,6 +1138,16 @@ fn validate_v2_result(
         V2Operation::PrepareConnectorMaterial => {}
     }
     Ok(result)
+}
+
+fn is_expired_unclaimed_prepare(result: &V2Result) -> bool {
+    result.operation == V2Operation::PrepareConnectorMaterial
+        && result.disposition == Disposition::ExpiredUnclaimed
+        && result.lifecycle_state == LifecycleState::ExpiredUnclaimed
+}
+
+fn reissue_required() -> ReleaseError {
+    deployment("Connector bootstrap expired unclaimed; reissue required")
 }
 
 fn require_next_revision(prior: Revision, next: Revision) -> Result<()> {
@@ -1876,6 +1918,43 @@ mod tests {
         );
         let frames = operator.frames.lock().expect("frames");
         assert_eq!(&frames[0][frames[0].len() - 4..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn expired_unclaimed_prepare_requires_exact_no_effect_projection() {
+        let plan = parse_plan(PLAN).expect("plan");
+        let record = record(&plan);
+        let exact = V2Result {
+            operation: V2Operation::PrepareConnectorMaterial,
+            application: V2Application::Replayed,
+            disposition: Disposition::ExpiredUnclaimed,
+            desired_revision: record.initial_revision.desired,
+            observed_revision: record.initial_revision.observed,
+            connector_id: record.connector_id.clone(),
+            lifecycle_state: LifecycleState::ExpiredUnclaimed,
+            prepared_receipt_sha256: None,
+            finalized_receipt_sha256: None,
+        };
+        assert!(is_expired_unclaimed_prepare(
+            &validate_v2_result(
+                exact.clone(),
+                &record,
+                V2Operation::PrepareConnectorMaterial,
+                record.initial_revision,
+            )
+            .expect("exact terminal response"),
+        ));
+        let mut receipt = exact;
+        receipt.prepared_receipt_sha256 = Some("a".repeat(64));
+        assert!(
+            validate_v2_result(
+                receipt,
+                &record,
+                V2Operation::PrepareConnectorMaterial,
+                record.initial_revision,
+            )
+            .is_err()
+        );
     }
 
     #[test]

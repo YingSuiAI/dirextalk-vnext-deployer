@@ -44,6 +44,13 @@ environment, URL, or shell. The handoff must be a root-owned, no-follow `0600`
 regular file. Manifest, plan, config, and CA inputs must also be root-owned
 closed-mode regular files. Output and durable state retain only digests and
 sanitized Host responses. It is not an SSH/cloud transport.
+If the Host returns the exact V2 `expired_unclaimed` prepare result (no receipt
+digests and no revision change), apply durably terminalizes the unobserved
+Connector claim and its single-Connector deployment operation, then returns
+`Connector bootstrap expired unclaimed; reissue required`. Reissue a fresh
+Server bootstrap and create a new operation with the terminal operation as its
+explicit predecessor; successor ownership is accepted only when both exact
+predecessor records prove that no-effect terminal state.
 `deployment-validate` and `deployment-plan` are cross-platform;
 `deployment-status` is Unix-only and fails closed as unsupported elsewhere.
 

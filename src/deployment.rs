@@ -559,6 +559,8 @@ pub enum OperationPhase {
     ServicesConverged,
     ReadinessVerified,
     Completed,
+    /// The Host proved that an expired Connector bootstrap made no lifecycle effect.
+    ExpiredUnclaimed,
     FailedRecoverable,
     RollbackFenced,
     RollbackConverged,
@@ -580,6 +582,7 @@ impl OperationPhase {
             Self::ServicesConverged => Some(Self::ReadinessVerified),
             Self::ReadinessVerified => Some(Self::Completed),
             Self::Completed
+            | Self::ExpiredUnclaimed
             | Self::FailedRecoverable
             | Self::RollbackFenced
             | Self::RollbackConverged
@@ -799,6 +802,7 @@ impl OperationRecord {
         if matches!(
             self.phase,
             OperationPhase::Completed
+                | OperationPhase::ExpiredUnclaimed
                 | OperationPhase::RollbackFenced
                 | OperationPhase::RollbackConverged
                 | OperationPhase::RollbackBlocked
@@ -809,6 +813,26 @@ impl OperationRecord {
         self.last_proven_phase = self.phase;
         self.phase = OperationPhase::FailedRecoverable;
         self.last_failure = Some(evidence);
+        Ok(())
+    }
+    fn expire_unclaimed(&mut self, instance_id: &str) -> Result<()> {
+        let BindingWorkload::ConnectorHost { connectors, .. } = &self.binding.workload else {
+            return Err(contract(
+                "only a Connector-host operation may expire unclaimed",
+            ));
+        };
+        if self.phase != OperationPhase::ArtifactsVerified
+            || self.last_proven_phase != OperationPhase::ArtifactsVerified
+            || self.last_failure.is_some()
+            || connectors.len() != 1
+            || connectors[0].instance_id != instance_id
+        {
+            return Err(contract(
+                "expired-unclaimed operation is not exact no-effect state",
+            ));
+        }
+        self.phase = OperationPhase::ExpiredUnclaimed;
+        self.last_proven_phase = OperationPhase::ExpiredUnclaimed;
         Ok(())
     }
     pub fn rollback_service_only(&mut self, phase: OperationPhase) -> Result<()> {
@@ -1058,13 +1082,15 @@ impl DeploymentStateStore {
                     return Err(ReleaseError::OperationConflict);
                 }
                 let predecessor = self.read(&current.current_operation_id)?;
-                if operation_identity_digest(&predecessor)? != current.operation_identity_digest
-                    || !matches!(
-                        predecessor.phase,
-                        OperationPhase::Completed | OperationPhase::RollbackConverged
-                    )
-                {
+                if operation_identity_digest(&predecessor)? != current.operation_identity_digest {
                     return Err(ReleaseError::OperationConflict);
+                }
+                match predecessor.phase {
+                    OperationPhase::Completed | OperationPhase::RollbackConverged => {}
+                    OperationPhase::ExpiredUnclaimed => {
+                        self.validate_expired_unclaimed_successor(&predecessor, record)?;
+                    }
+                    _ => return Err(ReleaseError::OperationConflict),
                 }
             }
             Err(ReleaseError::Io { source, .. })
@@ -1134,6 +1160,23 @@ impl DeploymentStateStore {
         record.last_failure = None;
         self.persist_record(record)
     }
+    /// Terminally records the exact Host-proven no-effect expiry for one bootstrap.
+    pub fn expire_unclaimed_operation(
+        &self,
+        id: &str,
+        instance_id: &str,
+    ) -> Result<OperationRecord> {
+        let (_lock, mut record) = self.lock_current(id)?;
+        let claim = Self::read_claim(&self.connector_claim_path(instance_id, id)?)?;
+        if claim.phase != ConnectorClaimPhase::ExpiredUnclaimed {
+            return Err(ReleaseError::OperationConflict);
+        }
+        if record.phase == OperationPhase::ExpiredUnclaimed {
+            return Ok(record);
+        }
+        record.expire_unclaimed(instance_id)?;
+        self.persist_record(record)
+    }
     pub fn rollback_fence(&self, id: &str) -> Result<OperationRecord> {
         let (_lock, mut record) = self.lock_current(id)?;
         record.rollback_service_only(OperationPhase::RollbackFenced)?;
@@ -1169,6 +1212,36 @@ impl DeploymentStateStore {
             {
                 return Err(ReleaseError::OperationConflict);
             }
+        }
+        Ok(())
+    }
+    fn validate_expired_unclaimed_successor(
+        &self,
+        predecessor: &OperationRecord,
+        successor: &OperationRecord,
+    ) -> Result<()> {
+        let (
+            BindingWorkload::ConnectorHost {
+                connectors: prior, ..
+            },
+            BindingWorkload::ConnectorHost {
+                connectors: next, ..
+            },
+        ) = (&predecessor.binding.workload, &successor.binding.workload)
+        else {
+            return Err(ReleaseError::OperationConflict);
+        };
+        if prior.len() != 1 || next.len() != 1 || prior[0].instance_id != next[0].instance_id {
+            return Err(ReleaseError::OperationConflict);
+        }
+        let claim = Self::read_claim(
+            &self.connector_claim_path(&prior[0].instance_id, predecessor.operation_id())?,
+        )?;
+        if claim.phase != ConnectorClaimPhase::ExpiredUnclaimed
+            || claim.operation_id != predecessor.operation_id
+            || claim.target != predecessor.target
+        {
+            return Err(ReleaseError::OperationConflict);
         }
         Ok(())
     }
@@ -1433,6 +1506,8 @@ pub enum ConnectorClaimPhase {
     Prepared,
     HandoffObserved,
     Released,
+    /// The Host proved this expired bootstrap had no Connector lifecycle effect.
+    ExpiredUnclaimed,
 }
 #[allow(clippy::missing_errors_doc)]
 impl ConnectorClaim {
@@ -1626,11 +1701,22 @@ impl DeploymentStateStore {
                 let prior = Self::read_claim(&prior_path)?;
                 let prior_parent = self.read(&prior.operation_id)?;
                 if connector_claim_identity_digest(&prior)? != current.claim_identity_digest
-                    || prior.phase != ConnectorClaimPhase::Released
                     || prior.target != parent.target
                     || prior_parent.binding.host != parent.binding.host
                 {
                     return Err(ReleaseError::OperationConflict);
+                }
+                match prior.phase {
+                    ConnectorClaimPhase::Released
+                        if matches!(
+                            prior_parent.phase,
+                            OperationPhase::Completed | OperationPhase::RollbackConverged
+                        ) => {}
+                    ConnectorClaimPhase::ExpiredUnclaimed
+                        if prior_parent.phase == OperationPhase::ExpiredUnclaimed
+                            && parent.predecessor_operation_id.as_deref()
+                                == Some(prior_parent.operation_id()) => {}
+                    _ => return Err(ReleaseError::OperationConflict),
                 }
                 self.write_path(&owner_path, &connector_owner)?;
             }
@@ -1694,6 +1780,23 @@ impl DeploymentStateStore {
             ));
         }
         claim.phase = ConnectorClaimPhase::Released;
+        self.persist_connector_claim(&owner, claim)
+    }
+
+    /// Persists the Host-proven no-effect expiry before its parent operation is terminalized.
+    pub fn expire_unclaimed_connector_claim(&self, instance_id: &str) -> Result<ConnectorClaim> {
+        uuid(instance_id, "instance_id")?;
+        let (owner, mut claim, _target_lock, _connector_lock) =
+            self.lock_current_connector(instance_id)?;
+        if claim.phase == ConnectorClaimPhase::ExpiredUnclaimed {
+            return Ok(claim);
+        }
+        if claim.phase != ConnectorClaimPhase::Prepared {
+            return Err(contract(
+                "only an unobserved connector claim may expire unclaimed",
+            ));
+        }
+        claim.phase = ConnectorClaimPhase::ExpiredUnclaimed;
         self.persist_connector_claim(&owner, claim)
     }
 
@@ -1820,6 +1923,14 @@ impl DeploymentStateStore {
         let _ = (self, id);
         Err(durable_state_unsupported())
     }
+    pub fn expire_unclaimed_operation(
+        &self,
+        id: &str,
+        instance_id: &str,
+    ) -> Result<OperationRecord> {
+        let _ = (self, id, instance_id);
+        Err(durable_state_unsupported())
+    }
     pub fn rollback_fence(&self, id: &str) -> Result<OperationRecord> {
         let _ = (self, id);
         Err(durable_state_unsupported())
@@ -1857,6 +1968,10 @@ impl DeploymentStateStore {
         Err(durable_state_unsupported())
     }
     pub fn release_connector_claim(&self, instance_id: &str) -> Result<ConnectorClaim> {
+        let _ = (self, instance_id);
+        Err(durable_state_unsupported())
+    }
+    pub fn expire_unclaimed_connector_claim(&self, instance_id: &str) -> Result<ConnectorClaim> {
         let _ = (self, instance_id);
         Err(durable_state_unsupported())
     }
@@ -2082,6 +2197,7 @@ fn canonical_service_subsequence(
         .all(|actual| remaining.by_ref().any(|planned| planned == &actual.service))
 }
 
+#[allow(clippy::too_many_lines)]
 fn valid_record(r: &OperationRecord) -> Result<()> {
     if r.schema_version != 1 {
         return Err(contract("operation schema_version must be 1"));
@@ -2162,6 +2278,14 @@ fn valid_record(r: &OperationRecord) -> Result<()> {
         | OperationPhase::RollbackBlocked => {
             if r.last_proven_phase != OperationPhase::Completed || r.last_failure.is_some() {
                 return Err(contract("rollback operation state is invalid"));
+            }
+        }
+        OperationPhase::ExpiredUnclaimed => {
+            if !matches!(r.binding.workload, BindingWorkload::ConnectorHost { ref connectors, .. } if connectors.len() == 1)
+                || r.last_proven_phase != OperationPhase::ExpiredUnclaimed
+                || r.last_failure.is_some()
+            {
+                return Err(contract("expired-unclaimed operation state is invalid"));
             }
         }
         phase => {
@@ -2673,6 +2797,81 @@ mod tests {
                 .advance(&parent.operation_id, phase)
                 .expect("connector parent completion");
         }
+    }
+
+    #[test]
+    fn expired_unclaimed_bootstrap_is_replayable_and_allows_only_exact_successor() {
+        let temp = TempDir::new().expect("temp");
+        let store = DeploymentStateStore::for_test(temp.path().join("state"));
+        let parent = connector_record();
+        let proof = VerifiedHostBinding(parent.binding.host.clone());
+        store
+            .claim(&manifest_for_record(&parent), &parent, &proof)
+            .expect("parent claim");
+        let instance = "018f856e-e0bd-72d2-9428-58d50cf77eaf";
+        let claim = ConnectorClaim::prepared(&parent, instance, None).expect("connector claim");
+        store
+            .claim_connector(&claim, &proof)
+            .expect("claim connector");
+        for phase in [
+            OperationPhase::Claimed,
+            OperationPhase::HostBound,
+            OperationPhase::ArtifactsVerified,
+        ] {
+            store
+                .advance(parent.operation_id(), phase)
+                .expect("pre-effect phase");
+        }
+        let terminal_claim = store
+            .expire_unclaimed_connector_claim(instance)
+            .expect("terminal claim");
+        assert_eq!(
+            terminal_claim.phase(),
+            ConnectorClaimPhase::ExpiredUnclaimed
+        );
+        assert_eq!(
+            store
+                .expire_unclaimed_connector_claim(instance)
+                .expect("claim replay")
+                .phase(),
+            ConnectorClaimPhase::ExpiredUnclaimed
+        );
+        assert_eq!(
+            store
+                .expire_unclaimed_operation(parent.operation_id(), instance)
+                .expect("terminal operation")
+                .phase(),
+            OperationPhase::ExpiredUnclaimed
+        );
+        assert_eq!(
+            store
+                .expire_unclaimed_operation(parent.operation_id(), instance)
+                .expect("operation replay")
+                .phase(),
+            OperationPhase::ExpiredUnclaimed
+        );
+
+        let mut successor = connector_record();
+        successor.operation_id = SECOND_ID.into();
+        successor.predecessor_operation_id = Some(ID.into());
+        let claimed = store
+            .claim(&manifest_for_record(&successor), &successor, &proof)
+            .expect("exact successor operation");
+        let successor_claim = store
+            .prepare_connector_claim(&claimed, instance)
+            .expect("successor connector preparation");
+        assert_eq!(successor_claim.predecessor_operation_id(), Some(ID));
+        store
+            .claim_connector(&successor_claim, &proof)
+            .expect("exact successor connector claim");
+
+        let mut wrong = connector_record();
+        wrong.operation_id = THIRD_ID.into();
+        wrong.predecessor_operation_id = Some(ID.into());
+        assert!(matches!(
+            store.claim(&manifest_for_record(&wrong), &wrong, &proof),
+            Err(ReleaseError::OperationConflict)
+        ));
     }
 
     fn manifest() -> DeploymentContract {
