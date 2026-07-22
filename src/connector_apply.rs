@@ -277,6 +277,13 @@ impl Operator for ProductionOperator {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OperatorProtocol {
+    V1,
+    V2,
+    Unknown,
+}
+
 /// Applies or exactly resumes one canonical deployment operation.
 ///
 /// # Errors
@@ -1518,6 +1525,7 @@ fn invoke_process(
     frame: Vec<u8>,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    let protocol = operator_protocol(&frame);
     let mut child = Command::new(program)
         .args(arguments)
         .env_clear()
@@ -1576,23 +1584,60 @@ fn invoke_process(
     if let Err(error) = write_result {
         return Err(io_error(program)(error));
     }
-    validate_exit(program, status, output)
+    validate_exit(program, status, output, protocol)
 }
 fn terminate_and_reap(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
-fn validate_exit(program: &str, status: ExitStatus, output: Vec<u8>) -> Result<Vec<u8>> {
-    if !status.success() {
+fn validate_exit(
+    program: &str,
+    status: ExitStatus,
+    output: Vec<u8>,
+    protocol: OperatorProtocol,
+) -> Result<Vec<u8>> {
+    if output.is_empty() || output.len() > MAX_OUTPUT {
+        if !status.success() {
+            return Err(ReleaseError::CommandFailed {
+                program: program.into(),
+                status,
+            });
+        }
+        return Err(deployment("Host Supervisor response is empty or oversized"));
+    }
+    if !status.success() && !structured_rejection(protocol, &output) {
         return Err(ReleaseError::CommandFailed {
             program: program.into(),
             status,
         });
     }
-    if output.is_empty() || output.len() > MAX_OUTPUT {
-        return Err(deployment("Host Supervisor response is empty or oversized"));
-    }
     Ok(output)
+}
+
+fn operator_protocol(frame: &[u8]) -> OperatorProtocol {
+    match frame.get(..8) {
+        Some(magic) if magic == b"DTXHC01\0" => OperatorProtocol::V1,
+        Some(magic) if magic == b"DTXHC02\0" => OperatorProtocol::V2,
+        _ => OperatorProtocol::Unknown,
+    }
+}
+
+fn structured_rejection(protocol: OperatorProtocol, output: &[u8]) -> bool {
+    match protocol {
+        OperatorProtocol::V1 => decode_strict::<V1Response>(output).is_ok_and(|response| {
+            response.protocol == PROTOCOL_V1
+                && response.status == ResponseStatus::Rejected
+                && response.result.is_none()
+                && response.error.is_some()
+        }),
+        OperatorProtocol::V2 => decode_strict::<V2Response>(output).is_ok_and(|response| {
+            response.protocol == PROTOCOL_V2
+                && response.status == ResponseStatus::Rejected
+                && response.result.is_none()
+                && response.error.is_some()
+        }),
+        OperatorProtocol::Unknown => false,
+    }
 }
 
 #[cfg(test)]
@@ -1789,6 +1834,39 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn subprocess_propagates_bounded_structured_rejection_on_failure() {
+        let response = r#"{"protocol":"dirextalk.host-control.operator.v2","status":"rejected","error":"MATERIAL_REQUIRED"}"#;
+        let command = format!("cat >/dev/null; printf '%s\\n' '{response}'; exit 1");
+        let output = invoke_process(
+            "/bin/sh",
+            &["-c", &command],
+            b"DTXHC02\0".to_vec(),
+            Duration::from_secs(1),
+        )
+        .expect("structured rejection is returned");
+        let decoded: V2Response = decode_strict(&output).expect("structured rejection decodes");
+        assert_eq!(decoded.protocol, PROTOCOL_V2);
+        assert_eq!(decoded.status, ResponseStatus::Rejected);
+        assert_eq!(decoded.error.as_deref(), Some("MATERIAL_REQUIRED"));
+    }
+
+    #[test]
+    fn subprocess_rejects_malformed_or_empty_failure_output() {
+        for command in [
+            "cat >/dev/null; printf 'not-json'; exit 1",
+            "cat >/dev/null; exit 1",
+        ] {
+            let result = invoke_process(
+                "/bin/sh",
+                &["-c", command],
+                b"DTXHC02\0".to_vec(),
+                Duration::from_secs(1),
+            );
+            assert!(matches!(result, Err(ReleaseError::CommandFailed { .. })));
+        }
     }
 
     #[test]
