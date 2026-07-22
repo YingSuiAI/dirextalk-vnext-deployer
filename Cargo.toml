@@ -32,6 +32,7 @@ zip = { version = "8.3.0", default-features = false, features = ["deflate-flate2
 [target.'cfg(unix)'.dependencies]
 fs2 = "0.4.3"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
+libc = "0.2.172"
 
 [dev-dependencies]
 tempfile = "3.27.0"

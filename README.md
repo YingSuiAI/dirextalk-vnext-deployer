@@ -108,3 +108,31 @@ installation, migration execution, rollback execution, service management, and
 remote Connector enrollment remain later typed CLI stages. They must consume the
 fenced durable state and fixed actions without an arbitrary command or
 shell-script escape hatch.
+
+## Single-node AWS EC2 lifecycle
+
+`ec2-plan` validates one immutable Ubuntu 24.04 amd64 node in `ap-east-1` and
+prints fixed `aws`, `ssh`, and `scp` argv. `ec2-apply`/`ec2-resume`,
+`ec2-update`, and `ec2-destroy` remain dry runs unless `--execute` is present.
+The manifest requires the exact `dirextalk/vnet-server@sha256:<64>` image and
+stack bundle digest, a 0600 private key, and a pinned host key. State is a
+0600 integrity-sealed journal; status redacts credentials and destroy only
+touches resources recorded as Dirextalk-owned. Use the same manifest shape for
+`x6`, `x7`, or `x8` (see `aws-ec2.example.json`). No AWS credentials are read
+from files or persisted; the standard AWS environment/profile is inherited by
+the fixed `aws` process.
+
+`ec2-status` and `ec2-update` perform one bounded, read-only Docker Hub
+discovery using the fixed command `docker buildx imagetools inspect` for
+`docker.io/dirextalk/vnet-server:latest`. Its JSON manifest digest must parse
+as canonical `sha256:<64>`. The tag is comparison-only: apply/update state and
+the digest-bound installer contract accept only
+`dirextalk/vnet-server@sha256:<64>`, and update refuses a manifest whose exact
+digest does not match the registry readback. Docker credentials, command
+stderr, and registry tokens are neither printed nor persisted.
+
+```text
+cargo run --locked -- ec2-plan --manifest aws-ec2.example.json
+cargo run --locked -- ec2-plan --manifest aws-ec2-x7.example.json
+cargo run --locked -- ec2-plan --manifest aws-ec2-x8.example.json
+```

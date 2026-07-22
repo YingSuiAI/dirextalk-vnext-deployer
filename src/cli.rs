@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::{
     archive::assemble,
+    aws_ec2::{self, AwsEc2Manifest, ProductionAwsExecutor, ProductionRegistryExecutor},
     connector_apply::{ConnectorApplyInputs, apply},
     deployment::{DeploymentManifest, DeploymentPlan, DeploymentStateStore, DeploymentTarget},
     error::Result,
@@ -117,6 +118,63 @@ enum Commands {
         control_ca: PathBuf,
         #[arg(long)]
         issuer_ca: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Plan one immutable AWS EC2 vNext node (dry run).
+    Ec2Plan {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+    },
+    /// Apply or resume one AWS EC2 node; requires explicit --execute.
+    Ec2Apply {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Resume an interrupted AWS EC2 apply.
+    Ec2Resume {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Read redacted AWS EC2 ownership state.
+    Ec2Status {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+    },
+    /// Verify DNS/TLS/health and the immutable release receipt.
+    Ec2Verify {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+    },
+    /// Update the exact bundle digest with a rollback receipt.
+    Ec2Update {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Destroy only recorded owned EC2 resources.
+    Ec2Destroy {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
         #[arg(long)]
         execute: bool,
     },
@@ -244,6 +302,73 @@ pub fn run(cli: Cli) -> Result<()> {
                 issuer_ca,
             })?;
             print_json(&result)?;
+        }
+        Commands::Ec2Plan { manifest, .. } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::plan(&m)?)?;
+        }
+        Commands::Ec2Apply {
+            manifest,
+            state_dir,
+            execute,
+        }
+        | Commands::Ec2Resume {
+            manifest,
+            state_dir,
+            execute,
+        } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::apply(
+                &m,
+                &state_dir,
+                execute,
+                &ProductionAwsExecutor,
+            )?)?;
+        }
+        Commands::Ec2Status {
+            manifest,
+            state_dir,
+        } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::status_with_executor(
+                &m,
+                &state_dir,
+                &ProductionRegistryExecutor,
+            )?)?;
+        }
+        Commands::Ec2Verify {
+            manifest,
+            state_dir,
+        } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::verify(&m, &state_dir)?)?;
+        }
+        Commands::Ec2Update {
+            manifest,
+            state_dir,
+            execute,
+        } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::update(
+                &m,
+                &state_dir,
+                execute,
+                &ProductionAwsExecutor,
+                &ProductionRegistryExecutor,
+            )?)?;
+        }
+        Commands::Ec2Destroy {
+            manifest,
+            state_dir,
+            execute,
+        } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::destroy(
+                &m,
+                &state_dir,
+                execute,
+                &ProductionAwsExecutor,
+            )?)?;
         }
     }
     Ok(())

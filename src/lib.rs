@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+pub mod aws_ec2;
 pub mod cli;
 pub mod connector_apply;
 pub mod deployment;
