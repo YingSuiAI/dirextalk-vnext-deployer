@@ -91,11 +91,11 @@ fn remote_ssh_command_preserves_fixed_argument_boundaries() {
             "/usr/bin/find",
             "/usr/local/libexec/dirextalk",
             "-printf",
-            "%y %U %G %m %n %s %p\\n",
+            "%y %u %g %m %n %s %p\\n",
             "a'b",
         ])
         .expect("render"),
-        "'/usr/bin/find' '/usr/local/libexec/dirextalk' '-printf' '%y %U %G %m %n %s %p\\n' 'a'\"'\"'b'"
+        "'/usr/bin/find' '/usr/local/libexec/dirextalk' '-printf' '%y %u %g %m %n %s %p\\n' 'a'\"'\"'b'"
     );
     assert!(workflow::render_remote_command(["line\nbreak"]).is_err());
     assert!(workflow::render_remote_command::<0>([]).is_err());
