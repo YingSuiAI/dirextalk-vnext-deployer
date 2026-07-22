@@ -11,7 +11,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use super::{
@@ -256,6 +256,124 @@ impl AwsExecutor for Identity {
 struct ObservePending {
     state_path: PathBuf,
     phase: LifecyclePhase,
+}
+
+#[derive(Clone, Copy)]
+enum SshIngressShape {
+    Old,
+    Both,
+    New,
+}
+
+struct RebindExecutor {
+    state: Mutex<SshIngressShape>,
+    revoke_converges: bool,
+    group: Value,
+    calls: Mutex<Vec<String>>,
+}
+
+impl RebindExecutor {
+    fn new(state: &Ec2State, shape: SshIngressShape, owned: bool) -> Self {
+        Self::with_revoke_convergence(state, shape, owned, true)
+    }
+
+    fn with_revoke_convergence(
+        state: &Ec2State,
+        shape: SshIngressShape,
+        owned: bool,
+        revoke_converges: bool,
+    ) -> Self {
+        let tags = if owned {
+            state
+                .ownership_tags
+                .iter()
+                .map(|(key, value)| json!({"Key": key, "Value": value}))
+                .collect()
+        } else {
+            vec![json!({"Key":"DirextalkManaged","Value":"false"})]
+        };
+        Self {
+            state: Mutex::new(shape),
+            revoke_converges,
+            group: json!({
+                "GroupId": state.security_group_id,
+                "VpcId": state.vpc_id,
+                "Tags": tags,
+            }),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn ingress(shape: SshIngressShape) -> Value {
+        let mut rules = vec![
+            json!({"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk ACME HTTP challenge"}]}),
+            json!({"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk public HTTPS"}]}),
+            json!({"IpProtocol":"tcp","FromPort":9443,"ToPort":9445,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk Agent Control TLS"}]}),
+        ];
+        if matches!(shape, SshIngressShape::Old | SshIngressShape::Both) {
+            rules.push(json!({"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"203.0.113.9/32","Description":"Dirextalk operator SSH"}]}));
+        }
+        if matches!(shape, SshIngressShape::New | SshIngressShape::Both) {
+            rules.push(json!({"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"198.51.100.7/32","Description":"Dirextalk operator SSH"}]}));
+        }
+        Value::Array(rules)
+    }
+}
+
+impl AwsExecutor for RebindExecutor {
+    fn run(&self, command: &FixedCommand) -> Result<ExecOutput> {
+        self.calls.lock().expect("calls").push(command.id.clone());
+        let stdout = match command.id.as_str() {
+            "verify-caller-account" => "{\"Account\":\"123456789012\"}".into(),
+            "describe-exact-owned-security-group" => {
+                let mut group = self.group.clone();
+                group["IpPermissions"] = Self::ingress(*self.state.lock().expect("state"));
+                json!({"SecurityGroups":[group]}).to_string()
+            }
+            "rebind-authorize-operator-ssh-cidr" => {
+                *self.state.lock().expect("state") = SshIngressShape::Both;
+                String::new()
+            }
+            "rebind-revoke-operator-ssh-cidr" => {
+                if self.revoke_converges {
+                    *self.state.lock().expect("state") = SshIngressShape::New;
+                }
+                String::new()
+            }
+            _ => return Err(contract("unexpected rebind command")),
+        };
+        Ok(ExecOutput {
+            status: 0,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
+fn rebind_state(
+    dir: &TempDir,
+    manifest: &AwsEc2Manifest,
+    phase: LifecyclePhase,
+) -> (PathBuf, Ec2State) {
+    let state_dir = dir.path().join("rebind-state");
+    let mut state = apply(
+        manifest,
+        &state_dir,
+        100,
+        false,
+        &Never(AtomicUsize::new(0)),
+    )
+    .expect("dry state");
+    state.account_id = Some("123456789012".into());
+    state.vpc_id = Some("vpc-01234567".into());
+    state.security_group_id = Some("sg-01234567".into());
+    state.phase = phase;
+    state = state.seal().expect("seal");
+    Store::lock(&state_dir, &manifest.target)
+        .expect("store")
+        .write(&state)
+        .expect("write");
+    (state_dir, state)
 }
 
 struct ExistingReceipt {
@@ -681,6 +799,132 @@ fn lifecycle_state_is_persisted_before_every_effect() {
         serde_json::from_slice(&fs::read(store.state_path()).expect("state after effect"))
             .expect("state JSON");
     assert_eq!(persisted.pending_effect, None);
+}
+
+#[test]
+fn operator_cidr_rebind_authorizes_then_revokes_and_reseals_state() {
+    let (dir, old_manifest) = fixture("1.2.3", 'a');
+    let (state_dir, state) = rebind_state(&dir, &old_manifest, LifecyclePhase::DnsReady);
+    let mut new_manifest = old_manifest.clone();
+    new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
+    let executor = RebindExecutor::new(&state, SshIngressShape::Old, true);
+
+    let updated =
+        rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", true, &executor)
+            .expect("rebind");
+    assert_eq!(updated.phase, LifecyclePhase::DnsReady);
+    assert_eq!(updated.infrastructure.operator_ssh_cidr, "198.51.100.7/32");
+    updated.verify().expect("resealed state");
+    assert_eq!(
+        *executor.calls.lock().expect("calls"),
+        vec![
+            "verify-caller-account",
+            "describe-exact-owned-security-group",
+            "rebind-authorize-operator-ssh-cidr",
+            "describe-exact-owned-security-group",
+            "rebind-revoke-operator-ssh-cidr",
+            "describe-exact-owned-security-group",
+        ]
+    );
+}
+
+#[test]
+fn operator_cidr_rebind_refuses_to_advance_state_when_revoke_does_not_converge() {
+    let (dir, old_manifest) = fixture("1.2.3", 'a');
+    let (state_dir, state) = rebind_state(&dir, &old_manifest, LifecyclePhase::DnsReady);
+    let mut new_manifest = old_manifest.clone();
+    new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
+    let executor =
+        RebindExecutor::with_revoke_convergence(&state, SshIngressShape::Both, true, false);
+
+    assert!(
+        rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", true, &executor,)
+            .is_err()
+    );
+    let persisted: Ec2State = Store::lock(&state_dir, "x6")
+        .expect("store")
+        .read()
+        .expect("read")
+        .expect("state");
+    assert_eq!(
+        persisted.infrastructure.operator_ssh_cidr, "203.0.113.9/32",
+        "failed post-revoke readback must not advance durable CIDR state"
+    );
+    assert_eq!(
+        *executor.calls.lock().expect("calls"),
+        vec![
+            "verify-caller-account",
+            "describe-exact-owned-security-group",
+            "rebind-revoke-operator-ssh-cidr",
+            "describe-exact-owned-security-group",
+        ]
+    );
+}
+
+#[test]
+fn operator_cidr_rebind_replays_crash_windows_without_widening() {
+    for (shape, expected_effects) in [
+        (
+            SshIngressShape::Both,
+            vec!["rebind-revoke-operator-ssh-cidr"],
+        ),
+        (SshIngressShape::New, vec![]),
+    ] {
+        let (dir, old_manifest) = fixture("1.2.3", 'a');
+        let (state_dir, state) = rebind_state(&dir, &old_manifest, LifecyclePhase::DnsReady);
+        let mut new_manifest = old_manifest.clone();
+        new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
+        let executor = RebindExecutor::new(&state, shape, true);
+        let updated =
+            rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", true, &executor)
+                .expect("replay");
+        assert_eq!(updated.infrastructure.operator_ssh_cidr, "198.51.100.7/32");
+        let calls = executor.calls.lock().expect("calls");
+        let effects: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| call.starts_with("rebind-").then_some(call.as_str()))
+            .collect();
+        assert_eq!(effects, expected_effects);
+    }
+}
+
+#[test]
+fn operator_cidr_rebind_rejects_wrong_identity_phase_ownership_and_dry_run_has_no_effects() {
+    let (dir, old_manifest) = fixture("1.2.3", 'a');
+    let (state_dir, _state) = rebind_state(&dir, &old_manifest, LifecyclePhase::DnsReady);
+    let mut new_manifest = old_manifest.clone();
+    new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
+    let never = Never(AtomicUsize::new(0));
+    assert!(rebind_operator_cidr(&new_manifest, &state_dir, "192.0.2.8/32", true, &never).is_err());
+    assert!(
+        rebind_operator_cidr(&new_manifest, &state_dir, "198.51.100.7/32", true, &never).is_err()
+    );
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+    let dry = rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", false, &never)
+        .expect("dry rebind");
+    assert_eq!(dry.infrastructure.operator_ssh_cidr, "203.0.113.9/32");
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+
+    let (terminal_dir, _) = rebind_state(&dir, &old_manifest, LifecyclePhase::Destroying);
+    assert!(
+        rebind_operator_cidr(&new_manifest, &terminal_dir, "203.0.113.9/32", true, &never).is_err()
+    );
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+
+    let (owner_dir, owner_state) = rebind_state(&dir, &old_manifest, LifecyclePhase::DnsReady);
+    let unowned = RebindExecutor::new(&owner_state, SshIngressShape::Old, false);
+    assert!(
+        rebind_operator_cidr(&new_manifest, &owner_dir, "203.0.113.9/32", true, &unowned).is_err()
+    );
+    assert!(
+        !unowned
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|call| call.starts_with("rebind-")),
+        "ownership rejection must produce zero cloud effects"
+    );
 }
 
 #[test]

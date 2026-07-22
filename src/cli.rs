@@ -175,6 +175,17 @@ enum Commands {
         #[arg(long)]
         execute: bool,
     },
+    /// Rebind only the exact operator SSH /32 on one owned security group.
+    Ec2RebindOperatorCidr {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        expected_old_cidr: String,
+        #[arg(long)]
+        execute: bool,
+    },
     /// Destroy only recorded owned EC2 resources.
     Ec2Destroy {
         #[arg(long)]
@@ -379,6 +390,21 @@ pub fn run(cli: Cli) -> Result<()> {
             print_json(&aws_ec2::update(
                 &m,
                 &state_dir,
+                execute,
+                &ProductionAwsExecutor,
+            )?)?;
+        }
+        Commands::Ec2RebindOperatorCidr {
+            manifest,
+            state_dir,
+            expected_old_cidr,
+            execute,
+        } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::rebind_operator_cidr(
+                &m,
+                &state_dir,
+                &expected_old_cidr,
                 execute,
                 &ProductionAwsExecutor,
             )?)?;

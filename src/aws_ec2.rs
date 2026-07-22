@@ -25,7 +25,9 @@ use crate::{ReleaseError, Result, error::io_error};
 use bundle::{BundleFacts, InstalledReceipt, ReceiptState, digest, image, load_bundle};
 use provision::HostReadyReceipt;
 
-pub use workflow::{apply, destroy, resume, status, status_with_registry, update, verify};
+pub use workflow::{
+    apply, destroy, rebind_operator_cidr, resume, status, status_with_registry, update, verify,
+};
 
 pub(super) const REGION: &str = "ap-east-1";
 pub(super) const PROVIDER: &str = "aws";

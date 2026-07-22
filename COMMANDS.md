@@ -18,6 +18,7 @@ Run from the repository root.
 | EC2 apply/resume (explicit mutation) | `cargo run --locked -- ec2-apply --manifest aws-ec2.example.json --max-monthly-usd 100 --execute` |
 | EC2 status/verify | `cargo run --locked -- ec2-status --manifest aws-ec2.example.json` / `cargo run --locked -- ec2-verify --manifest aws-ec2.example.json` |
 | EC2 update validation (mutation fail-closed) / destroy | `cargo run --locked -- ec2-update --manifest aws-ec2.example.json` / `cargo run --locked -- ec2-destroy --manifest aws-ec2.example.json --execute` |
+| EC2 operator SSH /32 recovery (exact old-to-new rebind) | `cargo run --locked -- ec2-rebind-operator-cidr --manifest aws-ec2.example.json --state-dir .dirextalk-ec2-state --expected-old-cidr <old/32> --execute` |
 | EC2 retained-volume purge (separate exact fence) | `cargo run --locked -- ec2-destroy --manifest aws-ec2.example.json --purge-volume --purge-volume-id vol-... --execute` |
 | Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
 

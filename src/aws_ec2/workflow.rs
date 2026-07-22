@@ -2761,6 +2761,286 @@ pub fn update(
     ))
 }
 
+/// Reconcile a narrowly fenced operator SSH CIDR recovery without changing lifecycle phase.
+pub fn rebind_operator_cidr(
+    manifest: &AwsEc2Manifest,
+    state_dir: &Path,
+    expected_old_cidr: &str,
+    execute: bool,
+    executor: &dyn AwsExecutor,
+) -> Result<Ec2State> {
+    manifest.validate()?;
+    let facts = manifest.bundle()?;
+    super::operator_cidr(expected_old_cidr)?;
+    if expected_old_cidr == manifest.operator_ssh_cidr {
+        return Err(contract(
+            "expected old operator SSH CIDR must differ from manifest CIDR",
+        ));
+    }
+    let store = Store::lock(state_dir, &manifest.target)?;
+    let mut state = store
+        .read::<Ec2State>()?
+        .ok_or_else(|| contract("no owned EC2 lifecycle state exists"))?;
+    state.verify()?;
+    ensure_rebind_phase(&state.phase)?;
+    ensure_rebind_pending_effect(state.pending_effect.as_deref())?;
+    ensure_rebind_identity(&state, manifest, &facts)?;
+    if state.infrastructure.operator_ssh_cidr != expected_old_cidr {
+        return Err(ReleaseError::OperationConflict);
+    }
+    if !execute {
+        return Ok(state);
+    }
+    verify_caller_account(&state, executor)?;
+    let security_group_id = state
+        .security_group_id
+        .clone()
+        .ok_or_else(|| contract("recorded security group is missing"))?;
+    let group = describe_exact_owned_security_group(&state, &security_group_id, executor)?;
+    let ingress = classify_rebind_ingress(
+        &group["IpPermissions"],
+        expected_old_cidr,
+        &manifest.operator_ssh_cidr,
+    )?;
+    match ingress {
+        RebindIngress::OldOnly => {
+            run_effect(
+                &store,
+                &mut state,
+                &operator_ingress_command(
+                    "rebind-authorize-operator-ssh-cidr",
+                    "authorize-security-group-ingress",
+                    &security_group_id,
+                    &manifest.operator_ssh_cidr,
+                )?,
+                executor,
+            )?;
+            if !matches!(
+                classify_rebind_ingress(
+                    &describe_exact_owned_security_group(&state, &security_group_id, executor)?["IpPermissions"],
+                    expected_old_cidr,
+                    &manifest.operator_ssh_cidr,
+                )?,
+                RebindIngress::Both
+            ) {
+                return Err(contract(
+                    "operator SSH ingress did not reconcile after authorization",
+                ));
+            }
+            revoke_old_operator_ingress(
+                &store,
+                &mut state,
+                &security_group_id,
+                expected_old_cidr,
+                &manifest.operator_ssh_cidr,
+                executor,
+            )?;
+        }
+        RebindIngress::Both => revoke_old_operator_ingress(
+            &store,
+            &mut state,
+            &security_group_id,
+            expected_old_cidr,
+            &manifest.operator_ssh_cidr,
+            executor,
+        )?,
+        RebindIngress::NewOnly => {}
+    }
+    // A crash after revoke leaves state old but the exact new-only remote shape; this is
+    // intentionally the only post-effect state accepted above and converges here.
+    state
+        .infrastructure
+        .operator_ssh_cidr
+        .clone_from(&manifest.operator_ssh_cidr);
+    state.pending_effect = None;
+    persist(&store, &mut state)?;
+    Ok(state)
+}
+
+fn ensure_rebind_phase(phase: &LifecyclePhase) -> Result<()> {
+    match phase {
+        LifecyclePhase::UpdateStaged
+        | LifecyclePhase::UpdateInstalling
+        | LifecyclePhase::UpdateVerifying
+        | LifecyclePhase::RollbackStaged
+        | LifecyclePhase::RollbackInstalling
+        | LifecyclePhase::RolledBack
+        | LifecyclePhase::Destroying
+        | LifecyclePhase::InfrastructureRemovedVolumeRetained
+        | LifecyclePhase::VolumePurged => Err(contract(
+            "operator SSH CIDR rebind refuses update, rollback, destroying, or terminal lifecycle state",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn ensure_rebind_pending_effect(pending_effect: Option<&str>) -> Result<()> {
+    if matches!(
+        pending_effect,
+        None | Some("rebind-authorize-operator-ssh-cidr" | "rebind-revoke-operator-ssh-cidr")
+    ) {
+        Ok(())
+    } else {
+        Err(ReleaseError::OperationConflict)
+    }
+}
+
+fn ensure_rebind_identity(
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+) -> Result<()> {
+    let mut expected_infrastructure = InfrastructureRecord::from_manifest(manifest);
+    expected_infrastructure
+        .operator_ssh_cidr
+        .clone_from(&state.infrastructure.operator_ssh_cidr);
+    if state.target != manifest.target
+        || state.region != manifest.region
+        || state.domain != manifest.domain
+        || state.infrastructure != expected_infrastructure
+        || state.desired != BundleRecord::from_facts(facts, manifest)
+        || state
+            .key
+            .as_ref()
+            .is_some_and(|key| key.key_name != manifest.key_name)
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(())
+}
+
+enum RebindIngress {
+    OldOnly,
+    Both,
+    NewOnly,
+}
+
+fn describe_exact_owned_security_group(
+    state: &Ec2State,
+    security_group_id: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<Value> {
+    let output = executor.run(&FixedCommand::new(
+        "describe-exact-owned-security-group",
+        AWS,
+        [
+            "ec2",
+            "describe-security-groups",
+            "--region",
+            REGION,
+            "--group-ids",
+            security_group_id,
+            "--output",
+            "json",
+        ],
+        false,
+        30,
+    ))?;
+    let value: Value = serde_json::from_str(&output.stdout)?;
+    let groups = value["SecurityGroups"]
+        .as_array()
+        .ok_or_else(|| contract("security group response is malformed"))?;
+    if groups.len() != 1
+        || groups[0]["GroupId"].as_str() != Some(security_group_id)
+        || groups[0]["VpcId"].as_str() != state.vpc_id.as_deref()
+        || !tags_match(&groups[0]["Tags"], state)
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(groups[0].clone())
+}
+
+fn classify_rebind_ingress(actual: &Value, old: &str, new: &str) -> Result<RebindIngress> {
+    let old_expected = rebind_permissions(&[old]);
+    let new_expected = rebind_permissions(&[new]);
+    let both_expected = rebind_permissions(&[old, new]);
+    if permissions_match(actual, &old_expected)? {
+        Ok(RebindIngress::OldOnly)
+    } else if permissions_match(actual, &both_expected)? {
+        Ok(RebindIngress::Both)
+    } else if permissions_match(actual, &new_expected)? {
+        Ok(RebindIngress::NewOnly)
+    } else {
+        Err(ReleaseError::OperationConflict)
+    }
+}
+
+fn rebind_permissions(operator_cidrs: &[&str]) -> Value {
+    let mut permissions = vec![
+        json!({"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk ACME HTTP challenge"}]}),
+        json!({"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk public HTTPS"}]}),
+        json!({"IpProtocol":"tcp","FromPort":9443,"ToPort":9445,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk Agent Control TLS"}]}),
+    ];
+    permissions.extend(
+        operator_cidrs
+            .iter()
+            .map(|cidr| operator_ingress_permission(cidr)),
+    );
+    Value::Array(permissions)
+}
+
+fn operator_ingress_permission(cidr: &str) -> Value {
+    json!({"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":cidr,"Description":"Dirextalk operator SSH"}]})
+}
+
+fn operator_ingress_command(
+    id: &str,
+    action: &str,
+    security_group_id: &str,
+    cidr: &str,
+) -> Result<FixedCommand> {
+    Ok(FixedCommand::new(
+        id,
+        AWS,
+        [
+            "ec2".into(),
+            action.into(),
+            "--region".into(),
+            REGION.into(),
+            "--group-id".into(),
+            security_group_id.into(),
+            "--ip-permissions".into(),
+            serde_json::to_string(&Value::Array(vec![operator_ingress_permission(cidr)]))?,
+        ],
+        true,
+        45,
+    ))
+}
+
+fn revoke_old_operator_ingress(
+    store: &Store,
+    state: &mut Ec2State,
+    security_group_id: &str,
+    old_cidr: &str,
+    new_cidr: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    run_effect(
+        store,
+        state,
+        &operator_ingress_command(
+            "rebind-revoke-operator-ssh-cidr",
+            "revoke-security-group-ingress",
+            security_group_id,
+            old_cidr,
+        )?,
+        executor,
+    )?;
+    if !matches!(
+        classify_rebind_ingress(
+            &describe_exact_owned_security_group(state, security_group_id, executor)?["IpPermissions"],
+            old_cidr,
+            new_cidr,
+        )?,
+        RebindIngress::NewOnly
+    ) {
+        return Err(contract(
+            "operator SSH ingress did not reconcile after revocation",
+        ));
+    }
+    Ok(())
+}
+
 fn load_state(store: &Store, manifest: &AwsEc2Manifest) -> Result<Ec2State> {
     let state = store
         .read::<Ec2State>()?

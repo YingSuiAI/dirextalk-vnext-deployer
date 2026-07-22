@@ -119,6 +119,13 @@ is present. `ec2-update`
 validates the requested immutable candidate but rejects every changed candidate
 before any provider or host effect until replay-safe update recovery is
 implemented.
+`ec2-rebind-operator-cidr` is a separately fenced recovery operation for an
+already-owned security group: it requires the exact current `/32` in state and
+an otherwise identical, digest-bound manifest with a new `/32`. With
+`--execute`, it verifies caller account and exact ownership tags, accepts only
+the old-only, old+new replay, or new-only post-revoke ingress shapes, authorizes
+the exact new TCP/22 rule before revoking the exact old rule, then reseals only
+`infrastructure.operator_ssh_cidr` without changing lifecycle phase.
 The manifest requires exact runtime and migrator images from the single
 authorized repository `dirextalk/vnet-server@sha256:<64>`, digest-pinned
 Postgres, Caddy, and probe images, a deterministic uncompressed USTAR stack
