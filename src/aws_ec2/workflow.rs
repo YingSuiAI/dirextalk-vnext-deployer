@@ -15,9 +15,9 @@ use super::store::Store;
 use super::{
     AWS, AmiRecord, AwsEc2Manifest, AwsExecutor, BundleRecord, CURL, Ec2State, EipRecord,
     FixedCommand, GETENT, HEALTH_PATH, HostKeyRecord, InfrastructureRecord, KeyRecord,
-    LifecyclePhase, OwnedRecordSet, REGION, REMOTE_BUNDLE, REMOTE_INSTALLER,
-    REMOTE_INSTALLER_ATOMIC, REMOTE_INSTALLER_UPLOAD, REMOTE_PROVISION_REQUEST, REMOTE_PROVISIONER,
-    REMOTE_PROVISIONER_ATOMIC, REMOTE_PROVISIONER_UPLOAD, REMOTE_READY_RECEIPT,
+    LifecyclePhase, OwnedRecordSet, REGION, REMOTE_BUNDLE, REMOTE_CURRENT_RECEIPT,
+    REMOTE_INSTALLER, REMOTE_INSTALLER_ATOMIC, REMOTE_INSTALLER_UPLOAD, REMOTE_PROVISION_REQUEST,
+    REMOTE_PROVISIONER, REMOTE_PROVISIONER_ATOMIC, REMOTE_PROVISIONER_UPLOAD, REMOTE_READY_RECEIPT,
     REMOTE_RECEIPT_READER, REMOTE_RECEIPT_READER_ATOMIC, REMOTE_RECEIPT_READER_UPLOAD,
     REMOTE_REQUEST, ReceiptState, RegistryExecutor, SCP, SSH, SSH_KEYGEN, SSH_KEYSCAN,
     StatusReport, UBUNTU_OWNER, UBUNTU_PATTERN, VerifyReport, contract, enforce_cost_guard,
@@ -27,11 +27,6 @@ use crate::{ReleaseError, Result};
 
 const APPLY_BUNDLE_SUFFIX: &str = "current.bundle";
 const APPLY_REQUEST_SUFFIX: &str = "current.request";
-const PREVIOUS_BUNDLE_SUFFIX: &str = "previous.bundle";
-const PREVIOUS_REQUEST_SUFFIX: &str = "previous.request";
-const NEXT_BUNDLE_SUFFIX: &str = "next.bundle";
-const NEXT_REQUEST_SUFFIX: &str = "next.request";
-const ROLLBACK_REQUEST_SUFFIX: &str = "rollback.request";
 const USER_DATA_SUFFIX: &str = "cloud-init.yaml";
 const PRIVATE_KEY_SUFFIX: &str = "id_ed25519";
 const PUBLIC_KEY_SUFFIX: &str = "id_ed25519.pub";
@@ -54,6 +49,7 @@ pub fn apply(
     let store = Store::lock(state_dir, &manifest.target)?;
     let mut state = if let Some(state) = store.read::<Ec2State>()? {
         state.verify()?;
+        ensure_apply_resumable_phase(&state.phase)?;
         ensure_apply_identity(&state, manifest, &facts)?;
         state
     } else {
@@ -82,6 +78,59 @@ pub fn apply(
     persist(&store, &mut state)?;
     debug_assert_eq!(report.server_image, manifest.server_image);
     Ok(state)
+}
+
+pub fn resume(
+    manifest: &AwsEc2Manifest,
+    state_dir: &Path,
+    max_monthly_usd: u32,
+    execute: bool,
+    executor: &dyn AwsExecutor,
+) -> Result<Ec2State> {
+    manifest.validate()?;
+    manifest.bundle()?;
+    enforce_cost_guard(manifest, max_monthly_usd)?;
+    let state = {
+        let store = Store::lock(state_dir, &manifest.target)?;
+        load_state(&store, manifest)?
+    };
+    ensure_apply_resumable_phase(&state.phase)?;
+    if !execute {
+        return Ok(state);
+    }
+    apply(manifest, state_dir, max_monthly_usd, true, executor)
+}
+
+fn ensure_apply_resumable_phase(phase: &LifecyclePhase) -> Result<()> {
+    match phase {
+        LifecyclePhase::Planned
+        | LifecyclePhase::AccountBound
+        | LifecyclePhase::AmiResolved
+        | LifecyclePhase::KeyReady
+        | LifecyclePhase::SecurityGroupReady
+        | LifecyclePhase::InstanceReady
+        | LifecyclePhase::EipReady
+        | LifecyclePhase::DnsReady
+        | LifecyclePhase::HostKeyPinned
+        | LifecyclePhase::ProvisionPending
+        | LifecyclePhase::Provisioning
+        | LifecyclePhase::HostReady
+        | LifecyclePhase::Installed
+        | LifecyclePhase::Verified => Ok(()),
+        LifecyclePhase::UpdateStaged
+        | LifecyclePhase::UpdateInstalling
+        | LifecyclePhase::UpdateVerifying
+        | LifecyclePhase::RollbackStaged
+        | LifecyclePhase::RollbackInstalling
+        | LifecyclePhase::RolledBack => Err(contract(
+            "apply/resume refuses update or rollback lifecycle state",
+        )),
+        LifecyclePhase::Destroying
+        | LifecyclePhase::InfrastructureRemovedVolumeRetained
+        | LifecyclePhase::VolumePurged => Err(contract(
+            "apply/resume refuses destroying or terminal lifecycle state",
+        )),
+    }
 }
 
 fn new_state(
@@ -183,7 +232,7 @@ fn after_effect(store: &Store, state: &mut Ec2State) -> Result<()> {
     persist(store, state)
 }
 
-fn run_effect(
+pub(super) fn run_effect(
     store: &Store,
     state: &mut Ec2State,
     command: &FixedCommand,
@@ -1394,14 +1443,49 @@ struct HostHelperSpec<'a> {
     installed_name: &'static str,
 }
 
-struct RemoteFileMetadata {
-    kind: String,
-    owner: String,
-    group: String,
-    mode: String,
-    links: String,
+pub(super) struct RemoteFileMetadata {
+    pub kind: String,
+    pub owner: String,
+    pub group: String,
+    pub mode: String,
+    pub links: String,
+    pub size: usize,
+    pub path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InstallInputState {
+    Absent,
+    UbuntuStaged,
+    UbuntuProtected,
+    RootProtected,
+}
+
+pub(super) fn classify_install_input(
+    metadata: Option<&RemoteFileMetadata>,
+    path: &str,
     size: usize,
-    path: String,
+) -> Result<InstallInputState> {
+    let Some(metadata) = metadata else {
+        return Ok(InstallInputState::Absent);
+    };
+    if metadata.kind != "f"
+        || metadata.links != "1"
+        || metadata.size != size
+        || metadata.path != path
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    match (
+        metadata.owner.as_str(),
+        metadata.group.as_str(),
+        metadata.mode.as_str(),
+    ) {
+        ("ubuntu", "ubuntu", "600") => Ok(InstallInputState::UbuntuStaged),
+        ("ubuntu", "ubuntu", "400") => Ok(InstallInputState::UbuntuProtected),
+        ("root", "root", "400") => Ok(InstallInputState::RootProtected),
+        _ => Err(ReleaseError::OperationConflict),
+    }
 }
 
 fn ensure_host_helpers(
@@ -1720,7 +1804,11 @@ fn inspect_remote_file(
         false,
         30,
     )?)?;
-    let trimmed = output.stdout.trim();
+    parse_remote_file_metadata(&output.stdout)
+}
+
+fn parse_remote_file_metadata(output: &str) -> Result<Option<RemoteFileMetadata>> {
+    let trimmed = output.trim();
     if trimmed.is_empty() {
         return Ok(None);
     }
@@ -1968,7 +2056,7 @@ fn provision_initial(
     persist(store, state)
 }
 
-fn stage_install_read_receipt(
+pub(super) fn stage_install_read_receipt(
     store: &Store,
     state: &mut Ec2State,
     bundle_suffix: &str,
@@ -1977,64 +2065,38 @@ fn stage_install_read_receipt(
     expected_state: ReceiptState,
     executor: &dyn AwsExecutor,
 ) -> Result<InstalledReceipt> {
+    if let Some(receipt) = read_existing_install_receipt(state, store, request, executor)? {
+        return Ok(receipt);
+    }
     let bundle_path = store.artifact_path(bundle_suffix)?;
     let request_path = store.artifact_path(request_suffix)?;
-    let bundle_sha = hash(&fs::read(&bundle_path).map_err(crate::error::io_error(&bundle_path))?);
-    let request_sha =
-        hash(&fs::read(&request_path).map_err(crate::error::io_error(&request_path))?);
-    for (id, local, remote) in [
-        ("stage-exact-stack-bundle", &bundle_path, REMOTE_BUNDLE),
-        ("stage-exact-install-request", &request_path, REMOTE_REQUEST),
-    ] {
-        run_effect(
-            store,
-            state,
-            &scp_command(id, state, store, local, remote)?,
-            executor,
-        )?;
-    }
-    let remote_hashes = run_effect(
-        store,
-        state,
-        &ssh_command(
-            "verify-remote-staged-digests",
-            state,
-            store,
-            ["/usr/bin/sha256sum", REMOTE_BUNDLE, REMOTE_REQUEST],
-            false,
-            30,
-        )?,
-        executor,
-    )?;
-    verify_remote_hashes(&remote_hashes.stdout, &bundle_sha, &request_sha)?;
-    for (id, command) in [
+    let bundle_bytes = fs::read(&bundle_path).map_err(crate::error::io_error(&bundle_path))?;
+    let request_bytes = fs::read(&request_path).map_err(crate::error::io_error(&request_path))?;
+    for (label, local, remote, name, bytes) in [
         (
-            "own-fixed-staged-install-inputs",
-            [
-                "/usr/bin/sudo",
-                "--non-interactive",
-                "/usr/bin/chown",
-                "root:root",
-                REMOTE_BUNDLE,
-                REMOTE_REQUEST,
-            ],
+            "stack-bundle",
+            &bundle_path,
+            REMOTE_BUNDLE,
+            "dirextalk-vnext.bundle",
+            bundle_bytes.as_slice(),
         ),
         (
-            "mode-fixed-staged-install-inputs",
-            [
-                "/usr/bin/sudo",
-                "--non-interactive",
-                "/usr/bin/chmod",
-                "0400",
-                REMOTE_BUNDLE,
-                REMOTE_REQUEST,
-            ],
+            "install-request",
+            &request_path,
+            REMOTE_REQUEST,
+            "dirextalk-vnext.request",
+            request_bytes.as_slice(),
         ),
     ] {
-        run_effect(
+        reconcile_install_input(
             store,
             state,
-            &ssh_command(id, state, store, command, true, 30)?,
+            label,
+            local,
+            remote,
+            name,
+            bytes.len(),
+            &hash(bytes),
             executor,
         )?;
     }
@@ -2062,24 +2124,185 @@ fn stage_install_read_receipt(
     InstalledReceipt::parse_and_verify(receipt.stdout.as_bytes(), request, expected_state)
 }
 
-fn verify_remote_hashes(output: &str, bundle_sha: &str, request_sha: &str) -> Result<()> {
-    let mut found = BTreeMap::new();
-    for line in output.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let digest = fields.next().unwrap_or_default();
-        let path = fields.next().unwrap_or_default().trim_start_matches('*');
-        if fields.next().is_some() {
-            return Err(contract("remote sha256sum output is malformed"));
-        }
-        found.insert(path, digest);
-    }
-    if found.len() != 2
-        || found.get(REMOTE_BUNDLE) != Some(&bundle_sha)
-        || found.get(REMOTE_REQUEST) != Some(&request_sha)
+fn read_existing_install_receipt(
+    state: &Ec2State,
+    store: &Store,
+    request: &InstallRequest,
+    executor: &dyn AwsExecutor,
+) -> Result<Option<InstalledReceipt>> {
+    let metadata = executor.run(&ssh_command(
+        "inspect-current-installed-receipt",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/find",
+            "/var/lib",
+            "-maxdepth",
+            "3",
+            "-mindepth",
+            "3",
+            "-path",
+            REMOTE_CURRENT_RECEIPT,
+            "-printf",
+            "%y %U %G %m %n %s %p\\n",
+        ],
+        false,
+        30,
+    )?)?;
+    let Some(metadata) = parse_remote_file_metadata(&metadata.stdout)? else {
+        return Ok(None);
+    };
+    if metadata.kind != "f"
+        || metadata.owner != "root"
+        || metadata.group != "root"
+        || metadata.mode != "600"
+        || metadata.links != "1"
+        || metadata.size == 0
+        || metadata.size > 64 * 1024
+        || metadata.path != REMOTE_CURRENT_RECEIPT
     {
-        return Err(contract("remote staged material digest mismatch"));
+        return Err(ReleaseError::OperationConflict);
     }
-    Ok(())
+    let output = executor.run(&ssh_command(
+        "read-existing-installed-receipt",
+        state,
+        store,
+        ["/usr/bin/sudo", "--non-interactive", REMOTE_RECEIPT_READER],
+        false,
+        30,
+    )?)?;
+    if output.stdout.len() != metadata.size {
+        return Err(ReleaseError::OperationConflict);
+    }
+    InstalledReceipt::parse_and_verify(output.stdout.as_bytes(), request, ReceiptState::Installed)
+        .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_install_input(
+    store: &Store,
+    state: &mut Ec2State,
+    label: &str,
+    local: &Path,
+    remote: &str,
+    name: &str,
+    size: usize,
+    expected_sha256: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let mut metadata = inspect_remote_file(
+        state,
+        store,
+        executor,
+        &format!("inspect-{label}"),
+        "/home/ubuntu",
+        name,
+    )?;
+    let mut disposition = classify_install_input(metadata.as_ref(), remote, size)?;
+    if disposition == InstallInputState::Absent {
+        run_effect(
+            store,
+            state,
+            &scp_command(&format!("stage-exact-{label}"), state, store, local, remote)?,
+            executor,
+        )?;
+        metadata = inspect_remote_file(
+            state,
+            store,
+            executor,
+            &format!("inspect-staged-{label}"),
+            "/home/ubuntu",
+            name,
+        )?;
+        disposition = classify_install_input(metadata.as_ref(), remote, size)?;
+        if disposition != InstallInputState::UbuntuStaged {
+            return Err(ReleaseError::OperationConflict);
+        }
+    }
+    if matches!(
+        disposition,
+        InstallInputState::UbuntuStaged | InstallInputState::UbuntuProtected
+    ) {
+        verify_remote_helper_hash(
+            state,
+            store,
+            executor,
+            &format!("verify-staged-{label}"),
+            remote,
+            expected_sha256,
+            false,
+        )?;
+        if disposition == InstallInputState::UbuntuStaged {
+            run_effect(
+                store,
+                state,
+                &ssh_command(
+                    &format!("protect-staged-{label}"),
+                    state,
+                    store,
+                    ["/usr/bin/chmod", "0400", remote],
+                    true,
+                    30,
+                )?,
+                executor,
+            )?;
+            metadata = inspect_remote_file(
+                state,
+                store,
+                executor,
+                &format!("inspect-protected-{label}"),
+                "/home/ubuntu",
+                name,
+            )?;
+            if classify_install_input(metadata.as_ref(), remote, size)?
+                != InstallInputState::UbuntuProtected
+            {
+                return Err(ReleaseError::OperationConflict);
+            }
+        }
+        run_effect(
+            store,
+            state,
+            &ssh_command(
+                &format!("own-protected-{label}"),
+                state,
+                store,
+                [
+                    "/usr/bin/sudo",
+                    "--non-interactive",
+                    "/usr/bin/chown",
+                    "root:root",
+                    remote,
+                ],
+                true,
+                30,
+            )?,
+            executor,
+        )?;
+        metadata = inspect_remote_file(
+            state,
+            store,
+            executor,
+            &format!("inspect-owned-{label}"),
+            "/home/ubuntu",
+            name,
+        )?;
+        disposition = classify_install_input(metadata.as_ref(), remote, size)?;
+    }
+    if disposition != InstallInputState::RootProtected {
+        return Err(ReleaseError::OperationConflict);
+    }
+    verify_remote_helper_hash(
+        state,
+        store,
+        executor,
+        &format!("verify-owned-{label}"),
+        remote,
+        expected_sha256,
+        true,
+    )
 }
 
 fn verify_single_remote_hash(output: &str, path: &str, expected: &str) -> Result<()> {
@@ -2448,20 +2671,21 @@ pub fn verify(
 pub fn update(
     manifest: &AwsEc2Manifest,
     state_dir: &Path,
-    execute: bool,
-    executor: &dyn AwsExecutor,
+    _execute: bool,
+    _executor: &dyn AwsExecutor,
 ) -> Result<Ec2State> {
     manifest.validate()?;
     let facts = manifest.bundle()?;
     let store = Store::lock(state_dir, &manifest.target)?;
-    let mut state = load_state(&store, manifest)?;
+    let state = load_state(&store, manifest)?;
     if !matches!(
         state.phase,
         LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack
     ) {
-        return Err(contract("update requires a converged installed lifecycle"));
+        return Err(contract(
+            "update recovery is fail-closed for a non-converged lifecycle",
+        ));
     }
-    verify_caller_account(&state, executor)?;
     let prior_bundle = state
         .current
         .clone()
@@ -2491,185 +2715,9 @@ pub fn update(
             "update cannot change immutable host-provision or host-helper inputs",
         ));
     }
-    if !execute {
-        return Ok(state);
-    }
-    let current_bundle_suffix = state
-        .current_bundle_suffix
-        .clone()
-        .ok_or_else(|| contract("current durable bundle is absent"))?;
-    let current_request_suffix = state
-        .current_request_suffix
-        .clone()
-        .ok_or_else(|| contract("current durable request is absent"))?;
-    store.write_artifact(
-        PREVIOUS_BUNDLE_SUFFIX,
-        &store.read_artifact(&current_bundle_suffix, 512 * 1024 * 1024)?,
-        0o600,
-    )?;
-    store.write_artifact(
-        PREVIOUS_REQUEST_SUFFIX,
-        &store.read_artifact(&current_request_suffix, 64 * 1024)?,
-        0o600,
-    )?;
-    store.copy_artifact(
-        NEXT_BUNDLE_SUFFIX,
-        &manifest.stack_bundle_path,
-        &facts.bundle_sha256,
-    )?;
-    let request = InstallRequest::new(
-        &state.domain,
-        &facts,
-        Some(prior_receipt.receipt_sha256.clone()),
-    );
-    store.write_artifact(NEXT_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
-    state.previous = Some(prior_bundle.clone());
-    state.previous_receipt = Some(prior_receipt.clone());
-    state.previous_bundle_suffix = Some(PREVIOUS_BUNDLE_SUFFIX.into());
-    state.previous_request_suffix = Some(PREVIOUS_REQUEST_SUFFIX.into());
-    state.desired = candidate.clone();
-    state.phase = LifecyclePhase::UpdateStaged;
-    persist(&store, &mut state)?;
-    let update_result = (|| -> Result<()> {
-        state.phase = LifecyclePhase::UpdateInstalling;
-        persist(&store, &mut state)?;
-        let receipt = stage_install_read_receipt(
-            &store,
-            &mut state,
-            NEXT_BUNDLE_SUFFIX,
-            NEXT_REQUEST_SUFFIX,
-            &request,
-            ReceiptState::Installed,
-            executor,
-        )?;
-        state.current = Some(candidate.clone());
-        state.current_receipt = Some(receipt);
-        state.current_bundle_suffix = Some(NEXT_BUNDLE_SUFFIX.into());
-        state.current_request_suffix = Some(NEXT_REQUEST_SUFFIX.into());
-        state.phase = LifecyclePhase::UpdateVerifying;
-        persist(&store, &mut state)?;
-        verify_live_locked(&store, &mut state, manifest, executor)?;
-        state.phase = LifecyclePhase::Verified;
-        persist(&store, &mut state)
-    })();
-    if update_result.is_ok() {
-        return Ok(state);
-    }
-    rollback_update(
-        &store,
-        &mut state,
-        manifest,
-        &prior_bundle,
-        &prior_receipt,
-        executor,
-    )?;
     Err(contract(
-        "update failed; exact previous release was rolled back",
+        "EC2 update mutation is disabled until replay-safe recovery is implemented",
     ))
-}
-
-fn rollback_update(
-    store: &Store,
-    state: &mut Ec2State,
-    manifest: &AwsEc2Manifest,
-    previous: &BundleRecord,
-    previous_receipt: &InstalledReceipt,
-    executor: &dyn AwsExecutor,
-) -> Result<()> {
-    let rollback_previous = state.current_receipt.as_ref().map_or_else(
-        || previous_receipt.receipt_sha256.clone(),
-        |receipt| receipt.receipt_sha256.clone(),
-    );
-    let request = request_from_record(&state.domain, previous, Some(rollback_previous));
-    store.write_artifact(ROLLBACK_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
-    state.phase = LifecyclePhase::RollbackStaged;
-    persist(store, state)?;
-    state.phase = LifecyclePhase::RollbackInstalling;
-    persist(store, state)?;
-    let receipt = stage_install_read_receipt(
-        store,
-        state,
-        PREVIOUS_BUNDLE_SUFFIX,
-        ROLLBACK_REQUEST_SUFFIX,
-        &request,
-        ReceiptState::RolledBack,
-        executor,
-    )?;
-    state.current = Some(previous.clone());
-    state.current_receipt = Some(receipt.clone());
-    state.rollback_receipt = Some(receipt);
-    state.current_bundle_suffix = Some(PREVIOUS_BUNDLE_SUFFIX.into());
-    state.current_request_suffix = Some(ROLLBACK_REQUEST_SUFFIX.into());
-    verify_network_health(state, manifest, executor)?;
-    state.phase = LifecyclePhase::RolledBack;
-    state.pending_effect = None;
-    persist(store, state)
-}
-
-fn request_from_record(
-    domain: &str,
-    record: &BundleRecord,
-    previous_receipt_sha256: Option<String>,
-) -> InstallRequest {
-    InstallRequest {
-        schema: "dirextalk.vnext-install-request".into(),
-        schema_version: 1,
-        target: "linux-amd64".into(),
-        domain: domain.into(),
-        version: record.version.clone(),
-        source_commit: record.source_commit.clone(),
-        bundle_sha256: record.bundle_sha256.clone(),
-        manifest_sha256: record.manifest_sha256.clone(),
-        server_image: record.server_image.clone(),
-        migrator_image: record.migrator_image.clone(),
-        previous_receipt_sha256,
-    }
-}
-
-fn verify_network_health(
-    state: &Ec2State,
-    manifest: &AwsEc2Manifest,
-    executor: &dyn AwsExecutor,
-) -> Result<()> {
-    let ip = state
-        .eip
-        .as_ref()
-        .map(|eip| eip.public_ip.as_str())
-        .ok_or_else(|| contract("EIP state is missing"))?;
-    let dns = executor.run(&FixedCommand::new(
-        "verify-rollback-dns",
-        GETENT,
-        ["ahostsv4", manifest.domain.as_str()],
-        false,
-        20,
-    ))?;
-    if !dns
-        .stdout
-        .lines()
-        .any(|line| line.split_ascii_whitespace().next() == Some(ip))
-    {
-        return Err(contract("rollback DNS readiness failed"));
-    }
-    executor.run(&FixedCommand::new(
-        "verify-rollback-https",
-        CURL,
-        [
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--proto",
-            "=https",
-            "--tlsv1.2",
-            "--max-time",
-            "20",
-            "--output",
-            "/dev/null",
-            &format!("https://{}{HEALTH_PATH}", manifest.domain),
-        ],
-        false,
-        30,
-    ))?;
-    Ok(())
 }
 
 fn load_state(store: &Store, manifest: &AwsEc2Manifest) -> Result<Ec2State> {
@@ -2698,7 +2746,6 @@ pub fn destroy(
     manifest.validate()?;
     let store = Store::lock(state_dir, &manifest.target)?;
     let mut state = load_state(&store, manifest)?;
-    verify_caller_account(&state, executor)?;
     if purge_volume {
         let expected = state
             .volume_id
@@ -2717,6 +2764,7 @@ pub fn destroy(
         if !execute {
             return Ok(state);
         }
+        verify_caller_account(&state, executor)?;
         let volumes = describe_volumes_by_id(&expected, executor)?;
         if volumes.is_empty()
             && state.pending_effect.as_deref() == Some("purge-explicit-retained-volume")
@@ -2724,6 +2772,7 @@ pub fn destroy(
             state.retained_volume = false;
             state.phase = LifecyclePhase::VolumePurged;
             state.pending_effect = None;
+            clear_terminal_runtime_evidence(&mut state);
             persist(&store, &mut state)?;
             return Ok(state);
         }
@@ -2747,10 +2796,8 @@ pub fn destroy(
         state.retained_volume = false;
         state.phase = LifecyclePhase::VolumePurged;
         state.pending_effect = None;
+        clear_terminal_runtime_evidence(&mut state);
         persist(&store, &mut state)?;
-        return Ok(state);
-    }
-    if !execute {
         return Ok(state);
     }
     if matches!(
@@ -2759,6 +2806,10 @@ pub fn destroy(
     ) {
         return Ok(state);
     }
+    if !execute {
+        return Ok(state);
+    }
+    verify_caller_account(&state, executor)?;
     state.phase = LifecyclePhase::Destroying;
     persist(&store, &mut state)?;
     destroy_dns(&store, &mut state, executor)?;
@@ -2773,8 +2824,17 @@ pub fn destroy(
     state.retained_volume = true;
     state.phase = LifecyclePhase::InfrastructureRemovedVolumeRetained;
     state.pending_effect = None;
+    clear_terminal_runtime_evidence(&mut state);
     persist(&store, &mut state)?;
     Ok(state)
+}
+
+pub(super) fn clear_terminal_runtime_evidence(state: &mut Ec2State) {
+    state.host_key = None;
+    state.current_receipt = None;
+    state.previous_receipt = None;
+    state.rollback_receipt = None;
+    state.host_ready_receipt = None;
 }
 
 fn destroy_dns(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecutor) -> Result<()> {
@@ -3310,14 +3370,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_stage_hashes_require_both_fixed_paths_exactly_once() {
+    fn remote_stage_hash_requires_one_fixed_path_exactly_once() {
         let bundle = "a".repeat(64);
-        let request = "b".repeat(64);
-        let output = format!("{bundle}  {REMOTE_BUNDLE}\n{request}  {REMOTE_REQUEST}\n");
-        verify_remote_hashes(&output, &bundle, &request).expect("hashes");
+        let output = format!("{bundle}  {REMOTE_BUNDLE}\n");
+        verify_single_remote_hash(&output, REMOTE_BUNDLE, &bundle).expect("hash");
         assert!(
-            verify_remote_hashes(&format!("{bundle}  {REMOTE_BUNDLE}\n"), &bundle, &request,)
-                .is_err()
+            verify_single_remote_hash(
+                &format!("{bundle}  {REMOTE_BUNDLE}\n{bundle}  {REMOTE_REQUEST}\n"),
+                REMOTE_BUNDLE,
+                &bundle,
+            )
+            .is_err()
         );
     }
 }

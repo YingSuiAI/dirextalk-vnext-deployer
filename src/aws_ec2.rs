@@ -25,7 +25,7 @@ use crate::{ReleaseError, Result, error::io_error};
 use bundle::{BundleFacts, InstalledReceipt, ReceiptState, digest, image, load_bundle};
 use provision::HostReadyReceipt;
 
-pub use workflow::{apply, destroy, status, status_with_registry, update, verify};
+pub use workflow::{apply, destroy, resume, status, status_with_registry, update, verify};
 
 pub(super) const REGION: &str = "ap-east-1";
 pub(super) const PROVIDER: &str = "aws";
@@ -50,6 +50,7 @@ pub(super) const REMOTE_RECEIPT_READER_UPLOAD: &str = "/home/ubuntu/read-vnext-r
 pub(super) const REMOTE_INSTALLER: &str = "/usr/local/libexec/dirextalk/install-vnext";
 pub(super) const REMOTE_PROVISIONER: &str = "/usr/local/libexec/dirextalk/provision-vnext";
 pub(super) const REMOTE_RECEIPT_READER: &str = "/usr/local/libexec/dirextalk/read-vnext-receipt";
+pub(super) const REMOTE_CURRENT_RECEIPT: &str = "/var/lib/dirextalk-vnext/receipts/current.json";
 pub(super) const REMOTE_INSTALLER_ATOMIC: &str = "/usr/local/libexec/dirextalk/.install-vnext.new";
 pub(super) const REMOTE_PROVISIONER_ATOMIC: &str =
     "/usr/local/libexec/dirextalk/.provision-vnext.new";

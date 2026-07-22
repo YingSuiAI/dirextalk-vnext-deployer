@@ -166,7 +166,7 @@ enum Commands {
         #[arg(long, default_value = ".dirextalk-ec2-state")]
         state_dir: PathBuf,
     },
-    /// Update the exact bundle digest with a rollback receipt.
+    /// Validate an exact update request; mutation currently fails closed.
     Ec2Update {
         #[arg(long)]
         manifest: PathBuf,
@@ -327,15 +327,24 @@ pub fn run(cli: Cli) -> Result<()> {
             state_dir,
             max_monthly_usd,
             execute,
+        } => {
+            let m = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::apply(
+                &m,
+                &state_dir,
+                max_monthly_usd,
+                execute,
+                &ProductionAwsExecutor,
+            )?)?;
         }
-        | Commands::Ec2Resume {
+        Commands::Ec2Resume {
             manifest,
             state_dir,
             max_monthly_usd,
             execute,
         } => {
             let m = AwsEc2Manifest::load(&manifest)?;
-            print_json(&aws_ec2::apply(
+            print_json(&aws_ec2::resume(
                 &m,
                 &state_dir,
                 max_monthly_usd,

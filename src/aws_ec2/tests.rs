@@ -1,8 +1,11 @@
 use std::{
     fs,
     io::Cursor,
-    path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -193,6 +196,49 @@ impl AwsExecutor for Identity {
             stdout: "{\"Account\":\"123456789012\"}".into(),
             stderr: String::new(),
         })
+    }
+}
+
+struct ObservePending {
+    state_path: PathBuf,
+    phase: LifecyclePhase,
+}
+
+struct ExistingReceipt {
+    receipt: String,
+    calls: Mutex<Vec<String>>,
+}
+
+impl AwsExecutor for ExistingReceipt {
+    fn run(&self, command: &FixedCommand) -> Result<ExecOutput> {
+        self.calls.lock().expect("calls").push(command.id.clone());
+        let stdout = match command.id.as_str() {
+            "inspect-current-installed-receipt" => format!(
+                "f root root 600 1 {} {}\n",
+                self.receipt.len(),
+                REMOTE_CURRENT_RECEIPT
+            ),
+            "read-existing-installed-receipt" => self.receipt.clone(),
+            _ => return Err(contract("unexpected effect after existing receipt")),
+        };
+        Ok(ExecOutput {
+            status: 0,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
+impl AwsExecutor for ObservePending {
+    fn run(&self, command: &FixedCommand) -> Result<ExecOutput> {
+        let state: Ec2State = serde_json::from_slice(
+            &fs::read(&self.state_path).expect("state persisted before executor"),
+        )
+        .expect("persisted state JSON");
+        state.verify().expect("persisted state integrity");
+        assert_eq!(state.phase, self.phase);
+        assert_eq!(state.pending_effect.as_deref(), Some(command.id.as_str()));
+        Ok(ExecOutput::default())
     }
 }
 
@@ -412,7 +458,7 @@ fn cloud_init_fits_ec2_limit_and_contains_no_helpers_or_provision_secrets() {
 }
 
 #[test]
-fn update_uses_explicit_digest_and_cross_version_fails_closed() {
+fn update_mutation_and_cross_version_fail_closed_without_effects() {
     let (old_dir, old) = fixture("1.2.3", 'a');
     let old_facts = old.bundle().expect("old facts");
     let old_request = InstallRequest::new("x6.example.invalid", &old_facts, None);
@@ -432,7 +478,11 @@ fn update_uses_explicit_digest_and_cross_version_fails_closed() {
         .expect("write state");
 
     let (_same_dir, same_version) = fixture("1.2.3", 'b');
-    update(&same_version, &state_dir, false, &Identity).expect("explicit digest plan");
+    let executor = Never(AtomicUsize::new(0));
+    let error = update(&same_version, &state_dir, true, &executor)
+        .expect_err("update mutation remains disabled");
+    assert!(error.to_string().contains("update mutation is disabled"));
+    assert_eq!(executor.0.load(Ordering::Relaxed), 0);
 
     let (_new_dir, cross_version) = fixture("2.0.0", 'b');
     let error = update(&cross_version, &state_dir, false, &Identity)
@@ -442,6 +492,202 @@ fn update_uses_explicit_digest_and_cross_version_fails_closed() {
             .to_string()
             .contains("cross-version update is unsupported")
     );
+}
+
+fn remote_file(
+    owner: &str,
+    group: &str,
+    mode: &str,
+    size: usize,
+    path: &str,
+) -> workflow::RemoteFileMetadata {
+    workflow::RemoteFileMetadata {
+        kind: "f".into(),
+        owner: owner.into(),
+        group: group.into(),
+        mode: mode.into(),
+        links: "1".into(),
+        size,
+        path: path.into(),
+    }
+}
+
+#[test]
+fn install_input_crash_windows_reconcile_exactly() {
+    use workflow::InstallInputState;
+
+    let path = REMOTE_BUNDLE;
+    let size = 61_440;
+    assert_eq!(
+        workflow::classify_install_input(None, path, size).expect("absent"),
+        InstallInputState::Absent
+    );
+    for (owner, group, mode, expected) in [
+        ("ubuntu", "ubuntu", "600", InstallInputState::UbuntuStaged),
+        (
+            "ubuntu",
+            "ubuntu",
+            "400",
+            InstallInputState::UbuntuProtected,
+        ),
+        ("root", "root", "400", InstallInputState::RootProtected),
+    ] {
+        let metadata = remote_file(owner, group, mode, size, path);
+        assert_eq!(
+            workflow::classify_install_input(Some(&metadata), path, size).expect("crash window"),
+            expected
+        );
+    }
+    for metadata in [
+        remote_file("root", "root", "600", size, path),
+        remote_file("ubuntu", "ubuntu", "644", size, path),
+        remote_file("root", "root", "400", size + 1, path),
+        workflow::RemoteFileMetadata {
+            kind: "l".into(),
+            ..remote_file("root", "root", "400", size, path)
+        },
+        workflow::RemoteFileMetadata {
+            links: "2".into(),
+            ..remote_file("root", "root", "400", size, path)
+        },
+    ] {
+        assert!(workflow::classify_install_input(Some(&metadata), path, size).is_err());
+    }
+}
+
+#[test]
+fn initial_install_resume_accepts_exact_post_effect_receipt_without_reinstall() {
+    let (dir, manifest) = fixture("1.2.3", 'a');
+    let facts = manifest.bundle().expect("facts");
+    let request = InstallRequest::new(&manifest.domain, &facts, None);
+    let receipt = canonical(&receipt_for(&request, ReceiptState::Installed));
+    let executor = ExistingReceipt {
+        receipt: String::from_utf8(receipt).expect("receipt UTF-8"),
+        calls: Mutex::new(Vec::new()),
+    };
+    let state_dir = dir.path().join("post-effect");
+    let mut state = apply(
+        &manifest,
+        &state_dir,
+        100,
+        false,
+        &Never(AtomicUsize::new(0)),
+    )
+    .expect("state");
+    state.eip = Some(EipRecord {
+        allocation_id: "eipalloc-1".into(),
+        association_id: "eipassoc-1".into(),
+        public_ip: "203.0.113.8".into(),
+    });
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    let actual = workflow::stage_install_read_receipt(
+        &store,
+        &mut state,
+        "missing.bundle",
+        "missing.request",
+        &request,
+        ReceiptState::Installed,
+        &executor,
+    )
+    .expect("resume receipt");
+    assert_eq!(actual.bundle_sha256, request.bundle_sha256);
+    assert_eq!(
+        *executor.calls.lock().expect("calls"),
+        vec![
+            "inspect-current-installed-receipt".to_owned(),
+            "read-existing-installed-receipt".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn lifecycle_state_is_persisted_before_every_effect() {
+    let (dir, manifest) = fixture("1.2.3", 'a');
+    let state_dir = dir.path().join("effect-state");
+    let mut state = apply(
+        &manifest,
+        &state_dir,
+        100,
+        false,
+        &Never(AtomicUsize::new(0)),
+    )
+    .expect("dry state");
+    state.phase = LifecyclePhase::Provisioning;
+    state = state.seal().expect("seal");
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    store.write(&state).expect("initial state");
+    let observer = ObservePending {
+        state_path: store.state_path(),
+        phase: LifecyclePhase::Provisioning,
+    };
+    let command = FixedCommand::new("fixed-test-effect", "fixed-test", ["arg"], true, 1);
+    workflow::run_effect(&store, &mut state, &command, &observer).expect("effect");
+    assert_eq!(state.pending_effect, None);
+    let persisted: Ec2State =
+        serde_json::from_slice(&fs::read(store.state_path()).expect("state after effect"))
+            .expect("state JSON");
+    assert_eq!(persisted.pending_effect, None);
+}
+
+#[test]
+fn apply_and_resume_reject_update_and_destroy_states_before_effects() {
+    let (dir, manifest) = fixture("1.2.3", 'a');
+    let executor = Never(AtomicUsize::new(0));
+    for (index, phase) in [
+        LifecyclePhase::UpdateStaged,
+        LifecyclePhase::UpdateInstalling,
+        LifecyclePhase::RollbackInstalling,
+        LifecyclePhase::Destroying,
+        LifecyclePhase::InfrastructureRemovedVolumeRetained,
+        LifecyclePhase::VolumePurged,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state_dir = dir.path().join(format!("terminal-{index}"));
+        let mut state = apply(&manifest, &state_dir, 100, false, &executor).expect("dry state");
+        state.phase = phase;
+        state = state.seal().expect("seal");
+        Store::lock(&state_dir, "x6")
+            .expect("store")
+            .write(&state)
+            .expect("state");
+        assert!(apply(&manifest, &state_dir, 100, true, &executor).is_err());
+        assert!(resume(&manifest, &state_dir, 100, true, &executor).is_err());
+    }
+    assert_eq!(executor.0.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn terminalization_clears_remote_authentication_evidence() {
+    let (dir, manifest) = fixture("1.2.3", 'a');
+    let facts = manifest.bundle().expect("facts");
+    let request = InstallRequest::new(&manifest.domain, &facts, None);
+    let mut state = apply(
+        &manifest,
+        &dir.path().join("state"),
+        100,
+        false,
+        &Never(AtomicUsize::new(0)),
+    )
+    .expect("state");
+    state.host_key = Some(HostKeyRecord {
+        algorithm: "ssh-ed25519".into(),
+        key_base64: "AAAA".into(),
+        key_sha256: "a".repeat(64),
+        console_line_sha256: "b".repeat(64),
+        known_hosts_suffix: "known_hosts".into(),
+    });
+    let receipt = receipt_for(&request, ReceiptState::Installed);
+    state.current_receipt = Some(receipt.clone());
+    state.previous_receipt = Some(receipt.clone());
+    state.rollback_receipt = Some(receipt);
+    workflow::clear_terminal_runtime_evidence(&mut state);
+    assert!(state.host_key.is_none());
+    assert!(state.current_receipt.is_none());
+    assert!(state.previous_receipt.is_none());
+    assert!(state.rollback_receipt.is_none());
+    assert!(state.host_ready_receipt.is_none());
 }
 
 #[test]

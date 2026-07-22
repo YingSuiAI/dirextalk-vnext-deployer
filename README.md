@@ -114,8 +114,11 @@ command or shell-script escape hatch.
 
 `ec2-plan` validates one immutable Ubuntu 24.04 amd64 node in `ap-east-1` and
 prints the closed action set and conservative monthly cost ceiling.
-`ec2-apply`/`ec2-resume`,
-`ec2-update`, and `ec2-destroy` remain dry runs unless `--execute` is present.
+`ec2-apply`, `ec2-resume`, and `ec2-destroy` remain dry runs unless `--execute`
+is present. `ec2-update`
+validates the requested immutable candidate but rejects every changed candidate
+before any provider or host effect until replay-safe update recovery is
+implemented.
 The manifest requires exact runtime and migrator images from the single
 authorized repository `dirextalk/vnet-server@sha256:<64>`, digest-pinned
 Postgres, Caddy, and probe images, a deterministic uncompressed USTAR stack
@@ -145,11 +148,11 @@ purge it. Use the same manifest shape for `x6`, `x7`, or `x8`.
 fixed command `docker buildx imagetools inspect` for
 `docker.io/dirextalk/vnet-server:latest`. Its JSON manifest digest must parse
 as canonical `sha256:<64>`. The tag is comparison-only and is never consulted
-by apply or update. Updates consume only the explicitly supplied immutable
-bundle and image digests; this stage fails closed on cross-version updates
-until migration-history compatibility evidence is available. Same-version
-updates preserve the installed production compose, dependency-image, and
-host-helper identities; changing those requires a fresh host lifecycle. Docker
+by apply or update. Update validation consumes only the explicitly supplied
+immutable bundle and image digests, rejects cross-version changes, and also
+requires the production compose, dependency-image, and host-helper identities
+to remain unchanged. It performs no candidate install or rollback mutation.
+Docker
 credentials, command stderr, and registry tokens are neither printed nor
 persisted.
 
