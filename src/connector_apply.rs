@@ -392,7 +392,15 @@ fn apply_with(
 
     if record.phase == Phase::Claimed {
         let result = if plan_expired {
-            invoke_expired_unclaimed_proof(operator, &record)?
+            invoke_expired_unclaimed_proof(operator, &record, || {
+                let files = load_material_files(inputs, &plan, &record.plan_sha256)?;
+                validate_material_identity(
+                    &record,
+                    &files,
+                    &ProtectedBytes::read(&inputs.plan, MAX_PLAN, ProtectedKind::NonSecret)?,
+                )?;
+                Ok(files.prepare_material)
+            })?
         } else {
             invoke_v2_recoverable(
                 operator,
@@ -888,11 +896,15 @@ fn invoke_v2_recoverable(
     }
 }
 
-/// Obtains the sole accepted expired-bootstrap proof without ever supplying material.
-fn invoke_expired_unclaimed_proof(
+/// Obtains the exact no-effect proof, loading material only after the Host requests it.
+fn invoke_expired_unclaimed_proof<F>(
     operator: &dyn Operator,
     record: &ConnectorExecutionRecordV1,
-) -> Result<V2Result> {
+    material: F,
+) -> Result<V2Result>
+where
+    F: FnOnce() -> Result<Vec<u8>>,
+{
     let expected = record.initial_revision;
     let empty = Vec::new();
     let header = v2_header(
@@ -904,9 +916,27 @@ fn invoke_expired_unclaimed_proof(
     if digest(&serde_json::to_vec(&header)?) != record.prepare_replay_header_sha256 {
         return Err(ReleaseError::OperationConflict);
     }
-    let V2Reply::Success(result) = invoke_v2(operator, &header, &empty)? else {
+    if !matches!(
+        invoke_v2(operator, &header, &empty)?,
+        V2Reply::MaterialRequired
+    ) {
         return Err(deployment(
-            "expired Connector bootstrap requires header-only no-effect proof",
+            "expired Connector bootstrap must require exact material before no-effect proof",
+        ));
+    }
+    let material = material()?;
+    if material.is_empty() {
+        return Err(deployment("expired Connector bootstrap material is empty"));
+    }
+    let header = v2_header(
+        record,
+        V2Operation::PrepareConnectorMaterial,
+        expected,
+        &material,
+    )?;
+    let V2Reply::Success(result) = invoke_v2(operator, &header, &material)? else {
+        return Err(deployment(
+            "expired Connector bootstrap still requires exact material",
         ));
     };
     let result = validate_v2_result(
@@ -1995,7 +2025,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_planned_entry_uses_only_replayable_header_proof() {
+    fn expired_planned_entry_requires_material_then_accepts_no_effect_proof() {
         let plan = parse_plan(PLAN).expect("plan");
         let mut record = record(&plan);
         let header = v2_header(
@@ -2012,48 +2042,19 @@ mod tests {
         );
         let operator = QueueOperator {
             responses: Mutex::new(VecDeque::from([
-                response.as_bytes().to_vec(),
+                br#"{"protocol":"dirextalk.host-control.operator.v2","status":"rejected","error":"MATERIAL_REQUIRED"}"#.to_vec(),
                 response.into_bytes(),
             ])),
             frames: Mutex::new(Vec::new()),
         };
         assert!(is_expired_unclaimed_prepare(
-            &invoke_expired_unclaimed_proof(&operator, &record).expect("first proof")
+            &invoke_expired_unclaimed_proof(&operator, &record, || Ok(b"exact material".to_vec()))
+                .expect("material proof")
         ));
-        assert!(is_expired_unclaimed_prepare(
-            &invoke_expired_unclaimed_proof(&operator, &record).expect("replay proof")
-        ));
-        assert!(
-            operator
-                .frames
-                .lock()
-                .expect("frames")
-                .iter()
-                .all(|frame| frame[frame.len() - 4..] == [0, 0, 0, 0])
-        );
-    }
-
-    #[test]
-    fn expired_planned_entry_refuses_material_request() {
-        let plan = parse_plan(PLAN).expect("plan");
-        let mut record = record(&plan);
-        let header = v2_header(
-            &record,
-            V2Operation::PrepareConnectorMaterial,
-            record.initial_revision,
-            &[],
-        )
-        .expect("header");
-        record.prepare_replay_header_sha256 = digest(&serde_json::to_vec(&header).expect("json"));
-        let operator = QueueOperator {
-            responses: Mutex::new(VecDeque::from([
-                br#"{"protocol":"dirextalk.host-control.operator.v2","status":"rejected","error":"MATERIAL_REQUIRED"}"#.to_vec(),
-            ])),
-            frames: Mutex::new(Vec::new()),
-        };
-        assert!(invoke_expired_unclaimed_proof(&operator, &record).is_err());
         let frames = operator.frames.lock().expect("frames");
         assert_eq!(&frames[0][frames[0].len() - 4..], [0, 0, 0, 0]);
+        assert_ne!(&frames[1][frames[1].len() - 4..], [0, 0, 0, 0]);
+        assert_eq!(frames.len(), 2, "no start or finalize frame follows proof");
     }
 
     #[test]
