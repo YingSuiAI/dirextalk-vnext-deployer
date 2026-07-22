@@ -26,6 +26,10 @@ use crate::error::{ReleaseError, Result, io_error};
 const MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(unix)]
 const STATE_DIR: &str = "/var/lib/dirextalk-vnext-deployer";
+#[cfg(unix)]
+const MAX_STATE_ROOT_ENTRIES: usize = 4096;
+#[cfg(unix)]
+const TARGET_OWNER_PREFIX: &str = "target-owner-";
 const HOST_EVIDENCE_PATH: &str = "/etc/dirextalk/host-supervisor/host.json";
 #[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +46,44 @@ impl DeploymentManifest {
         require_safe_file(path, MAX_BYTES)?;
         let bytes = fs::read(path).map_err(io_error(path))?;
         Self::from_bytes(&bytes)
+    }
+    /// Loads the local production manifest through a root-owned, closed-mode file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `path` is a non-symlink regular `0600` file owned
+    /// by root and contains a strict deployment manifest.
+    #[cfg(unix)]
+    pub fn load_protected(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(path)(std::io::Error::from(error)))?;
+        let file: File = descriptor.into();
+        let metadata = file.metadata().map_err(io_error(path))?;
+        if !protected_manifest_metadata_valid(
+            metadata.is_file(),
+            metadata.nlink(),
+            metadata.uid(),
+            metadata.mode() & 0o777,
+            metadata.len(),
+        ) {
+            return Err(ReleaseError::StateUnsafe(path.to_path_buf()));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_error(path))?;
+        Self::from_bytes(&bytes)
+    }
+    #[cfg(not(unix))]
+    pub fn load_protected(path: &Path) -> Result<Self> {
+        let _ = path;
+        Err(durable_state_unsupported())
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() || bytes.len() as u64 > MAX_BYTES {
@@ -62,6 +104,16 @@ impl DeploymentManifest {
     pub fn digest(&self) -> &str {
         &self.digest
     }
+}
+#[cfg(unix)]
+const fn protected_manifest_metadata_valid(
+    is_regular: bool,
+    nlink: u64,
+    uid: u32,
+    mode: u32,
+    size: u64,
+) -> bool {
+    is_regular && nlink == 1 && uid == 0 && mode == 0o600 && size > 0 && size <= MAX_BYTES
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -279,6 +331,10 @@ fn verify_host_tuple(expected: &HostTuple, actual: &HostTuple) -> Result<Verifie
         return Err(contract("host evidence tuple does not match target"));
     }
     Ok(VerifiedHostBinding(expected.clone()))
+}
+#[cfg(test)]
+pub(crate) fn verified_host_binding_for_test(host: HostTuple) -> VerifiedHostBinding {
+    VerifiedHostBinding(host)
 }
 impl HostTuple {
     fn validate(&self) -> Result<()> {
@@ -908,21 +964,96 @@ impl DeploymentStateStore {
         serialize_bounded(&record)?;
         serialize_bounded(&ownership)?;
         self.ensure_root()?;
+        // Every claim takes the globally keyed operation lock before its target
+        // lock. This prevents one UUID from being published under two target
+        // ownership fences while preserving target-level serialization.
+        let _operation_lock = self.lock(&format!("id-{}", record.operation_id))?;
+        let existing = match self.read(&record.operation_id) {
+            Ok(existing) => Some(existing),
+            Err(ReleaseError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(existing) = &existing
+            && operation_identity_digest(existing)? != operation_identity_digest(&record)?
+        {
+            return Err(ReleaseError::OperationConflict);
+        }
         let fence = ownership_fence(&record.target, &record.binding.host)?;
-        let _lock = self.lock(&format!("target-{fence}"))?;
         let owner_path = self.root.join(format!("target-owner-{fence}.json"));
-        match Self::read_owner(&owner_path) {
+        if existing.is_none() {
+            self.reconcile_legacy_owner_for_absent_operation(&record, &ownership, &owner_path)?;
+        }
+        let _target_lock = self.lock(&format!("target-{fence}"))?;
+        self.validate_owner_transition(&owner_path, &record, &ownership)?;
+        if let Some(existing) = existing {
+            // Complete an interrupted record-first claim (or atomically rewrite
+            // the identical ownership projection on an exact retry).
+            self.write_path(&owner_path, &ownership)?;
+            return Ok(existing);
+        }
+        // Persist the immutable global identity before publishing target
+        // ownership. A crash here is recoverable by the exact replay above.
+        self.write_path(&self.record_path(&record.operation_id)?, &record)?;
+        self.write_path(&owner_path, &ownership)?;
+        Ok(record)
+    }
+    fn reconcile_legacy_owner_for_absent_operation(
+        &self,
+        record: &OperationRecord,
+        ownership: &TargetOwnership,
+        expected_owner_path: &Path,
+    ) -> Result<()> {
+        let entries = fs::read_dir(&self.root).map_err(io_error(&self.root))?;
+        let mut matching = None;
+        let mut candidate_count = 0;
+        for entry in entries {
+            let entry = entry.map_err(io_error(&self.root))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !is_target_owner_projection_filename(name) {
+                continue;
+            }
+            candidate_count += 1;
+            if candidate_count > MAX_STATE_ROOT_ENTRIES {
+                return Err(ReleaseError::StateUnsafe(self.root.clone()));
+            }
+            let path = entry.path();
+            let current = Self::read_owner(&path)?;
+            if current.current_operation_id != record.operation_id {
+                continue;
+            }
+            if matching.replace(path.clone()).is_some()
+                || path != expected_owner_path
+                || current != *ownership
+            {
+                return Err(ReleaseError::OperationConflict);
+            }
+        }
+        Ok(())
+    }
+    fn validate_owner_transition(
+        &self,
+        owner_path: &Path,
+        record: &OperationRecord,
+        ownership: &TargetOwnership,
+    ) -> Result<()> {
+        match Self::read_owner(owner_path) {
             Ok(current) if current.current_operation_id == record.operation_id => {
-                if current != ownership {
+                if current != *ownership {
                     return Err(ReleaseError::OperationConflict);
                 }
             }
             Ok(current) => {
-                if current.target != record.target || current.host != record.binding.host {
-                    return Err(ReleaseError::OperationConflict);
-                }
-                if record.predecessor_operation_id.as_deref()
-                    != Some(current.current_operation_id.as_str())
+                if current.target != record.target
+                    || current.host != record.binding.host
+                    || record.predecessor_operation_id.as_deref()
+                        != Some(current.current_operation_id.as_str())
                 {
                     return Err(ReleaseError::OperationConflict);
                 }
@@ -935,7 +1066,6 @@ impl DeploymentStateStore {
                 {
                     return Err(ReleaseError::OperationConflict);
                 }
-                self.write_path(&owner_path, &ownership)?;
             }
             Err(ReleaseError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
@@ -943,11 +1073,10 @@ impl DeploymentStateStore {
                 if record.predecessor_operation_id.is_some() {
                     return Err(ReleaseError::OperationConflict);
                 }
-                self.write_path(&owner_path, &ownership)?;
             }
             Err(error) => return Err(error),
         }
-        self.converge_operation(&record)
+        Ok(())
     }
     pub fn read(&self, id: &str) -> Result<OperationRecord> {
         uuid(id, "operation_id")?;
@@ -1042,23 +1171,6 @@ impl DeploymentStateStore {
             }
         }
         Ok(())
-    }
-    fn converge_operation(&self, record: &OperationRecord) -> Result<OperationRecord> {
-        match self.read(&record.operation_id) {
-            Ok(existing) => {
-                if operation_identity_digest(&existing)? != operation_identity_digest(record)? {
-                    return Err(ReleaseError::OperationConflict);
-                }
-                Ok(existing)
-            }
-            Err(ReleaseError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                self.write_path(&self.record_path(&record.operation_id)?, record)?;
-                Ok(record.clone())
-            }
-            Err(error) => Err(error),
-        }
     }
     fn lock_current(&self, id: &str) -> Result<(Lock, OperationRecord)> {
         let initial = self.read(id)?;
@@ -2187,6 +2299,17 @@ fn ownership_fence(target: &str, host: &HostTuple) -> Result<String> {
     ))?)))
 }
 #[cfg(unix)]
+fn is_target_owner_projection_filename(name: &str) -> bool {
+    name.strip_prefix(TARGET_OWNER_PREFIX)
+        .and_then(|value| value.strip_suffix(".json"))
+        .is_some_and(|fence| {
+            fence.len() == 64
+                && fence
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+}
+#[cfg(unix)]
 fn serialize_bounded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
@@ -2259,7 +2382,13 @@ fn sha256(s: &str, name: &str) -> Result<()> {
     }
     Ok(())
 }
-fn uuid(s: &str, name: &str) -> Result<()> {
+/// Validates lower-case canonical `UUIDv7` text with the RFC4122 variant.
+///
+/// # Errors
+///
+/// Returns an error when the UUID text is not canonical `UUIDv7` or uses a
+/// non-RFC4122 variant.
+pub fn require_canonical_uuid7(s: &str, name: &str) -> Result<()> {
     let b = s.as_bytes();
     if b.len() != 36
         || [8, 13, 18, 23].iter().any(|&i| b[i] != b'-')
@@ -2269,9 +2398,14 @@ fn uuid(s: &str, name: &str) -> Result<()> {
             !([8, 13, 18, 23].contains(&i) || b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
         })
     {
-        return Err(contract(&format!("{name} must be a UUID")));
+        return Err(contract(&format!(
+            "{name} must be a canonical RFC4122 UUIDv7"
+        )));
     }
     Ok(())
+}
+fn uuid(s: &str, name: &str) -> Result<()> {
+    require_canonical_uuid7(s, name)
 }
 fn identity_id(value: &str, name: &str) -> Result<()> {
     if value.len() != 57
@@ -2633,6 +2767,21 @@ mod tests {
     }
 
     #[test]
+    fn canonical_uuid7_rejects_ncs_variant() {
+        assert!(require_canonical_uuid7(ID, "id").is_ok());
+        let mut ncs = ID.to_owned();
+        ncs.replace_range(19..20, "0");
+        assert!(require_canonical_uuid7(&ncs, "id").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn protected_manifest_metadata_rejects_hardlinks() {
+        assert!(protected_manifest_metadata_valid(true, 1, 0, 0o600, 1));
+        assert!(!protected_manifest_metadata_valid(true, 2, 0, 0o600, 1));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn manifest_v1_validation_failure_matrix_is_fail_closed() {
         type ManifestCase = (&'static str, Box<dyn Fn(&mut DeploymentContract)>);
@@ -2828,6 +2977,199 @@ mod tests {
                 .phase,
             OperationPhase::Claimed
         );
+    }
+
+    #[test]
+    fn claim_rejects_same_uuid_on_another_target_without_publishing_owner() {
+        let temp = TempDir::new().expect("temp");
+        let store = DeploymentStateStore::for_test(temp.path().join("state"));
+        let first = record();
+        let mut second = record();
+        second.target = "node-b".into();
+        second.binding.target = "node-b".into();
+        let second_proof = VerifiedHostBinding(second.binding.host.clone());
+        claim_operation(&store, &first, &proof()).expect("first claim");
+        assert!(matches!(
+            store.claim(&manifest_for_record(&second), &second, &second_proof),
+            Err(ReleaseError::OperationConflict)
+        ));
+        let fence = ownership_fence(&second.target, &second.binding.host).expect("fence");
+        assert!(
+            !temp
+                .path()
+                .join("state")
+                .join(format!("target-owner-{fence}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn claim_serializes_same_uuid_across_targets() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("state");
+        let first = record();
+        let mut second = record();
+        second.target = "node-b".into();
+        second.binding.target = "node-b".into();
+        let barrier = Arc::new(Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+        let first_root = root.clone();
+        let second_root = root.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            let store = DeploymentStateStore::for_test(first_root);
+            let proof = VerifiedHostBinding(first.binding.host.clone());
+            store.claim(&manifest_for_record(&first), &first, &proof)
+        });
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            let store = DeploymentStateStore::for_test(second_root);
+            let proof = VerifiedHostBinding(second.binding.host.clone());
+            store.claim(&manifest_for_record(&second), &second, &proof)
+        });
+        barrier.wait();
+        let first = first_thread.join().expect("first thread");
+        let second = second_thread.join().expect("second thread");
+        assert_ne!(first.is_ok(), second.is_ok());
+    }
+
+    #[test]
+    fn claim_repairs_operation_present_owner_absent_on_exact_replay() {
+        let temp = TempDir::new().expect("temp");
+        let store = DeploymentStateStore::for_test(temp.path().join("state"));
+        let planned = record();
+        let record = planned.clone().seal().expect("seal");
+        let manifest = manifest_for_record(&planned);
+        store.ensure_root().expect("state root");
+        store
+            .write_path(&store.record_path(ID).expect("record path"), &record)
+            .expect("orphan operation");
+        let recovered = store
+            .claim(&manifest, &planned, &proof())
+            .expect("replay repairs owner");
+        assert_eq!(recovered, record);
+        let fence = ownership_fence(&record.target, &record.binding.host).expect("fence");
+        assert!(
+            temp.path()
+                .join("state")
+                .join(format!("target-owner-{fence}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn claim_repairs_legacy_owner_present_operation_absent_on_exact_replay() {
+        let temp = TempDir::new().expect("temp");
+        let store = DeploymentStateStore::for_test(temp.path().join("state"));
+        let planned = record();
+        let record = planned.clone().seal().expect("seal");
+        let ownership = TargetOwnership::from_record(&record).expect("ownership");
+        let fence = ownership_fence(&record.target, &record.binding.host).expect("fence");
+        let owner_path = temp
+            .path()
+            .join("state")
+            .join(format!("target-owner-{fence}.json"));
+        store.ensure_root().expect("state root");
+        store
+            .write_path(&owner_path, &ownership)
+            .expect("legacy owner");
+        assert_eq!(
+            store
+                .claim(&manifest_for_record(&planned), &planned, &proof())
+                .expect("exact legacy repair"),
+            record
+        );
+        assert_eq!(
+            DeploymentStateStore::read_owner(&owner_path).expect("owner"),
+            ownership
+        );
+    }
+
+    #[test]
+    fn legacy_owner_for_absent_uuid_blocks_cross_target_claim_until_exact_replay() {
+        let temp = TempDir::new().expect("temp");
+        let store = DeploymentStateStore::for_test(temp.path().join("state"));
+        let planned = record();
+        let sealed = planned.clone().seal().expect("seal");
+        let ownership = TargetOwnership::from_record(&sealed).expect("ownership");
+        let first_fence = ownership_fence(&planned.target, &planned.binding.host).expect("fence");
+        let first_owner = temp
+            .path()
+            .join("state")
+            .join(format!("target-owner-{first_fence}.json"));
+        store.ensure_root().expect("state root");
+        for index in 0..=MAX_STATE_ROOT_ENTRIES {
+            drop(
+                store
+                    .lock(&format!("unrelated-{index:04x}"))
+                    .expect("unrelated valid lock"),
+            );
+        }
+        store
+            .write_path(&first_owner, &ownership)
+            .expect("legacy owner");
+
+        let mut competing = record();
+        competing.target = "node-b".into();
+        competing.binding.target = "node-b".into();
+        let competing_proof = VerifiedHostBinding(competing.binding.host.clone());
+        assert!(matches!(
+            store.claim(
+                &manifest_for_record(&competing),
+                &competing,
+                &competing_proof
+            ),
+            Err(ReleaseError::OperationConflict)
+        ));
+        assert!(!store.record_path(ID).expect("record path").exists());
+        assert_eq!(
+            DeploymentStateStore::read_owner(&first_owner).expect("owner"),
+            ownership
+        );
+
+        assert_eq!(
+            store
+                .claim(&manifest_for_record(&planned), &planned, &proof())
+                .expect("exact recovery"),
+            sealed
+        );
+    }
+
+    #[test]
+    fn multiple_legacy_owner_projections_for_absent_uuid_fail_closed() {
+        let temp = TempDir::new().expect("temp");
+        let store = DeploymentStateStore::for_test(temp.path().join("state"));
+        let planned = record();
+        let sealed = planned.clone().seal().expect("seal");
+        let ownership = TargetOwnership::from_record(&sealed).expect("ownership");
+        let fence = ownership_fence(&planned.target, &planned.binding.host).expect("fence");
+        store.ensure_root().expect("state root");
+        store
+            .write_path(
+                &temp
+                    .path()
+                    .join("state")
+                    .join(format!("target-owner-{fence}.json")),
+                &ownership,
+            )
+            .expect("first owner");
+        store
+            .write_path(
+                &temp
+                    .path()
+                    .join("state")
+                    .join(format!("target-owner-{}.json", "e".repeat(64))),
+                &ownership,
+            )
+            .expect("duplicate owner");
+        assert!(matches!(
+            store.claim(&manifest_for_record(&planned), &planned, &proof()),
+            Err(ReleaseError::OperationConflict)
+        ));
+        assert!(!store.record_path(ID).expect("record path").exists());
     }
     #[test]
     fn connector_binding_replay_and_canonical_facts_are_strict() {

@@ -21,9 +21,18 @@ Run from the repository root.
 | EC2 operator SSH /32 recovery (exact old-to-new rebind) | `cargo run --locked -- ec2-rebind-operator-cidr --manifest aws-ec2.example.json --state-dir .dirextalk-ec2-state --expected-old-cidr <old/32> --execute` |
 | EC2 retained-volume purge (separate exact fence) | `cargo run --locked -- ec2-destroy --manifest aws-ec2.example.json --purge-volume --purge-volume-id vol-... --execute` |
 | Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
+| Connector-host operation claim | `sudo cargo run --locked -- deployment-connector-claim --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <connector-host-id> [--predecessor-operation-id <terminal-deployment-uuidv7>]` |
 
 `build` only executes commands when `--execute` is supplied. `publish` also
 requires `--execute` plus one or more destination flags.
+
+`deployment-connector-claim` is the root-only, local prerequisite for
+`deployment-connector-apply`. It accepts only a root-owned `0600` deployment
+manifest, a Connector-host target, canonical UUIDv7 operation identifiers, and
+an explicit terminal predecessor for an exact successor. It verifies the fixed
+root-owned host tuple evidence before creating or exactly replaying the
+canonical durable operation. It has no artifact, remote, service, or secret
+handling surface and prints the same sanitized operation projection as status.
 
 `deployment-connector-apply` is the sole production local Connector-host
 transport. It requires root and `--execute`, persists its local lifecycle

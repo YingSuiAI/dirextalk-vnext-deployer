@@ -8,6 +8,7 @@ pub mod connector_apply;
 #[cfg(not(unix))]
 #[path = "connector_apply_unsupported.rs"]
 pub mod connector_apply;
+pub mod connector_claim;
 pub mod deployment;
 mod digest;
 pub mod error;

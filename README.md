@@ -90,6 +90,21 @@ acceptance is implemented or claimed. See
 
 ## Local Connector-host lifecycle
 
+`deployment-connector-claim --execute` creates (or exactly replays) the
+canonical durable operation required by apply:
+
+```text
+sudo cargo run --locked -- deployment-connector-claim --execute --operation-id <uuidv7> --manifest deployment.json --target <connector-host-id> [--predecessor-operation-id <terminal-uuidv7>]
+```
+
+It is root-only; its manifest must be a root-owned no-follow `0600` regular
+file. It rejects Node targets, verifies the fixed root-owned Host Supervisor
+tuple evidence before mutating state, and delegates target ownership,
+predecessor terminality, and exact replay to the canonical local state store.
+It neither stages artifacts nor contacts remote hosts, invokes services, or
+handles secrets. Its output is the same sanitized durable operation projection
+as `deployment-status`.
+
 `deployment-connector-apply --execute` is a closed, root-only local transport
 for one Connector target. It validates the existing deployment manifest and
 Server-issued Connector plan, reads the protected handoff, config, and three

@@ -7,6 +7,7 @@ use crate::{
     archive::assemble,
     aws_ec2::{self, AwsEc2Manifest, ProductionAwsExecutor, ProductionRegistryExecutor},
     connector_apply::{ConnectorApplyInputs, apply},
+    connector_claim::{ConnectorClaimInputs, claim},
     deployment::{DeploymentManifest, DeploymentPlan, DeploymentStateStore, DeploymentTarget},
     error::Result,
     manifest::LoadedManifest,
@@ -120,6 +121,19 @@ enum Commands {
         control_ca: PathBuf,
         #[arg(long)]
         issuer_ca: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Create or exactly replay one local Connector-host deployment operation.
+    DeploymentConnectorClaim {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        predecessor_operation_id: Option<String>,
         #[arg(long)]
         execute: bool,
     },
@@ -326,6 +340,25 @@ pub fn run(cli: Cli) -> Result<()> {
             })?;
             print_json(&result)?;
         }
+        Commands::DeploymentConnectorClaim {
+            operation_id,
+            manifest,
+            target,
+            predecessor_operation_id,
+            execute,
+        } => {
+            if !execute {
+                return Err(crate::error::ReleaseError::Deployment(
+                    "deployment-connector-claim requires --execute".into(),
+                ));
+            }
+            print_json(&claim(&ConnectorClaimInputs {
+                operation_id,
+                manifest,
+                target,
+                predecessor_operation_id,
+            })?)?;
+        }
         Commands::Ec2Plan {
             manifest,
             max_monthly_usd,
@@ -433,4 +466,29 @@ pub fn run(cli: Cli) -> Result<()> {
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connector_claim_cli_requires_explicit_execute() {
+        let cli = Cli::try_parse_from([
+            "dirextalk-vnext-deployer",
+            "deployment-connector-claim",
+            "--operation-id",
+            "018f856e-e0bd-71d2-9428-58d50cf77eaf",
+            "--manifest",
+            "deployment.json",
+            "--target",
+            "connector-a",
+        ])
+        .expect("claim command parses");
+        assert!(matches!(
+            &cli.command,
+            Commands::DeploymentConnectorClaim { execute: false, .. }
+        ));
+        assert!(run(cli).is_err());
+    }
 }

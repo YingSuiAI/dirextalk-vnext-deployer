@@ -25,7 +25,8 @@ use uuid::Uuid;
 use crate::{
     deployment::{
         AdapterKind, BindingWorkload, ConnectorClaimPhase, DeploymentManifest,
-        DeploymentStateStore, OperationPhase, OperationRecord, validate_host_evidence,
+        DeploymentStateStore, OperationPhase, OperationRecord, require_canonical_uuid7,
+        validate_host_evidence,
     },
     error::{ReleaseError, Result, io_error},
 };
@@ -294,7 +295,7 @@ fn apply_with(
     if geteuid().as_raw() != 0 {
         return Err(deployment("deployment-connector-apply requires root"));
     }
-    require_uuid7(&inputs.operation_id, "deployment operation")?;
+    require_canonical_uuid7(&inputs.operation_id, "deployment operation")?;
     let manifest_file =
         ProtectedBytes::read(&inputs.manifest, MAX_MANIFEST, ProtectedKind::NonSecret)?;
     let manifest = DeploymentManifest::from_bytes(&manifest_file.bytes)?;
@@ -1253,7 +1254,7 @@ fn parse_plan(bytes: &[u8]) -> Result<BootstrapPlan> {
         &plan.connector.binding_id,
         &plan.connector.remote_mcp.mcp_node_id,
     ] {
-        require_uuid7(id, "bootstrap plan UUID")?;
+        require_canonical_uuid7(id, "bootstrap plan UUID")?;
     }
     require_identity_id(&plan.host.owner_id)?;
     for digest_value in [
@@ -1310,7 +1311,7 @@ fn validate_record_identity(
         &record.start_host_operation_id,
         &record.finalize_host_operation_id,
     ] {
-        require_uuid7(id, "persisted Host operation")?;
+        require_canonical_uuid7(id, "persisted Host operation")?;
     }
     if record.prepare_host_operation_id == record.start_host_operation_id
         || record.prepare_host_operation_id == record.finalize_host_operation_id
@@ -1416,14 +1417,6 @@ fn is_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-fn require_uuid7(value: &str, name: &str) -> Result<()> {
-    if !Uuid::parse_str(value)
-        .is_ok_and(|uuid| uuid.get_version_num() == 7 && uuid.to_string() == value)
-    {
-        return Err(deployment(&format!("{name} must be canonical UUIDv7")));
-    }
-    Ok(())
 }
 fn require_identity_id(value: &str) -> Result<()> {
     if value.len() != 57
