@@ -54,7 +54,7 @@ fn fixture(version: &str, server_digest: char) -> (TempDir, AwsEc2Manifest) {
             "dirextalk/vnet-server@sha256:{}",
             server_digest.to_string().repeat(64)
         ),
-        migrator: format!("dirextalk/vnet-migrator@sha256:{}", "c".repeat(64)),
+        migrator: format!("dirextalk/vnet-server@sha256:{}", "c".repeat(64)),
         installer_sha256: hash(installer),
         files,
     };

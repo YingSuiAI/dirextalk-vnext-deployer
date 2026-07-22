@@ -112,7 +112,7 @@ impl AwsEc2Manifest {
         exact_image(&self.server_image, "dirextalk/vnet-server", "server_image")?;
         exact_image(
             &self.migrator_image,
-            "dirextalk/vnet-migrator",
+            "dirextalk/vnet-server",
             "migrator_image",
         )?;
         if self.ubuntu_ami_owner != UBUNTU_OWNER || self.ubuntu_ami_pattern != UBUNTU_PATTERN {
@@ -705,7 +705,7 @@ fn validate_bundle_record(record: &BundleRecord) -> Result<()> {
     )?;
     exact_image(
         &record.migrator_image,
-        "dirextalk/vnet-migrator",
+        "dirextalk/vnet-server",
         "state migrator image",
     )
 }

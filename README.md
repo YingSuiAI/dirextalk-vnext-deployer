@@ -117,8 +117,9 @@ shell-script escape hatch.
 prints the closed action set and conservative monthly cost ceiling.
 `ec2-apply`/`ec2-resume`,
 `ec2-update`, and `ec2-destroy` remain dry runs unless `--execute` is present.
-The manifest requires exact `dirextalk/vnet-server@sha256:<64>` and
-`dirextalk/vnet-migrator@sha256:<64>` images plus a digest-bound stack bundle.
+The manifest requires exact runtime and migrator images from the single
+authorized repository `dirextalk/vnet-server@sha256:<64>`, with independent
+digests, plus a digest-bound stack bundle.
 Apply requires `--max-monthly-usd`, generates a per-operation Ed25519 key,
 pins the host key against an instance/client-token/AMI-bound EC2 console
 attestation, and transfers only the fixed bundle and request paths. State and
