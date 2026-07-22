@@ -59,6 +59,19 @@ fn derived_public_key_accepts_openssh_comment_only_when_identity_matches() {
     );
 }
 
+#[test]
+fn ed25519_fingerprint_matches_aws_padding_and_openssh_prefix() {
+    let digest = [13_u8; 32];
+    let aws = STANDARD.encode(digest);
+    let openssh = format!("SHA256:{}", aws.trim_end_matches('='));
+    assert!(workflow::fingerprints_match(&aws, &openssh).expect("same digest"));
+    assert!(workflow::fingerprints_match(&aws, "not-base64").is_err());
+    assert!(
+        workflow::fingerprints_match(&format!("{aws}="), &openssh).is_err(),
+        "noncanonical padding must fail closed"
+    );
+}
+
 fn append_directory(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
     let mut header = tar::Header::new_ustar();
     header.set_entry_type(tar::EntryType::Directory);

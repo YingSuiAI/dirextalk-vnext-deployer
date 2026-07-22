@@ -5,7 +5,10 @@ use std::{
     path::Path,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -482,7 +485,7 @@ fn ensure_key(
         .as_str()
         .ok_or_else(|| contract("EC2 key fingerprint is missing"))?;
     let local = &state.key.as_ref().expect("key").fingerprint;
-    if normalize_fingerprint(aws_fingerprint) != normalize_fingerprint(local) {
+    if !fingerprints_match(aws_fingerprint, local)? {
         return Err(ReleaseError::OperationConflict);
     }
     state.key.as_mut().expect("key").imported = true;
@@ -541,8 +544,22 @@ fn parse_ssh_fingerprint(value: &str) -> Result<String> {
     Ok(format!("SHA256:{fingerprint}"))
 }
 
-fn normalize_fingerprint(value: &str) -> &str {
-    value.strip_prefix("SHA256:").unwrap_or(value)
+pub(super) fn fingerprints_match(left: &str, right: &str) -> Result<bool> {
+    Ok(decode_fingerprint(left)? == decode_fingerprint(right)?)
+}
+
+fn decode_fingerprint(value: &str) -> Result<Vec<u8>> {
+    let encoded = value.strip_prefix("SHA256:").unwrap_or(value);
+    let decoded = STANDARD
+        .decode(encoded)
+        .or_else(|_| STANDARD_NO_PAD.decode(encoded))
+        .map_err(|_| contract("Ed25519 fingerprint is not canonical base64"))?;
+    if decoded.len() != 32
+        || (STANDARD.encode(&decoded) != encoded && STANDARD_NO_PAD.encode(&decoded) != encoded)
+    {
+        return Err(contract("Ed25519 fingerprint is not canonical SHA-256"));
+    }
+    Ok(decoded)
 }
 
 fn describe_key_pairs(key_name: &str, executor: &dyn AwsExecutor) -> Result<Vec<Value>> {
