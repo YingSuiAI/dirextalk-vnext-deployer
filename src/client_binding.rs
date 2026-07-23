@@ -1637,6 +1637,8 @@ mod tests {
         commands: Mutex<Vec<aws_ec2::FixedCommand>>,
         runtime_attestation: String,
         current_receipt: String,
+        runtime_attester_metadata: String,
+        runtime_attester_digest: String,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1661,10 +1663,18 @@ mod tests {
         }
 
         fn with_initial_state(fixture: &IssueEc2Fixture, initial: RuntimeHelperState) -> Self {
+            Self::with_helper_states(fixture, initial, initial)
+        }
+
+        fn with_helper_states(
+            fixture: &IssueEc2Fixture,
+            recovery: RuntimeHelperState,
+            attester: RuntimeHelperState,
+        ) -> Self {
             Self {
                 helper_state: Mutex::new(HashMap::from([
-                    ("recovery", initial),
-                    ("attester", initial),
+                    ("recovery", recovery),
+                    ("attester", attester),
                 ])),
                 runtime_attestation: fixture.runtime_attestation.clone(),
                 current_receipt: fixture.current_receipt.clone(),
@@ -1721,21 +1731,34 @@ mod tests {
             let mut states = self.helper_state.lock().expect("helper state");
             let state = states.entry(helper).or_insert(RuntimeHelperState::Absent);
             let stdout = match id {
-                id if id.starts_with("inspect-installed-runtime-") => {
-                    Self::metadata(*state, upload, atomic, installed)
-                }
-                id if id.starts_with("inspect-uploaded-runtime-") => {
-                    Self::metadata(*state, upload, atomic, installed)
-                }
-                id if id.starts_with("inspect-protected-runtime-") => {
-                    Self::metadata(*state, upload, atomic, installed)
-                }
-                id if id.starts_with("inspect-atomic-runtime-") => {
-                    Self::metadata(*state, upload, atomic, installed)
-                }
-                id if id.starts_with("reconcile-installed-runtime-") => {
-                    Self::metadata(*state, upload, atomic, installed)
-                }
+                id if id.starts_with("inspect-installed-runtime-") => match state {
+                    RuntimeHelperState::Installed => {
+                        Self::metadata(*state, upload, atomic, installed)
+                    }
+                    _ => String::new(),
+                },
+                id if id.starts_with("inspect-uploaded-runtime-") => match state {
+                    RuntimeHelperState::Uploaded | RuntimeHelperState::Protected => {
+                        Self::metadata(*state, upload, atomic, installed)
+                    }
+                    _ => String::new(),
+                },
+                id if id.starts_with("inspect-protected-runtime-") => match state {
+                    RuntimeHelperState::Protected => {
+                        Self::metadata(*state, upload, atomic, installed)
+                    }
+                    _ => String::new(),
+                },
+                id if id.starts_with("inspect-atomic-runtime-") => match state {
+                    RuntimeHelperState::Atomic => Self::metadata(*state, upload, atomic, installed),
+                    _ => String::new(),
+                },
+                id if id.starts_with("reconcile-installed-runtime-") => match state {
+                    RuntimeHelperState::Installed => {
+                        Self::metadata(*state, upload, atomic, installed)
+                    }
+                    _ => String::new(),
+                },
                 id if (id.starts_with("verify-") || id.starts_with("reconcile-hash-"))
                     && id.contains("runtime-") =>
                 {
@@ -1822,6 +1845,11 @@ mod tests {
                 commands: Mutex::new(Vec::new()),
                 runtime_attestation: fixture.runtime_attestation.clone(),
                 current_receipt: fixture.current_receipt.clone(),
+                runtime_attester_metadata: format!(
+                    "f root root 555 1 76217 {}\n",
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER
+                ),
+                runtime_attester_digest: aws_ec2::RUNTIME_RECOVERY_SHA256.into(),
             }
         }
 
@@ -1857,13 +1885,12 @@ mod tests {
                 .expect("commands")
                 .push(command.clone());
             let stdout = match command.id.as_str() {
-                "inspect-installed-runtime-attester-011-to-014" => format!(
-                    "f root root 555 1 76217 {}\n",
-                    aws_ec2::REMOTE_RUNTIME_ATTESTER
-                ),
+                "inspect-installed-runtime-attester-011-to-014" => {
+                    self.runtime_attester_metadata.clone()
+                }
                 "verify-installed-runtime-attester-011-to-014" => format!(
                     "{}  {}\n",
-                    aws_ec2::RUNTIME_RECOVERY_SHA256,
+                    self.runtime_attester_digest,
                     aws_ec2::REMOTE_RUNTIME_ATTESTER
                 ),
                 "inspect-runtime-attestation" => format!(
@@ -2543,22 +2570,69 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn recover_runtime_accepts_only_exact_pending_effect_classes() {
-        for pending in [
-            "clear-upload-runtime-recovery-011-to-014",
-            "stage-runtime-recovery-011-to-014",
-            "protect-uploaded-runtime-recovery-011-to-014",
-            "clear-atomic-runtime-recovery-011-to-014",
-            "prepare-atomic-runtime-recovery-011-to-014",
-            "activate-runtime-recovery-011-to-014",
-            "clear-upload-runtime-attester-011-to-014",
-            "stage-runtime-attester-011-to-014",
-            "protect-uploaded-runtime-attester-011-to-014",
-            "clear-atomic-runtime-attester-011-to-014",
-            "prepare-atomic-runtime-attester-011-to-014",
-            "activate-runtime-attester-011-to-014",
-            "run-fixed-runtime-recovery-011-to-014",
-            "run-fixed-runtime-attester-011-to-014",
+        for (pending, recovery, attester, expected) in [
+            (
+                "stage-runtime-recovery-011-to-014",
+                RuntimeHelperState::Absent,
+                RuntimeHelperState::Installed,
+                "stage-runtime-recovery-011-to-014",
+            ),
+            (
+                "protect-uploaded-runtime-recovery-011-to-014",
+                RuntimeHelperState::Uploaded,
+                RuntimeHelperState::Installed,
+                "protect-uploaded-runtime-recovery-011-to-014",
+            ),
+            (
+                "prepare-atomic-runtime-recovery-011-to-014",
+                RuntimeHelperState::Protected,
+                RuntimeHelperState::Installed,
+                "prepare-atomic-runtime-recovery-011-to-014",
+            ),
+            (
+                "activate-runtime-recovery-011-to-014",
+                RuntimeHelperState::Atomic,
+                RuntimeHelperState::Installed,
+                "activate-runtime-recovery-011-to-014",
+            ),
+            (
+                "activate-runtime-recovery-011-to-014",
+                RuntimeHelperState::Installed,
+                RuntimeHelperState::Installed,
+                "run-fixed-runtime-recovery-011-to-014",
+            ),
+            (
+                "stage-runtime-attester-011-to-014",
+                RuntimeHelperState::Installed,
+                RuntimeHelperState::Absent,
+                "stage-runtime-attester-011-to-014",
+            ),
+            (
+                "protect-uploaded-runtime-attester-011-to-014",
+                RuntimeHelperState::Installed,
+                RuntimeHelperState::Uploaded,
+                "protect-uploaded-runtime-attester-011-to-014",
+            ),
+            (
+                "prepare-atomic-runtime-attester-011-to-014",
+                RuntimeHelperState::Installed,
+                RuntimeHelperState::Protected,
+                "prepare-atomic-runtime-attester-011-to-014",
+            ),
+            (
+                "activate-runtime-attester-011-to-014",
+                RuntimeHelperState::Installed,
+                RuntimeHelperState::Atomic,
+                "activate-runtime-attester-011-to-014",
+            ),
+            (
+                "activate-runtime-attester-011-to-014",
+                RuntimeHelperState::Installed,
+                RuntimeHelperState::Installed,
+                "run-fixed-runtime-attester-011-to-014",
+            ),
         ] {
             let (fixture, state_dir, helper) = recovery_fixture();
             let mut state = fixture.state.clone();
@@ -2568,10 +2642,8 @@ mod tests {
                 .expect("store")
                 .write(&state)
                 .expect("pending state write");
-            let executor = RuntimeRecoveryExecutor::with_initial_state(
-                &fixture,
-                RuntimeHelperState::Installed,
-            );
+            let executor =
+                RuntimeRecoveryExecutor::with_helper_states(&fixture, recovery, attester);
             aws_ec2::recover_runtime_011_to_014(
                 &fixture.manifest,
                 &state_dir,
@@ -2580,6 +2652,22 @@ mod tests {
                 &executor,
             )
             .expect("allowed pending effect replay");
+            let calls = executor.calls();
+            assert!(
+                calls.iter().any(|command| command.id == expected),
+                "missing branch command {expected}"
+            );
+            let final_state = aws_ec2::store::Store::lock(&state_dir, "x6")
+                .expect("store")
+                .read::<Ec2State>()
+                .expect("state read")
+                .expect("final state");
+            assert_eq!(final_state.pending_effect, None);
+            assert_eq!(final_state.phase, fixture.state.phase);
+            assert_eq!(final_state.current_receipt, fixture.state.current_receipt);
+            assert_eq!(final_state.previous_receipt, fixture.state.previous_receipt);
+            assert_eq!(final_state.current, fixture.state.current);
+            assert_eq!(final_state.previous, fixture.state.previous);
         }
 
         let (fixture, state_dir, helper) = recovery_fixture();
@@ -2695,6 +2783,77 @@ mod tests {
             assert!(!calls.iter().any(|id| id == "inspect-client-binding-root"
                 || id == "create-client-binding-root"
                 || id == "inspect-client-binding-request"
+                || id == "run-client-binding-issue"));
+            assert!(!state_dir.join("client-binding.request").exists());
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn issue_ec2_rejects_untrusted_installed_runtime_attester_before_binding_effects() {
+        let cases = [
+            (
+                "absent",
+                String::new(),
+                aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
+            ),
+            (
+                "wrong-size",
+                "f root root 555 1 76216 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                    .into(),
+                aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
+            ),
+            (
+                "wrong-owner",
+                "f ubuntu root 555 1 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                    .into(),
+                aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
+            ),
+            (
+                "wrong-mode",
+                "f root root 755 1 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                    .into(),
+                aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
+            ),
+            (
+                "wrong-links",
+                "f root root 555 2 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                    .into(),
+                aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
+            ),
+            (
+                "wrong-digest",
+                "f root root 555 1 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                    .into(),
+                "0".repeat(64),
+            ),
+        ];
+        for (label, metadata, digest) in cases {
+            let fixture = issue_ec2_fixture();
+            let state_dir = fixture.root.path().join("ec2-state");
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
+            write_issue_ec2_state(&store, &fixture);
+            let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding"));
+            let output = fixture.root.path().join("binding.import.json");
+            let mut executor = IssueReplayExecutor::new(&fixture, None);
+            executor.runtime_attester_metadata = metadata;
+            executor.runtime_attester_digest = digest;
+            assert!(
+                issue_ec2(
+                    &fixture.manifest,
+                    &state_dir,
+                    &output,
+                    &binding_store,
+                    &executor
+                )
+                .is_err(),
+                "{label}"
+            );
+            let calls = executor.calls();
+            assert!(!calls.iter().any(|id| id == "inspect-client-binding-root"
+                || id == "create-client-binding-root"
+                || id == "inspect-client-binding-request"
+                || id == "stage-client-binding-request"
                 || id == "run-client-binding-issue"));
             assert!(!state_dir.join("client-binding.request").exists());
             assert!(!output.exists());
