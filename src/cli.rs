@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 
 #[cfg(unix)]
-use crate::client_binding::{ClientBindingStore, ProductionClientBindingExecutor};
+use crate::client_binding::ClientBindingStore;
 use crate::{
     archive::assemble,
     aws_ec2::{self, AwsEc2Manifest, ProductionAwsExecutor, ProductionRegistryExecutor},
@@ -139,17 +139,13 @@ enum Commands {
         #[arg(long)]
         execute: bool,
     },
-    /// Issue one short-lived client binding after a terminal deployment.
+    /// Issue one short-lived client binding through a verified EC2 deployment.
     #[cfg(unix)]
-    DeploymentClientBindingIssue {
+    Ec2ClientBindingIssue {
         #[arg(long)]
-        operation_id: String,
-        #[arg(long)]
-        target: String,
-        #[arg(long)]
-        tenant_id: String,
-        #[arg(long)]
-        server_origin: String,
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -378,30 +374,25 @@ pub fn run(cli: Cli) -> Result<()> {
             })?)?;
         }
         #[cfg(unix)]
-        Commands::DeploymentClientBindingIssue {
-            operation_id,
-            target,
-            tenant_id,
-            server_origin,
+        Commands::Ec2ClientBindingIssue {
+            manifest,
+            state_dir,
             output,
             execute,
         } => {
             if !execute {
                 return Err(crate::error::ReleaseError::Deployment(
-                    "deployment-client-binding-issue requires --execute".into(),
+                    "ec2-client-binding-issue requires --execute".into(),
                 ));
             }
-            let deployment_store = DeploymentStateStore::fixed()?;
+            let manifest = AwsEc2Manifest::load(&manifest)?;
             let binding_store = ClientBindingStore::fixed()?;
-            let result = crate::client_binding::issue(
-                &operation_id,
-                &target,
-                &tenant_id,
-                &server_origin,
+            let result = crate::client_binding::issue_ec2(
+                &manifest,
+                &state_dir,
                 &output,
-                &deployment_store,
                 &binding_store,
-                &ProductionClientBindingExecutor,
+                &crate::aws_ec2::ProductionAwsExecutor,
             )?;
             print_json(&result)?;
         }

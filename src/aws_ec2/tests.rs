@@ -13,6 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use zeroize::Zeroize;
 
 use super::{
     bundle::{InstallRequest, InstalledReceipt, ReceiptState, StackFile, StackManifest, hash},
@@ -1999,6 +2000,47 @@ fn real_server_bundle_5bf0090_parses_and_plans() {
 #[cfg(unix)]
 #[test]
 fn process_deadline_is_bounded() {
-    let error = run_process("sleep", &["1"], Duration::from_millis(20)).expect_err("timeout");
+    let started = std::time::Instant::now();
+    let error = run_process(
+        "sh",
+        &["-c", "printf bearer-secret; sleep 5 & wait"],
+        Duration::from_millis(20),
+    )
+    .expect_err("timeout");
     assert!(error.to_string().contains("deadline exceeded"));
+    assert!(!error.to_string().contains("bearer-secret"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn process_reader_join_is_bounded_when_descendant_keeps_pipes_open() {
+    let started = std::time::Instant::now();
+    let mut output = run_process(
+        "sh",
+        &["-c", "printf captured-bearer; sleep 5 &"],
+        Duration::from_secs(1),
+    )
+    .expect("successful parent command");
+    assert_eq!(output.stdout, "captured-bearer");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    output.stdout.zeroize();
+    output.stderr.zeroize();
+}
+
+#[cfg(unix)]
+#[test]
+fn process_failure_never_echoes_captured_output() {
+    let error = run_process(
+        "sh",
+        &[
+            "-c",
+            "printf stdout-bearer; printf stderr-bearer >&2; exit 9",
+        ],
+        Duration::from_secs(1),
+    )
+    .expect_err("nonzero exit");
+    let message = error.to_string();
+    assert!(!message.contains("stdout-bearer"));
+    assert!(!message.contains("stderr-bearer"));
 }
