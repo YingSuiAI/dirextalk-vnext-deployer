@@ -14,19 +14,22 @@ use uuid::Uuid;
 
 use super::bundle::{
     BundleFacts, InstallRequest, InstalledReceipt, canonical_json, hash, load_bundle,
+    read_hash_bound_helper,
 };
 use super::provision::{HostReadyReceipt, ProvisionRequest};
 use super::store::Store;
 use super::{
     AWS, AmiRecord, AwsEc2Manifest, AwsExecutor, BundleRecord, CURL, Ec2State, EipRecord,
     FixedCommand, GETENT, HEALTH_PATH, HostKeyRecord, InfrastructureRecord, KeyRecord,
-    LifecyclePhase, OwnedRecordSet, REGION, REMOTE_BUNDLE, REMOTE_CURRENT_RECEIPT,
-    REMOTE_INSTALLER, REMOTE_INSTALLER_ATOMIC, REMOTE_INSTALLER_UPLOAD, REMOTE_PROVISION_REQUEST,
-    REMOTE_PROVISIONER, REMOTE_PROVISIONER_ATOMIC, REMOTE_PROVISIONER_UPLOAD, REMOTE_READY_RECEIPT,
-    REMOTE_RECEIPT_READER, REMOTE_RECEIPT_READER_ATOMIC, REMOTE_RECEIPT_READER_UPLOAD,
-    REMOTE_REQUEST, ReceiptState, RegistryExecutor, SCP, SSH, SSH_KEYGEN, SSH_KEYSCAN,
-    StatusReport, UBUNTU_OWNER, UBUNTU_PATTERN, VerifyReport, contract, enforce_cost_guard,
-    expected_tags, resolve_latest_digest,
+    LifecyclePhase, OwnedRecordSet, REGION, REMOTE_BUNDLE, REMOTE_CROSS_VERSION_BOOTSTRAP,
+    REMOTE_CROSS_VERSION_BOOTSTRAP_ATOMIC, REMOTE_CROSS_VERSION_BOOTSTRAP_UPLOAD,
+    REMOTE_CURRENT_RECEIPT, REMOTE_INSTALLER, REMOTE_INSTALLER_ATOMIC, REMOTE_INSTALLER_UPLOAD,
+    REMOTE_PROVISION_REQUEST, REMOTE_PROVISIONER, REMOTE_PROVISIONER_ATOMIC,
+    REMOTE_PROVISIONER_UPLOAD, REMOTE_READY_RECEIPT, REMOTE_RECEIPT_READER,
+    REMOTE_RECEIPT_READER_ATOMIC, REMOTE_RECEIPT_READER_UPLOAD, REMOTE_REQUEST, ReceiptState,
+    RegistryExecutor, SCP, SSH, SSH_KEYGEN, SSH_KEYSCAN, StatusReport, UBUNTU_OWNER,
+    UBUNTU_PATTERN, VerifyReport, contract, enforce_cost_guard, expected_tags,
+    resolve_latest_digest,
 };
 use crate::{ReleaseError, Result};
 
@@ -39,6 +42,7 @@ const KNOWN_HOSTS_SUFFIX: &str = "known_hosts";
 const PROVISION_REQUEST_SUFFIX: &str = "current.provision";
 const UPDATE_BUNDLE_SUFFIX: &str = "update-candidate.bundle";
 const UPDATE_REQUEST_SUFFIX: &str = "update-candidate.request";
+pub(super) const CROSS_VERSION_BOOTSTRAP_SUFFIX: &str = "cross-version-bootstrap-0.1.1-to-0.1.4";
 const ROLLBACK_REQUEST_SUFFIX: &str = "rollback.request";
 const UPDATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
 const UPDATE_CAPACITY_INODES: u64 = 128;
@@ -1591,6 +1595,66 @@ fn ensure_host_helpers(
     Ok(())
 }
 
+fn read_durable_cross_version_bootstrap(store: &Store) -> Result<Vec<u8>> {
+    let bytes = store.read_artifact(CROSS_VERSION_BOOTSTRAP_SUFFIX, 1024 * 1024)?;
+    if hash(&bytes) != super::CROSS_VERSION_BOOTSTRAP_SHA256 {
+        return Err(ReleaseError::SourceMismatch(
+            store.artifact_path(CROSS_VERSION_BOOTSTRAP_SUFFIX)?,
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Authenticate and durably seal the admitted bootstrap without an executor.
+/// Every remote use must subsequently re-read this sealed copy.
+pub(super) fn stage_cross_version_bootstrap(
+    store: &Store,
+    manifest: &AwsEc2Manifest,
+) -> Result<()> {
+    match read_durable_cross_version_bootstrap(store) {
+        Ok(_) => Ok(()),
+        Err(ReleaseError::MissingArtifact(_)) => {
+            let path = manifest
+                .cross_version_installer_path
+                .as_deref()
+                .ok_or_else(|| contract("admitted cross-version bootstrap installer is absent"))?;
+            let expected = manifest
+                .cross_version_installer_sha256
+                .as_deref()
+                .ok_or_else(|| {
+                    contract("admitted cross-version bootstrap installer digest is absent")
+                })?;
+            let bytes = read_hash_bound_helper(path, expected, "cross-version installer")?;
+            store.write_artifact(CROSS_VERSION_BOOTSTRAP_SUFFIX, &bytes, 0o600)?;
+            let _ = read_durable_cross_version_bootstrap(store)?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_cross_version_bootstrap(
+    store: &Store,
+    state: &mut Ec2State,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let bytes = read_durable_cross_version_bootstrap(store)?;
+    let local = store.artifact_path(CROSS_VERSION_BOOTSTRAP_SUFFIX)?;
+    let helper = HostHelperSpec {
+        label: "cross-version-bootstrap",
+        local: &local,
+        sha256: super::CROSS_VERSION_BOOTSTRAP_SHA256,
+        size: bytes.len(),
+        upload: REMOTE_CROSS_VERSION_BOOTSTRAP_UPLOAD,
+        upload_name: "install-vnext-0.1.1-to-0.1.4.upload",
+        atomic: REMOTE_CROSS_VERSION_BOOTSTRAP_ATOMIC,
+        atomic_name: ".install-vnext-0.1.1-to-0.1.4.new",
+        installed: REMOTE_CROSS_VERSION_BOOTSTRAP,
+        installed_name: "install-vnext-0.1.1-to-0.1.4",
+    };
+    ensure_host_helper(store, state, &helper, executor)
+}
+
 fn ensure_host_helper(
     store: &Store,
     state: &mut Ec2State,
@@ -1968,6 +2032,7 @@ fn install_initial(
         &request,
         ReceiptState::Installed,
         None,
+        InstallInvoker::RetainedInstaller,
         executor,
     )?;
     state.current = Some(bundle);
@@ -2123,6 +2188,7 @@ pub(super) fn stage_install_read_receipt(
     request: &InstallRequest,
     expected_state: ReceiptState,
     retained: Option<(&InstallRequest, ReceiptState)>,
+    invoker: InstallInvoker,
     executor: &dyn AwsExecutor,
 ) -> Result<InstalledReceipt> {
     authenticate_bundle_artifact(store, manifest, bundle, bundle_suffix)?;
@@ -2175,10 +2241,10 @@ pub(super) fn stage_install_read_receipt(
         store,
         state,
         &ssh_command(
-            "run-fixed-stack-installer",
+            invoker.command_id(),
             state,
             store,
-            ["/usr/bin/sudo", "--non-interactive", REMOTE_INSTALLER],
+            ["/usr/bin/sudo", "--non-interactive", invoker.path()],
             true,
             900,
         )?,
@@ -2193,6 +2259,28 @@ pub(super) fn stage_install_read_receipt(
         30,
     )?)?;
     InstalledReceipt::parse_and_verify(receipt.stdout.as_bytes(), request, expected_state)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum InstallInvoker {
+    RetainedInstaller,
+    CrossVersionBootstrap,
+}
+
+impl InstallInvoker {
+    fn command_id(self) -> &'static str {
+        match self {
+            Self::RetainedInstaller => "run-fixed-stack-installer",
+            Self::CrossVersionBootstrap => "run-fixed-cross-version-bootstrap",
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::RetainedInstaller => REMOTE_INSTALLER,
+            Self::CrossVersionBootstrap => REMOTE_CROSS_VERSION_BOOTSTRAP,
+        }
+    }
 }
 
 pub(super) enum ExistingInstallReceipt {
@@ -2955,6 +3043,7 @@ pub fn update(
         persist(&store, &mut state)?;
     }
     authenticate_update_recovery_artifacts(&store, &state, manifest)?;
+    stage_cross_version_bootstrap(&store, manifest)?;
     ensure_update_capacity(&store, &state, executor)?;
     let bundle_suffix = state
         .candidate_bundle_suffix
@@ -2992,6 +3081,7 @@ pub fn update(
     {
         return Err(ReleaseError::OperationConflict);
     }
+    ensure_cross_version_bootstrap(&store, &mut state, executor)?;
     state.phase = LifecyclePhase::UpdateInstalling;
     persist(&store, &mut state)?;
     let desired = state.desired.clone();
@@ -3005,6 +3095,7 @@ pub fn update(
         &request,
         ReceiptState::Installed,
         Some((&prior_request, ReceiptState::Installed)),
+        InstallInvoker::CrossVersionBootstrap,
         executor,
     )?;
     state.current = Some(candidate);
@@ -3380,6 +3471,7 @@ pub fn rollback_update(
         &request,
         ReceiptState::RolledBack,
         Some((&candidate_request, ReceiptState::Installed)),
+        InstallInvoker::RetainedInstaller,
         executor,
     )?;
     state.current = Some(prior);

@@ -1771,6 +1771,8 @@ mod tests {
             stack_bundle_path: bundle_path,
             host_installer_path,
             host_installer_sha256: hash(host_installer),
+            cross_version_installer_path: None,
+            cross_version_installer_sha256: None,
             host_provisioner_path,
             host_provisioner_sha256: hash(host_provisioner),
             receipt_reader_path,

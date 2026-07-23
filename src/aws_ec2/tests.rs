@@ -24,6 +24,18 @@ use super::{
 
 const STACK_INSTALLER: &str = "scripts/production-stack/install.sh";
 
+fn admitted_cross_version_bootstrap(manifest: &mut AwsEc2Manifest) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../dirextalk-vnext-server")
+        .join("scripts/production-stack/host/install-vnext");
+    assert_eq!(
+        hash(&fs::read(&path).expect("admitted bootstrap")),
+        CROSS_VERSION_BOOTSTRAP_SHA256
+    );
+    manifest.cross_version_installer_path = Some(path);
+    manifest.cross_version_installer_sha256 = Some(CROSS_VERSION_BOOTSTRAP_SHA256.into());
+}
+
 fn canonical(value: &impl Serialize) -> Vec<u8> {
     let mut bytes =
         serde_json::to_vec(&serde_json::to_value(value).expect("value")).expect("canonical JSON");
@@ -233,6 +245,8 @@ fn fixture_with_directories(
         stack_bundle_path: bundle_path,
         host_installer_path,
         host_installer_sha256: hash(host_installer),
+        cross_version_installer_path: None,
+        cross_version_installer_sha256: None,
         host_provisioner_path,
         host_provisioner_sha256: hash(host_provisioner),
         receipt_reader_path,
@@ -571,6 +585,12 @@ impl AwsExecutor for UpdateReplayExecutor {
                     REMOTE_CURRENT_RECEIPT
                 )
             }
+            "inspect-installed-cross-version-bootstrap" => {
+                format!("f root root 555 1 51192 {REMOTE_CROSS_VERSION_BOOTSTRAP}\n")
+            }
+            "verify-installed-cross-version-bootstrap" => {
+                format!("{CROSS_VERSION_BOOTSTRAP_SHA256}  {REMOTE_CROSS_VERSION_BOOTSTRAP}\n")
+            }
             "read-existing-installed-receipt"
             | "verify-authenticated-installed-receipt"
             | "read-authenticated-installed-receipt" => {
@@ -592,7 +612,7 @@ impl AwsExecutor for UpdateReplayExecutor {
                 *self.request.lock().expect("request") = RemoteInput::Absent;
                 String::new()
             }
-            "run-fixed-stack-installer" => {
+            "run-fixed-stack-installer" | "run-fixed-cross-version-bootstrap" => {
                 let state: Ec2State =
                     serde_json::from_slice(&fs::read(&self.state_path).expect("state"))?;
                 *self.remote_receipt.lock().expect("receipt") =
@@ -1033,6 +1053,65 @@ fn missing_derived_directory_and_helper_tamper_fail_closed() {
 }
 
 #[test]
+fn cross_version_bootstrap_manifest_requires_the_exact_paired_digest() {
+    let (_dir, mut manifest) = fixture("0.1.4", 'a');
+    manifest.cross_version_installer_path = Some(PathBuf::from("bootstrap"));
+    assert!(manifest.validate().is_err());
+    manifest.cross_version_installer_sha256 = Some("a".repeat(64));
+    assert!(manifest.validate().is_err());
+    manifest.cross_version_installer_path = None;
+    manifest.cross_version_installer_sha256 = Some(CROSS_VERSION_BOOTSTRAP_SHA256.into());
+    assert!(manifest.validate().is_err());
+    admitted_cross_version_bootstrap(&mut manifest);
+    manifest.validate().expect("admitted pair");
+}
+
+#[test]
+fn missing_or_tampered_durable_cross_version_bootstrap_stops_before_remote_execution() {
+    let (dir, mut manifest) = fixture("0.1.4", 'a');
+    admitted_cross_version_bootstrap(&mut manifest);
+    let state_dir = dir.path().join("bootstrap-state");
+    let store = Store::lock(&state_dir, &manifest.target).expect("store");
+    store
+        .write_artifact(workflow::CROSS_VERSION_BOOTSTRAP_SUFFIX, b"tampered", 0o600)
+        .expect("tampered durable bootstrap");
+    let never = Never(AtomicUsize::new(0));
+    assert!(workflow::stage_cross_version_bootstrap(&store, &manifest).is_err());
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+    store
+        .remove_artifact(workflow::CROSS_VERSION_BOOTSTRAP_SUFFIX)
+        .expect("remove bootstrap");
+    manifest.cross_version_installer_path = Some(dir.path().join("missing-bootstrap"));
+    assert!(workflow::stage_cross_version_bootstrap(&store, &manifest).is_err());
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn update_rejects_missing_or_tampered_bootstrap_before_any_executor_call() {
+    let (dir, old) = fixture("0.1.1", 'a');
+    let (state_dir, _, _, _) = update_ready_state(&dir, &old);
+    let (_candidate_dir, mut candidate) = fixture("0.1.4", 'b');
+    candidate.cross_version_installer_path = Some(dir.path().join("missing-bootstrap"));
+    candidate.cross_version_installer_sha256 = Some(CROSS_VERSION_BOOTSTRAP_SHA256.into());
+    let never = Never(AtomicUsize::new(0));
+    assert!(update(&candidate, &state_dir, true, &never).is_err());
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+
+    let (tamper_dir, tamper_old) = fixture("0.1.1", 'c');
+    let (tamper_state_dir, _, _, _) = update_ready_state(&tamper_dir, &tamper_old);
+    let (_candidate_dir, mut tamper_candidate) = fixture("0.1.4", 'd');
+    admitted_cross_version_bootstrap(&mut tamper_candidate);
+    let store = Store::lock(&tamper_state_dir, &tamper_candidate.target).expect("store");
+    store
+        .write_artifact(workflow::CROSS_VERSION_BOOTSTRAP_SUFFIX, b"tampered", 0o600)
+        .expect("tampered durable bootstrap");
+    drop(store);
+    let never = Never(AtomicUsize::new(0));
+    assert!(update(&tamper_candidate, &tamper_state_dir, true, &never).is_err());
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn bundle_tampering_and_mutable_images_fail_closed() {
     let (_dir, mut manifest) = fixture("1.2.3", 'a');
     fs::write(&manifest.stack_bundle_path, b"tampered").expect("tamper");
@@ -1336,6 +1415,7 @@ fn initial_install_resume_accepts_exact_post_effect_receipt_without_reinstall() 
         &request,
         ReceiptState::Installed,
         None,
+        workflow::InstallInvoker::RetainedInstaller,
         &executor,
     )
     .expect("resume receipt");
@@ -1430,8 +1510,7 @@ fn update_capacity_parser_enforces_exact_bytes_inodes_and_rejects_invalid_values
 }
 
 #[test]
-fn executable_cross_version_update_replays_update_installing_and_verifying_without_installer_effect()
- {
+fn executable_cross_version_update_replays_update_installing_and_verifying_with_bootstrap() {
     let (dir, old) = fixture("0.1.1", 'a');
     let (state_dir, mut state, old_request, provision) = update_ready_state(&dir, &old);
     state
@@ -1444,7 +1523,8 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
         .expect("store")
         .write(&state)
         .expect("legacy state");
-    let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
+    let (_candidate_dir, mut candidate) = fixture("0.1.4", 'b');
+    admitted_cross_version_bootstrap(&mut candidate);
     let facts = candidate.bundle().expect("candidate facts");
     let request = InstallRequest::new(
         &candidate.domain,
@@ -1503,6 +1583,10 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
             .is_some()
     );
     let calls = executor.calls.lock().expect("calls").clone();
+    assert!(
+        !calls.iter().any(|id| id == "run-fixed-stack-installer"),
+        "cross-version update must not invoke the retained installer"
+    );
     let effects: Vec<&str> = calls
         .iter()
         .filter(|id| {
@@ -1515,7 +1599,7 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
                     | "stage-exact-install-request"
                     | "protect-staged-install-request"
                     | "own-protected-install-request"
-                    | "run-fixed-stack-installer"
+                    | "run-fixed-cross-version-bootstrap"
             )
         })
         .map(String::as_str)
@@ -1530,7 +1614,7 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
             "stage-exact-install-request",
             "protect-staged-install-request",
             "own-protected-install-request",
-            "run-fixed-stack-installer",
+            "run-fixed-cross-version-bootstrap",
         ]
     );
     assert_eq!(executor.persisted.lock().expect("persisted").len(), 8);
@@ -1642,7 +1726,7 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
                         | "stage-exact-install-request"
                         | "protect-staged-install-request"
                         | "own-protected-install-request"
-                        | "run-fixed-stack-installer"
+                        | "run-fixed-cross-version-bootstrap"
                 )
             })
             .count();
@@ -2198,6 +2282,8 @@ fn real_server_bundle_5bf0090_parses_and_plans() {
         host_installer_path: installer,
         host_installer_sha256:
             "7deda8b33531bef1f1564f0b68b07ff12d6a2deceaf312cf98529998a207cc84".into(),
+        cross_version_installer_path: None,
+        cross_version_installer_sha256: None,
         host_provisioner_path: provisioner,
         host_provisioner_sha256:
             "21a67bea150a2466a7ce22f0f2cdb234fde901539ea62a18a1471616b3e645c3".into(),

@@ -435,7 +435,11 @@ fn exact_server_image(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_hash_bound_helper(path: &Path, expected_sha256: &str, name: &str) -> Result<Vec<u8>> {
+pub(super) fn read_hash_bound_helper(
+    path: &Path,
+    expected_sha256: &str,
+    name: &str,
+) -> Result<Vec<u8>> {
     digest(expected_sha256, name)?;
     let before = fs::symlink_metadata(path).map_err(io_error(path))?;
     if !before.is_file() || before.len() == 0 || before.len() > MAX_HELPER {

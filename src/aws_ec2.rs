@@ -62,6 +62,14 @@ pub(super) const REMOTE_INSTALLER_UPLOAD: &str = "/home/ubuntu/install-vnext.upl
 pub(super) const REMOTE_PROVISIONER_UPLOAD: &str = "/home/ubuntu/provision-vnext.upload";
 pub(super) const REMOTE_RECEIPT_READER_UPLOAD: &str = "/home/ubuntu/read-vnext-receipt.upload";
 pub(super) const REMOTE_INSTALLER: &str = "/usr/local/libexec/dirextalk/install-vnext";
+/// A one-shot, separately named bootstrap for the only admitted retained-helper
+/// transition.  It must never replace `REMOTE_INSTALLER`.
+pub(super) const REMOTE_CROSS_VERSION_BOOTSTRAP_UPLOAD: &str =
+    "/home/ubuntu/install-vnext-0.1.1-to-0.1.4.upload";
+pub(super) const REMOTE_CROSS_VERSION_BOOTSTRAP_ATOMIC: &str =
+    "/usr/local/libexec/dirextalk/.install-vnext-0.1.1-to-0.1.4.new";
+pub(super) const REMOTE_CROSS_VERSION_BOOTSTRAP: &str =
+    "/usr/local/libexec/dirextalk/install-vnext-0.1.1-to-0.1.4";
 pub(super) const REMOTE_PROVISIONER: &str = "/usr/local/libexec/dirextalk/provision-vnext";
 pub(super) const REMOTE_RECEIPT_READER: &str = "/usr/local/libexec/dirextalk/read-vnext-receipt";
 pub(super) const REMOTE_CURRENT_RECEIPT: &str = "/var/lib/dirextalk-vnext/receipts/current.json";
@@ -98,6 +106,10 @@ pub struct AwsEc2Manifest {
     pub stack_bundle_path: PathBuf,
     pub host_installer_path: PathBuf,
     pub host_installer_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_version_installer_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_version_installer_sha256: Option<String>,
     pub host_provisioner_path: PathBuf,
     pub host_provisioner_sha256: String,
     pub receipt_reader_path: PathBuf,
@@ -144,6 +156,23 @@ impl AwsEc2Manifest {
         operator_cidr(&self.operator_ssh_cidr)?;
         digest(&self.stack_bundle_sha256, "stack bundle")?;
         digest(&self.host_installer_sha256, "host installer")?;
+        match (
+            &self.cross_version_installer_path,
+            &self.cross_version_installer_sha256,
+        ) {
+            (Some(_), Some(sha256)) if sha256 == CROSS_VERSION_BOOTSTRAP_SHA256 => {}
+            (Some(_), Some(_)) => {
+                return Err(contract(
+                    "cross-version installer digest is not the admitted bootstrap",
+                ));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(contract(
+                    "cross-version installer path and digest must be paired",
+                ));
+            }
+        }
         digest(&self.host_provisioner_sha256, "host provisioner")?;
         digest(&self.receipt_reader_sha256, "receipt reader")?;
         Version::parse(&self.release_version)
@@ -190,6 +219,9 @@ impl AwsEc2Manifest {
         Ok(facts)
     }
 }
+
+pub(super) const CROSS_VERSION_BOOTSTRAP_SHA256: &str =
+    "7b20ee7f048d7d813610659af60b597ab1e74b03b60a159fb685586cab7ac4da";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
