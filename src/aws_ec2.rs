@@ -22,11 +22,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{ReleaseError, Result, error::io_error};
-use bundle::{BundleFacts, InstalledReceipt, ReceiptState, digest, image, load_bundle};
+use bundle::{
+    BundleFacts, CrossVersionCompatibility, InstalledReceipt, ReceiptState, digest, image,
+    load_bundle,
+};
 use provision::HostReadyReceipt;
 
 pub use workflow::{
-    apply, destroy, rebind_operator_cidr, resume, status, status_with_registry, update, verify,
+    apply, destroy, rebind_operator_cidr, resume, rollback_update, status, status_with_registry,
+    update, verify,
 };
 
 pub(super) const REGION: &str = "ap-east-1";
@@ -537,6 +541,8 @@ pub struct BundleRecord {
     pub host_installer_sha256: String,
     pub host_provisioner_sha256: String,
     pub receipt_reader_sha256: String,
+    #[serde(default)]
+    pub cross_version_compatibility: Option<CrossVersionCompatibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -580,6 +586,7 @@ impl BundleRecord {
             host_installer_sha256: facts.host_installer_sha256.clone(),
             host_provisioner_sha256: facts.host_provisioner_sha256.clone(),
             receipt_reader_sha256: facts.receipt_reader_sha256.clone(),
+            cross_version_compatibility: facts.cross_version_compatibility.clone(),
         }
     }
 }
@@ -676,6 +683,10 @@ pub struct Ec2State {
     pub current_request_suffix: Option<String>,
     pub previous_bundle_suffix: Option<String>,
     pub previous_request_suffix: Option<String>,
+    #[serde(default)]
+    pub candidate_bundle_suffix: Option<String>,
+    #[serde(default)]
+    pub candidate_request_suffix: Option<String>,
     pub provision_request_suffix: Option<String>,
     pub phase: LifecyclePhase,
     #[serde(default)]
@@ -683,6 +694,91 @@ pub struct Ec2State {
     #[serde(default)]
     pub retained_volume: bool,
     pub integrity_sha256: String,
+}
+
+/// Exact pre-cross-version on-disk shape. Kept only to authenticate and migrate
+/// sealed state written before the two candidate fields existed.
+#[derive(Serialize)]
+struct LegacyEc2State<'a> {
+    schema: &'a String,
+    schema_version: u32,
+    operation_id: &'a String,
+    client_token: &'a String,
+    client_token_sha256: &'a String,
+    target: &'a String,
+    account_id: &'a Option<String>,
+    region: &'a String,
+    domain: &'a String,
+    tenant_id: &'a String,
+    indexer_id: &'a String,
+    ownership_tags: &'a BTreeMap<String, String>,
+    monthly_estimate_cents: u64,
+    max_monthly_usd: u32,
+    infrastructure: &'a InfrastructureRecord,
+    desired: LegacyBundleRecord,
+    current: Option<LegacyBundleRecord>,
+    previous: Option<LegacyBundleRecord>,
+    ami: &'a Option<AmiRecord>,
+    key: &'a Option<KeyRecord>,
+    vpc_id: &'a Option<String>,
+    security_group_id: &'a Option<String>,
+    instance_id: &'a Option<String>,
+    private_ipv4: &'a Option<String>,
+    volume_id: &'a Option<String>,
+    eip: &'a Option<EipRecord>,
+    dns: &'a Option<OwnedRecordSet>,
+    host_key: &'a Option<HostKeyRecord>,
+    current_receipt: &'a Option<InstalledReceipt>,
+    previous_receipt: &'a Option<InstalledReceipt>,
+    rollback_receipt: &'a Option<InstalledReceipt>,
+    host_ready_receipt: &'a Option<HostReadyReceipt>,
+    current_bundle_suffix: &'a Option<String>,
+    current_request_suffix: &'a Option<String>,
+    previous_bundle_suffix: &'a Option<String>,
+    previous_request_suffix: &'a Option<String>,
+    provision_request_suffix: &'a Option<String>,
+    phase: &'a LifecyclePhase,
+    pending_effect: &'a Option<String>,
+    retained_volume: bool,
+    integrity_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct LegacyBundleRecord {
+    version: String,
+    source_commit: String,
+    bundle_sha256: String,
+    manifest_sha256: String,
+    compose_sha256: String,
+    server_image: String,
+    migrator_image: String,
+    postgres_image: String,
+    caddy_image: String,
+    probe_image: String,
+    installer_sha256: String,
+    host_installer_sha256: String,
+    host_provisioner_sha256: String,
+    receipt_reader_sha256: String,
+}
+impl From<&BundleRecord> for LegacyBundleRecord {
+    fn from(v: &BundleRecord) -> Self {
+        Self {
+            version: v.version.clone(),
+            source_commit: v.source_commit.clone(),
+            bundle_sha256: v.bundle_sha256.clone(),
+            manifest_sha256: v.manifest_sha256.clone(),
+            compose_sha256: v.compose_sha256.clone(),
+            server_image: v.server_image.clone(),
+            migrator_image: v.migrator_image.clone(),
+            postgres_image: v.postgres_image.clone(),
+            caddy_image: v.caddy_image.clone(),
+            probe_image: v.probe_image.clone(),
+            installer_sha256: v.installer_sha256.clone(),
+            host_installer_sha256: v.host_installer_sha256.clone(),
+            host_provisioner_sha256: v.host_provisioner_sha256.clone(),
+            receipt_reader_sha256: v.receipt_reader_sha256.clone(),
+        }
+    }
 }
 
 impl Ec2State {
@@ -704,6 +800,71 @@ impl Ec2State {
         if digest != hex::encode(Sha256::digest(serde_json::to_vec(&copy)?)) {
             return Err(ReleaseError::StateUnsafe(PathBuf::from("EC2 state")));
         }
+        self.verify_semantics()
+    }
+
+    pub(super) fn verify_legacy_bytes(&self, bytes: &[u8]) -> Result<()> {
+        if self.candidate_bundle_suffix.is_some() || self.candidate_request_suffix.is_some() {
+            return Err(ReleaseError::StateUnsafe(PathBuf::from("EC2 state")));
+        }
+        let expected = serde_json::to_vec_pretty(&self.legacy_shape(&self.integrity_sha256))?;
+        if bytes != expected {
+            return Err(ReleaseError::StateUnsafe(PathBuf::from("EC2 state")));
+        }
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&self.legacy_shape(""))?));
+        if self.integrity_sha256 != digest {
+            return Err(ReleaseError::StateUnsafe(PathBuf::from("EC2 state")));
+        }
+        self.verify_semantics()
+    }
+
+    fn legacy_shape<'a>(&'a self, integrity_sha256: &'a str) -> LegacyEc2State<'a> {
+        LegacyEc2State {
+            schema: &self.schema,
+            schema_version: self.schema_version,
+            operation_id: &self.operation_id,
+            client_token: &self.client_token,
+            client_token_sha256: &self.client_token_sha256,
+            target: &self.target,
+            account_id: &self.account_id,
+            region: &self.region,
+            domain: &self.domain,
+            tenant_id: &self.tenant_id,
+            indexer_id: &self.indexer_id,
+            ownership_tags: &self.ownership_tags,
+            monthly_estimate_cents: self.monthly_estimate_cents,
+            max_monthly_usd: self.max_monthly_usd,
+            infrastructure: &self.infrastructure,
+            desired: LegacyBundleRecord::from(&self.desired),
+            current: self.current.as_ref().map(LegacyBundleRecord::from),
+            previous: self.previous.as_ref().map(LegacyBundleRecord::from),
+            ami: &self.ami,
+            key: &self.key,
+            vpc_id: &self.vpc_id,
+            security_group_id: &self.security_group_id,
+            instance_id: &self.instance_id,
+            private_ipv4: &self.private_ipv4,
+            volume_id: &self.volume_id,
+            eip: &self.eip,
+            dns: &self.dns,
+            host_key: &self.host_key,
+            current_receipt: &self.current_receipt,
+            previous_receipt: &self.previous_receipt,
+            rollback_receipt: &self.rollback_receipt,
+            host_ready_receipt: &self.host_ready_receipt,
+            current_bundle_suffix: &self.current_bundle_suffix,
+            current_request_suffix: &self.current_request_suffix,
+            previous_bundle_suffix: &self.previous_bundle_suffix,
+            previous_request_suffix: &self.previous_request_suffix,
+            provision_request_suffix: &self.provision_request_suffix,
+            phase: &self.phase,
+            pending_effect: &self.pending_effect,
+            retained_volume: self.retained_volume,
+            integrity_sha256,
+        }
+    }
+
+    fn verify_semantics(&self) -> Result<()> {
         let operation = uuid::Uuid::parse_str(&self.operation_id)
             .map_err(|_| ReleaseError::StateUnsafe(PathBuf::from("EC2 state")))?;
         let tenant = uuid::Uuid::parse_str(&self.tenant_id)
@@ -783,6 +944,9 @@ fn validate_bundle_record(record: &BundleRecord) -> Result<()> {
         (&record.receipt_reader_sha256, "state receipt reader"),
     ] {
         digest(value, name)?;
+    }
+    if let Some(marker) = &record.cross_version_compatibility {
+        marker.validate()?;
     }
     exact_image(
         &record.server_image,

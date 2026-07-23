@@ -75,12 +75,18 @@ impl Store {
         Ok(self.root.join(format!("{}.{}", self.target, suffix)))
     }
 
+    #[allow(dead_code)]
     pub fn read<T: DeserializeOwned>(&self) -> Result<Option<T>> {
+        self.read_with_bytes()
+            .map(|value| value.map(|(decoded, _)| decoded))
+    }
+
+    pub fn read_with_bytes<T: DeserializeOwned>(&self) -> Result<Option<(T, Vec<u8>)>> {
         let path = self.state_path();
         let Some(bytes) = read_secure(&path, MAX_STATE)? else {
             return Ok(None);
         };
-        Ok(Some(serde_json::from_slice(&bytes)?))
+        Ok(Some((serde_json::from_slice(&bytes)?, bytes)))
     }
 
     pub fn write<T: Serialize>(&self, value: &T) -> Result<()> {

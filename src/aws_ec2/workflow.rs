@@ -35,6 +35,11 @@ const PRIVATE_KEY_SUFFIX: &str = "id_ed25519";
 const PUBLIC_KEY_SUFFIX: &str = "id_ed25519.pub";
 const KNOWN_HOSTS_SUFFIX: &str = "known_hosts";
 const PROVISION_REQUEST_SUFFIX: &str = "current.provision";
+const UPDATE_BUNDLE_SUFFIX: &str = "update-candidate.bundle";
+const UPDATE_REQUEST_SUFFIX: &str = "update-candidate.request";
+const ROLLBACK_REQUEST_SUFFIX: &str = "rollback.request";
+const UPDATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
+const UPDATE_CAPACITY_INODES: u64 = 128;
 
 pub fn apply(
     manifest: &AwsEc2Manifest,
@@ -50,8 +55,7 @@ pub fn apply(
         return new_state(manifest, &facts, estimate, max_monthly_usd);
     }
     let store = Store::lock(state_dir, &manifest.target)?;
-    let mut state = if let Some(state) = store.read::<Ec2State>()? {
-        state.verify()?;
+    let mut state = if let Some(state) = read_verified_state(&store)? {
         ensure_apply_resumable_phase(&state.phase)?;
         ensure_apply_identity(&state, manifest, &facts)?;
         state
@@ -191,6 +195,8 @@ fn new_state(
         current_request_suffix: None,
         previous_bundle_suffix: None,
         previous_request_suffix: None,
+        candidate_bundle_suffix: None,
+        candidate_request_suffix: None,
         provision_request_suffix: None,
         phase: LifecyclePhase::Planned,
         pending_effect: None,
@@ -1956,6 +1962,7 @@ fn install_initial(
         APPLY_REQUEST_SUFFIX,
         &request,
         ReceiptState::Installed,
+        None,
         executor,
     )?;
     state.current = Some(BundleRecord::from_facts(facts, manifest));
@@ -2100,6 +2107,7 @@ fn provision_initial(
     persist(store, state)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_install_read_receipt(
     store: &Store,
     state: &mut Ec2State,
@@ -2107,10 +2115,14 @@ pub(super) fn stage_install_read_receipt(
     request_suffix: &str,
     request: &InstallRequest,
     expected_state: ReceiptState,
+    retained: Option<(&InstallRequest, ReceiptState)>,
     executor: &dyn AwsExecutor,
 ) -> Result<InstalledReceipt> {
-    if let Some(receipt) = read_existing_install_receipt(state, store, request, executor)? {
-        return Ok(receipt);
+    match read_existing_install_receipt(state, store, request, expected_state, retained, executor)?
+    {
+        ExistingInstallReceipt::PostEffect(receipt) => return Ok(*receipt),
+        ExistingInstallReceipt::PreEffect => clear_remote_install_inputs(store, state, executor)?,
+        ExistingInstallReceipt::Absent => {}
     }
     let bundle_path = store.artifact_path(bundle_suffix)?;
     let request_path = store.artifact_path(request_suffix)?;
@@ -2168,12 +2180,20 @@ pub(super) fn stage_install_read_receipt(
     InstalledReceipt::parse_and_verify(receipt.stdout.as_bytes(), request, expected_state)
 }
 
+pub(super) enum ExistingInstallReceipt {
+    Absent,
+    PreEffect,
+    PostEffect(Box<InstalledReceipt>),
+}
+
 fn read_existing_install_receipt(
     state: &Ec2State,
     store: &Store,
     request: &InstallRequest,
+    expected_state: ReceiptState,
+    retained: Option<(&InstallRequest, ReceiptState)>,
     executor: &dyn AwsExecutor,
-) -> Result<Option<InstalledReceipt>> {
+) -> Result<ExistingInstallReceipt> {
     let metadata = executor.run(&ssh_command(
         "inspect-current-installed-receipt",
         state,
@@ -2196,7 +2216,7 @@ fn read_existing_install_receipt(
         30,
     )?)?;
     let Some(metadata) = parse_remote_file_metadata(&metadata.stdout)? else {
-        return Ok(None);
+        return Ok(ExistingInstallReceipt::Absent);
     };
     if metadata.kind != "f"
         || metadata.owner != "root"
@@ -2220,8 +2240,48 @@ fn read_existing_install_receipt(
     if output.stdout.len() != metadata.size {
         return Err(ReleaseError::OperationConflict);
     }
-    InstalledReceipt::parse_and_verify(output.stdout.as_bytes(), request, ReceiptState::Installed)
-        .map(Some)
+    classify_existing_install_receipt(output.stdout.as_bytes(), request, expected_state, retained)
+}
+
+pub(super) fn classify_existing_install_receipt(
+    bytes: &[u8],
+    request: &InstallRequest,
+    expected_state: ReceiptState,
+    retained: Option<(&InstallRequest, ReceiptState)>,
+) -> Result<ExistingInstallReceipt> {
+    if let Ok(receipt) = InstalledReceipt::parse_and_verify(bytes, request, expected_state) {
+        return Ok(ExistingInstallReceipt::PostEffect(Box::new(receipt)));
+    }
+    if let Some((retained_request, retained_state)) = retained
+        && InstalledReceipt::parse_and_verify(bytes, retained_request, retained_state).is_ok()
+    {
+        return Ok(ExistingInstallReceipt::PreEffect);
+    }
+    Err(ReleaseError::OperationConflict)
+}
+
+fn clear_remote_install_inputs(
+    store: &Store,
+    state: &mut Ec2State,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let clear = ssh_command(
+        "clear-retained-install-inputs-before-replay",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/rm",
+            "--force",
+            "--",
+            REMOTE_BUNDLE,
+            REMOTE_REQUEST,
+        ],
+        true,
+        30,
+    )?;
+    run_effect(store, state, &clear, executor).map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2732,53 +2792,333 @@ pub fn verify(
 pub fn update(
     manifest: &AwsEc2Manifest,
     state_dir: &Path,
-    _execute: bool,
-    _executor: &dyn AwsExecutor,
+    execute: bool,
+    executor: &dyn AwsExecutor,
 ) -> Result<Ec2State> {
     manifest.validate()?;
     let facts = manifest.bundle()?;
     let store = Store::lock(state_dir, &manifest.target)?;
-    let state = load_state(&store, manifest)?;
-    if !matches!(
-        state.phase,
-        LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack
-    ) {
+    let mut state = load_state(&store, manifest)?;
+    if state.phase == LifecyclePhase::RolledBack {
         return Err(contract(
-            "update recovery is fail-closed for a non-converged lifecycle",
-        ));
-    }
-    let prior_bundle = state
-        .current
-        .clone()
-        .ok_or_else(|| contract("current immutable bundle is absent"))?;
-    let prior_receipt = state
-        .current_receipt
-        .clone()
-        .ok_or_else(|| contract("current installed receipt is absent"))?;
-    if facts.manifest.version != prior_receipt.version {
-        return Err(contract(
-            "cross-version update is unsupported until migration compatibility evidence is available",
+            "a rolled-back lifecycle cannot start a new forward update",
         ));
     }
     let candidate = BundleRecord::from_facts(&facts, manifest);
-    if candidate == prior_bundle {
+    let (prior_bundle, prior_receipt) = if state.phase == LifecyclePhase::UpdateVerifying {
+        (
+            state
+                .previous
+                .clone()
+                .ok_or_else(|| contract("retained immutable bundle is absent"))?,
+            state
+                .previous_receipt
+                .clone()
+                .ok_or_else(|| contract("retained installed receipt is absent"))?,
+        )
+    } else {
+        (
+            state
+                .current
+                .clone()
+                .ok_or_else(|| contract("current immutable bundle is absent"))?,
+            state
+                .current_receipt
+                .clone()
+                .ok_or_else(|| contract("current installed receipt is absent"))?,
+        )
+    };
+    if candidate == prior_bundle
+        && matches!(
+            state.phase,
+            LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack
+        )
+    {
         return Ok(state);
     }
-    if candidate.compose_sha256 != prior_bundle.compose_sha256
-        || candidate.postgres_image != prior_bundle.postgres_image
-        || candidate.caddy_image != prior_bundle.caddy_image
-        || candidate.probe_image != prior_bundle.probe_image
-        || candidate.host_installer_sha256 != prior_bundle.host_installer_sha256
-        || candidate.host_provisioner_sha256 != prior_bundle.host_provisioner_sha256
-        || candidate.receipt_reader_sha256 != prior_bundle.receipt_reader_sha256
+    ensure_cross_version_contract(&prior_bundle, &prior_receipt, &candidate)?;
+    match state.phase {
+        LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack => {}
+        LifecyclePhase::UpdateStaged
+        | LifecyclePhase::UpdateInstalling
+        | LifecyclePhase::UpdateVerifying => {
+            if state.desired != candidate {
+                return Err(ReleaseError::OperationConflict);
+            }
+        }
+        _ => {
+            return Err(contract(
+                "update recovery is fail-closed for this lifecycle phase",
+            ));
+        }
+    }
+    if !execute {
+        return Ok(state);
+    }
+
+    if matches!(
+        state.phase,
+        LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack
+    ) {
+        store.copy_artifact(
+            UPDATE_BUNDLE_SUFFIX,
+            &manifest.stack_bundle_path,
+            &facts.bundle_sha256,
+        )?;
+        let request = InstallRequest::new(
+            &state.domain,
+            &facts,
+            Some(prior_receipt.receipt_sha256.clone()),
+        );
+        store.write_artifact(UPDATE_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
+        state.previous = Some(prior_bundle);
+        state.previous_receipt = Some(prior_receipt);
+        state
+            .previous_bundle_suffix
+            .clone_from(&state.current_bundle_suffix);
+        state
+            .previous_request_suffix
+            .clone_from(&state.current_request_suffix);
+        state.desired = candidate.clone();
+        state.candidate_bundle_suffix = Some(UPDATE_BUNDLE_SUFFIX.into());
+        state.candidate_request_suffix = Some(UPDATE_REQUEST_SUFFIX.into());
+        state.phase = LifecyclePhase::UpdateStaged;
+        state.pending_effect = None;
+        persist(&store, &mut state)?;
+    }
+    ensure_update_capacity(&store, &state, executor)?;
+    let bundle_suffix = state
+        .candidate_bundle_suffix
+        .clone()
+        .ok_or_else(|| contract("candidate bundle fact is absent"))?;
+    let request_suffix = state
+        .candidate_request_suffix
+        .clone()
+        .ok_or_else(|| contract("candidate request fact is absent"))?;
+    let request: InstallRequest =
+        serde_json::from_slice(&store.read_artifact(&request_suffix, 64 * 1024)?)?;
+    if request.bundle_sha256 != state.desired.bundle_sha256
+        || request.previous_receipt_sha256
+            != state
+                .previous_receipt
+                .as_ref()
+                .map(|r| r.receipt_sha256.clone())
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let prior_request_suffix = state
+        .previous_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("retained install request fact is absent"))?;
+    let prior_request: InstallRequest =
+        serde_json::from_slice(&store.read_artifact(prior_request_suffix, 64 * 1024)?)?;
+    let retained_receipt = state
+        .previous_receipt
+        .as_ref()
+        .ok_or_else(|| contract("retained receipt fact is absent"))?;
+    if retained_receipt.state != ReceiptState::Installed
+        || retained_receipt.bundle_sha256 != prior_request.bundle_sha256
+        || retained_receipt.receipt_sha256
+            != request.previous_receipt_sha256.clone().unwrap_or_default()
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    state.phase = LifecyclePhase::UpdateInstalling;
+    persist(&store, &mut state)?;
+    let receipt = stage_install_read_receipt(
+        &store,
+        &mut state,
+        &bundle_suffix,
+        &request_suffix,
+        &request,
+        ReceiptState::Installed,
+        Some((&prior_request, ReceiptState::Installed)),
+        executor,
+    )?;
+    state.current = Some(candidate);
+    state.current_receipt = Some(receipt);
+    state.current_bundle_suffix = Some(bundle_suffix);
+    state.current_request_suffix = Some(request_suffix);
+    state.phase = LifecyclePhase::UpdateVerifying;
+    persist(&store, &mut state)?;
+    verify_live_locked(&store, &mut state, manifest, executor)?;
+    state.phase = LifecyclePhase::Verified;
+    state.pending_effect = None;
+    persist(&store, &mut state)?;
+    Ok(state)
+}
+
+fn ensure_cross_version_contract(
+    prior: &BundleRecord,
+    prior_receipt: &InstalledReceipt,
+    candidate: &BundleRecord,
+) -> Result<()> {
+    let retained = prior.cross_version_compatibility.as_ref().ok_or_else(|| {
+        contract("retained bundle lacks authenticated cross-version compatibility marker")
+    })?;
+    let proposed = candidate
+        .cross_version_compatibility
+        .as_ref()
+        .ok_or_else(|| {
+            contract("candidate bundle lacks authenticated cross-version compatibility marker")
+        })?;
+    retained.validate()?;
+    proposed.validate()?;
+    if prior.version != "0.1.1"
+        || prior_receipt.version != prior.version
+        || candidate.version != "0.1.4"
+        || retained != proposed
+        || retained.retained_version != prior.version
+        || retained.candidate_version != candidate.version
     {
         return Err(contract(
-            "update cannot change immutable host-provision or host-helper inputs",
+            "only the authenticated forward 0.1.1 to 0.1.4 update is supported",
         ));
     }
-    Err(contract(
-        "EC2 update mutation is disabled until replay-safe recovery is implemented",
-    ))
+    if candidate.postgres_image != prior.postgres_image
+        || candidate.caddy_image != prior.caddy_image
+        || candidate.probe_image != prior.probe_image
+        || candidate.host_installer_sha256 != prior.host_installer_sha256
+        || candidate.host_provisioner_sha256 != prior.host_provisioner_sha256
+        || candidate.receipt_reader_sha256 != prior.receipt_reader_sha256
+    {
+        return Err(contract(
+            "cross-version update cannot change retained host, dependency-image, or helper facts",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_update_capacity(
+    store: &Store,
+    state: &Ec2State,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let output = executor.run(&ssh_command(
+        "check-authenticated-update-capacity",
+        state,
+        store,
+        ["/usr/bin/df", "--output=avail,iavail", "-B1", "/"],
+        false,
+        30,
+    )?)?;
+    parse_update_capacity(&output.stdout)
+}
+
+pub(super) fn parse_update_capacity(output: &str) -> Result<()> {
+    let values = output
+        .lines()
+        .skip(1)
+        .flat_map(str::split_ascii_whitespace)
+        .collect::<Vec<_>>();
+    if values.len() != 2 {
+        return Err(contract(
+            "authenticated update capacity response is malformed",
+        ));
+    }
+    let bytes = values[0]
+        .parse::<u64>()
+        .map_err(|_| contract("authenticated update capacity bytes are malformed"))?;
+    let inodes = values[1]
+        .parse::<u64>()
+        .map_err(|_| contract("authenticated update capacity inodes are malformed"))?;
+    if bytes < UPDATE_CAPACITY_BYTES || inodes < UPDATE_CAPACITY_INODES {
+        return Err(contract(
+            "authenticated remote capacity is insufficient for update",
+        ));
+    }
+    Ok(())
+}
+
+/// A separately callable, code-only rollback primitive.  It never invokes a
+/// down migration; the server-owned installer must authenticate a `rolled_back`
+/// receipt against the retained request and candidate receipt chain.
+pub fn rollback_update(
+    manifest: &AwsEc2Manifest,
+    state_dir: &Path,
+    execute: bool,
+    executor: &dyn AwsExecutor,
+) -> Result<Ec2State> {
+    manifest.validate()?;
+    let store = Store::lock(state_dir, &manifest.target)?;
+    let mut state = load_state(&store, manifest)?;
+    if !matches!(
+        state.phase,
+        LifecyclePhase::UpdateVerifying
+            | LifecyclePhase::RollbackStaged
+            | LifecyclePhase::RollbackInstalling
+    ) {
+        return Err(contract("rollback requires an unverified candidate update"));
+    }
+    let prior = state
+        .previous
+        .clone()
+        .ok_or_else(|| contract("retained bundle is absent"))?;
+    let candidate_receipt = state
+        .current_receipt
+        .clone()
+        .ok_or_else(|| contract("candidate receipt is absent"))?;
+    let marker = prior
+        .cross_version_compatibility
+        .as_ref()
+        .ok_or_else(|| contract("retained rollback marker is absent"))?;
+    marker.validate()?;
+    state
+        .desired
+        .cross_version_compatibility
+        .as_ref()
+        .ok_or_else(|| contract("candidate rollback marker is absent"))?
+        .validate()?;
+    if !execute {
+        return Ok(state);
+    }
+    let previous_bundle = state
+        .previous_bundle_suffix
+        .clone()
+        .ok_or_else(|| contract("retained bundle artifact is absent"))?;
+    let request = InstallRequest {
+        schema: "dirextalk.vnext-install-request".into(),
+        schema_version: 1,
+        target: state.target.clone(),
+        domain: state.domain.clone(),
+        version: prior.version.clone(),
+        source_commit: prior.source_commit.clone(),
+        bundle_sha256: prior.bundle_sha256.clone(),
+        manifest_sha256: prior.manifest_sha256.clone(),
+        server_image: prior.server_image.clone(),
+        migrator_image: prior.migrator_image.clone(),
+        previous_receipt_sha256: Some(candidate_receipt.receipt_sha256),
+    };
+    store.write_artifact(ROLLBACK_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
+    state.phase = LifecyclePhase::RollbackStaged;
+    persist(&store, &mut state)?;
+    state.phase = LifecyclePhase::RollbackInstalling;
+    persist(&store, &mut state)?;
+    let candidate_request_suffix = state
+        .candidate_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("candidate install request fact is absent"))?;
+    let candidate_request: InstallRequest =
+        serde_json::from_slice(&store.read_artifact(candidate_request_suffix, 64 * 1024)?)?;
+    let receipt = stage_install_read_receipt(
+        &store,
+        &mut state,
+        &previous_bundle,
+        ROLLBACK_REQUEST_SUFFIX,
+        &request,
+        ReceiptState::RolledBack,
+        Some((&candidate_request, ReceiptState::Installed)),
+        executor,
+    )?;
+    state.current = Some(prior);
+    state.current_receipt = Some(receipt.clone());
+    state.rollback_receipt = Some(receipt);
+    state.current_bundle_suffix = Some(previous_bundle);
+    state.current_request_suffix = Some(ROLLBACK_REQUEST_SUFFIX.into());
+    state.phase = LifecyclePhase::RolledBack;
+    state.pending_effect = None;
+    persist(&store, &mut state)?;
+    Ok(state)
 }
 
 /// Reconcile a narrowly fenced operator SSH CIDR recovery without changing lifecycle phase.
@@ -2798,10 +3138,8 @@ pub fn rebind_operator_cidr(
         ));
     }
     let store = Store::lock(state_dir, &manifest.target)?;
-    let mut state = store
-        .read::<Ec2State>()?
+    let mut state = read_verified_state(&store)?
         .ok_or_else(|| contract("no owned EC2 lifecycle state exists"))?;
-    state.verify()?;
     ensure_rebind_phase(&state.phase)?;
     ensure_rebind_pending_effect(state.pending_effect.as_deref())?;
     ensure_rebind_identity(&state, manifest, &facts)?;
@@ -3062,10 +3400,8 @@ fn revoke_old_operator_ingress(
 }
 
 fn load_state(store: &Store, manifest: &AwsEc2Manifest) -> Result<Ec2State> {
-    let state = store
-        .read::<Ec2State>()?
+    let state = read_verified_state(store)?
         .ok_or_else(|| contract("no owned EC2 lifecycle state exists"))?;
-    state.verify()?;
     if state.target != manifest.target
         || state.region != manifest.region
         || state.domain != manifest.domain
@@ -3074,6 +3410,19 @@ fn load_state(store: &Store, manifest: &AwsEc2Manifest) -> Result<Ec2State> {
         return Err(ReleaseError::OperationConflict);
     }
     Ok(state)
+}
+
+fn read_verified_state(store: &Store) -> Result<Option<Ec2State>> {
+    let Some((mut state, bytes)) = store.read_with_bytes::<Ec2State>()? else {
+        return Ok(None);
+    };
+    if state.verify().is_err() {
+        state.verify_legacy_bytes(&bytes)?;
+        // The Store lock is already held. Resealing is a local schema migration,
+        // occurs before any later effect, and preserves all lifecycle facts.
+        persist(store, &mut state)?;
+    }
+    Ok(Some(state))
 }
 
 pub fn destroy(

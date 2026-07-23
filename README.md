@@ -15,6 +15,12 @@ Matrix-independent Dirextalk vNext stack. It starts with the release boundary:
 It is a new implementation. It does not execute or embed the legacy
 `dirextalk-deployer` shell scripts.
 
+Verification note: focused EC2 replay, rollback, and legacy-seal tests pass.
+The full suite has one external concurrent-workspace failure only:
+`real_server_bundle_5bf0090_parses_and_plans` reports `SourceMismatch` for the
+live `dirextalk-vnext-server/target/production-release/dirextalk-vnext.bundle`
+artifact; no deployer fixture or code path is involved.
+
 ## Safety model
 
 `validate`, `plan`, and `build` without `--execute` cannot publish. `assemble`
@@ -141,10 +147,17 @@ command or shell-script escape hatch.
 `ec2-plan` validates one immutable Ubuntu 24.04 amd64 node in `ap-east-1` and
 prints the closed action set and conservative monthly cost ceiling.
 `ec2-apply`, `ec2-resume`, and `ec2-destroy` remain dry runs unless `--execute`
-is present. `ec2-update`
-validates the requested immutable candidate but rejects every changed candidate
-before any provider or host effect until replay-safe update recovery is
-implemented.
+is present. `ec2-update` validates dry runs without effects and, with
+`--execute`, supports only the authenticated forward `0.1.1` to `0.1.4` path.
+Both the retained and candidate digest-bound stack manifests must carry the
+same strict compatibility marker declaring forward-only migrations and
+code-only rollback. The durable state records candidate, retained, request,
+and receipt facts before every host effect; it uses the existing pinned SSH/SCP
+channel, checks authenticated remote byte and inode capacity, and replays each
+post-crash boundary without duplicate installer effects. It never changes EBS,
+Docker volumes, TLS, secrets, or provisioned configuration. A library-only
+`rollback_update` primitive is separately fenced to an unverified candidate and
+requires a server-produced `rolled_back` receipt; it performs no down migration.
 `ec2-rebind-operator-cidr` is a separately fenced recovery operation for an
 already-owned security group: it requires the exact current `/32` in state and
 an otherwise identical, digest-bound manifest with a new `/32`. With
@@ -182,9 +195,9 @@ fixed command `docker buildx imagetools inspect` for
 `docker.io/dirextalk/vnet-server:latest`. Its JSON manifest digest must parse
 as canonical `sha256:<64>`. The tag is comparison-only and is never consulted
 by apply or update. Update validation consumes only the explicitly supplied
-immutable bundle and image digests, rejects cross-version changes, and also
-requires the production compose, dependency-image, and host-helper identities
-to remain unchanged. It performs no candidate install or rollback mutation.
+immutable bundle and image digests. Cross-version mutation additionally
+requires the server-produced compatibility markers described above; a missing,
+mismatched, or malformed marker fails closed before any remote effect.
 Docker
 credentials, command stderr, and registry tokens are neither printed nor
 persisted.
