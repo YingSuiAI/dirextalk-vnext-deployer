@@ -155,6 +155,18 @@ enum Commands {
         #[arg(long)]
         execute: bool,
     },
+    /// Issue one short-lived client binding through a verified EC2 deployment.
+    #[cfg(unix)]
+    Ec2ClientBindingIssue {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
     /// Plan one immutable AWS EC2 vNext node (dry run).
     Ec2Plan {
         #[arg(long)]
@@ -402,6 +414,29 @@ pub fn run(cli: Cli) -> Result<()> {
                 &deployment_store,
                 &binding_store,
                 &ProductionClientBindingExecutor,
+            )?;
+            print_json(&result)?;
+        }
+        #[cfg(unix)]
+        Commands::Ec2ClientBindingIssue {
+            manifest,
+            state_dir,
+            output,
+            execute,
+        } => {
+            if !execute {
+                return Err(crate::error::ReleaseError::Deployment(
+                    "ec2-client-binding-issue requires --execute".into(),
+                ));
+            }
+            let manifest = AwsEc2Manifest::load(&manifest)?;
+            let binding_store = ClientBindingStore::fixed()?;
+            let result = crate::client_binding::issue_ec2(
+                &manifest,
+                &state_dir,
+                &output,
+                &binding_store,
+                &crate::aws_ec2::ProductionAwsExecutor,
             )?;
             print_json(&result)?;
         }

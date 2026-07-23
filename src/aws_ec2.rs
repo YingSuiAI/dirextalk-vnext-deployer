@@ -1,10 +1,10 @@
 //! Durable, fail-closed lifecycle for one immutable Dirextalk vNext EC2 node.
 #![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
-mod bundle;
+pub(crate) mod bundle;
 mod provision;
-mod store;
-mod workflow;
+pub(crate) mod store;
+pub(crate) mod workflow;
 
 use std::{
     collections::BTreeMap,

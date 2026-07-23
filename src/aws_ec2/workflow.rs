@@ -31,7 +31,7 @@ use crate::{ReleaseError, Result};
 const APPLY_BUNDLE_SUFFIX: &str = "current.bundle";
 const APPLY_REQUEST_SUFFIX: &str = "current.request";
 const USER_DATA_SUFFIX: &str = "cloud-init.yaml";
-const PRIVATE_KEY_SUFFIX: &str = "id_ed25519";
+pub(crate) const PRIVATE_KEY_SUFFIX: &str = "id_ed25519";
 const PUBLIC_KEY_SUFFIX: &str = "id_ed25519.pub";
 const KNOWN_HOSTS_SUFFIX: &str = "known_hosts";
 const PROVISION_REQUEST_SUFFIX: &str = "current.provision";
@@ -2425,7 +2425,7 @@ fn read_host_ready_receipt(
     HostReadyReceipt::parse_and_verify(output.stdout.as_bytes(), request)
 }
 
-fn scp_command(
+pub(crate) fn scp_command(
     id: &str,
     state: &Ec2State,
     store: &Store,
@@ -2464,7 +2464,46 @@ fn scp_command(
     ))
 }
 
-fn ssh_command<const N: usize>(
+pub(crate) fn scp_from_command(
+    id: &str,
+    state: &Ec2State,
+    store: &Store,
+    remote: &str,
+    local: &Path,
+) -> Result<FixedCommand> {
+    let ip = state
+        .eip
+        .as_ref()
+        .map(|eip| eip.public_ip.as_str())
+        .ok_or_else(|| contract("EIP state is missing"))?;
+    let private = store.artifact_path(PRIVATE_KEY_SUFFIX)?;
+    let known_hosts = store.artifact_path(KNOWN_HOSTS_SUFFIX)?;
+    let local = fs::canonicalize(local).map_err(crate::error::io_error(local))?;
+    Ok(FixedCommand::new(
+        id,
+        SCP,
+        [
+            "-q".into(),
+            "-i".into(),
+            private.display().to_string(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-o".into(),
+            format!("UserKnownHostsFile={}", known_hosts.display()),
+            "--".into(),
+            format!("ubuntu@{ip}:{remote}"),
+            local.display().to_string(),
+        ],
+        false,
+        180,
+    ))
+}
+
+pub(crate) fn ssh_command<const N: usize>(
     id: &str,
     state: &Ec2State,
     store: &Store,

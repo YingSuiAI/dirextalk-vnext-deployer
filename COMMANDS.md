@@ -22,7 +22,7 @@ Run from the repository root.
 | EC2 retained-volume purge (separate exact fence) | `cargo run --locked -- ec2-destroy --manifest aws-ec2.example.json --purge-volume --purge-volume-id vol-... --execute` |
 | Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
 | Connector-host operation claim | `sudo cargo run --locked -- deployment-connector-claim --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <connector-host-id> [--predecessor-operation-id <terminal-deployment-uuidv7>]` |
-| Client binding issue (terminal Server deployment only) | `sudo cargo run --locked -- deployment-client-binding-issue --execute --operation-id <deployment-uuidv7> --target <node-id> --tenant-id <tenant-uuidv7> --server-origin https://host --output <operator-file>` |
+| Client binding issue (verified EC2 deployment only) | `sudo cargo run --locked -- ec2-client-binding-issue --execute --manifest aws-ec2.example.json --state-dir .dirextalk-ec2-state --output <operator-file>` |
 
 `build` only executes commands when `--execute` is supplied. `publish` also
 requires `--execute` plus one or more destination flags.

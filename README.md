@@ -119,14 +119,15 @@ operator output is written to state or printed.
 
 ## Client binding issue
 
-After a terminal-successful Server deployment, the root-only
-`deployment-client-binding-issue --execute` action invokes the fixed
-server-owned `dtx-identity-provision client-binding-issue` typed transport. It
-validates the operation, target, tenant, and canonical HTTPS origin, then writes
-one short-lived client-binding JSON artifact as a no-follow operator-local
-`0600` file. Authorization, PEM contents, and the secret-bearing output path
-are never printed or retained in durable state; replay is exact and conflicts
-fail closed.
+After a terminal-successful EC2 deployment, the root-only
+`ec2-client-binding-issue --execute` action stages one exact request at the
+fixed host path, invokes the release-bundled zero-argument issuer helper, pulls
+the exact import artifact, and invokes the fixed cleanup helper. The action
+reuses the sealed EC2 lifecycle state, operation lock, pinned SSH key and
+known-hosts file, and writes one short-lived client-binding JSON artifact as a
+no-follow operator-local `0600` file. Authorization and PEM contents are never
+printed or retained in durable state; replay is exact and conflicts fail
+closed.
 
 ## Current boundary
 

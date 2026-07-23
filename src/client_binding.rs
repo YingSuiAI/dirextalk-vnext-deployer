@@ -8,7 +8,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    aws_ec2::{self, AwsEc2Manifest, AwsExecutor, Ec2State, LifecyclePhase},
     deployment::{
         BindingWorkload, DeploymentStateStore, OperationPhase, OperationRecord,
         require_canonical_uuid7,
@@ -30,9 +30,6 @@ use crate::{
 };
 
 const STATE_DIR: &str = "/var/lib/dirextalk-vnext-deployer";
-const ISSUER: &str = "dtx-identity-provision";
-const ACTION: &str = "client-binding-issue";
-const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_BINDING: usize = 24 * 1024;
 const MAX_CA: usize = 12 * 1024;
 const MAX_LIFETIME_MS: u64 = 15 * 60 * 1_000;
@@ -91,28 +88,10 @@ pub struct ProductionClientBindingExecutor;
 
 impl ClientBindingExecutor for ProductionClientBindingExecutor {
     fn issue(&self, request: &ClientBindingIssueRequest) -> Result<ClientBindingIssueResponse> {
-        validate_request(request)?;
-        let input = serde_json::to_vec(request).map_err(ReleaseError::Json)?;
-        let mut child = Command::new(ISSUER)
-            .arg(ACTION)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| ReleaseError::CommandStart(ISSUER.into()))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| contract("identity issuer stdin unavailable"))?
-            .write_all(&input)
-            .map_err(|_| contract("identity issuer request failed"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|_| contract("identity issuer invocation failed"))?;
-        if !output.status.success() || output.stdout.len() > MAX_OUTPUT {
-            return Err(contract("identity issuer rejected client binding request"));
-        }
-        serde_json::from_slice(&output.stdout).map_err(ReleaseError::Json)
+        let _ = request;
+        Err(contract(
+            "local client binding issuer is disabled; use the EC2 transport",
+        ))
     }
 }
 
@@ -350,6 +329,468 @@ pub fn issue(
     binding_store.write(&state)?;
     zeroize_response(&mut response);
     Ok(ClientBindingProjection::from(&state))
+}
+
+const REMOTE_BINDING_REQUEST: &str = "/home/ubuntu/dirextalk-client-binding.request";
+const REMOTE_BINDING_IMPORT: &str = "/home/ubuntu/dirextalk-client-binding.import.json";
+const REMOTE_RELEASE_ROOT: &str = "/var/lib/dirextalk/vnext/releases";
+const REMOTE_HELPER_RELATIVE: &str = "scripts/production-stack/host/client-binding-issue";
+const REMOTE_CLEANUP_RELATIVE: &str = "scripts/production-stack/host/client-binding-export-cleanup";
+const REMOTE_CA_FILE: &str = "/run/dtx-client-binding/private-ca.pem";
+const CLIENT_BINDING_TTL_MILLIS: u64 = 900_000;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Ec2IssueRequest<'a> {
+    schema: &'a str,
+    schema_version: u32,
+    deployment_operation_id: &'a str,
+    tenant_id: &'a str,
+    server_origin: &'a str,
+    identity_tls_root_ca_file: &'a str,
+    ttl_millis: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ec2ImportArtifact {
+    schema: String,
+    schema_version: u32,
+    binding_id: String,
+    deployment_operation_id: String,
+    tenant_id: String,
+    server_origin: String,
+    identity_tls_root_ca_pem: String,
+    identity_tls_root_ca_sha256: String,
+    expires_at_unix_ms: u64,
+    authorization: String,
+}
+
+/// Issue a binding through the fixed production EC2 host helper.
+///
+/// The EC2 lifecycle Store lock fences this action against apply/update/destroy;
+/// the separate binding lock makes exact retries single-writer and replay-safe.
+///
+/// # Errors
+///
+/// Returns an error if the sealed lifecycle state is not terminal-successful,
+/// fixed transport evidence does not match, or protected output/state cannot be
+/// safely persisted.
+#[allow(clippy::too_many_arguments)]
+pub fn issue_ec2(
+    manifest: &AwsEc2Manifest,
+    state_dir: &Path,
+    output: &Path,
+    binding_store: &ClientBindingStore,
+    executor: &dyn AwsExecutor,
+) -> Result<ClientBindingProjection> {
+    manifest.validate()?;
+    let facts = manifest.bundle()?;
+    let ec2_store = aws_ec2::store::Store::lock(state_dir, &manifest.target)?;
+    let state = ec2_store
+        .read::<Ec2State>()?
+        .ok_or_else(|| contract("EC2 lifecycle state is missing"))?;
+    state.verify()?;
+    validate_ec2_terminal(&state, manifest, &facts)?;
+    let _binding_lock = binding_store.lock(&state.operation_id)?;
+    if let Some(existing) = binding_store.read(&state.operation_id)? {
+        validate_state(&existing)?;
+        if existing.target != state.target
+            || existing.tenant_id != state.tenant_id
+            || existing.server_origin != format!("https://{}", state.domain)
+            || existing.artifact_digest.is_empty()
+        {
+            return Err(ReleaseError::OperationConflict);
+        }
+        if existing.expires_at_unix_ms <= now_ms()? {
+            return Err(contract(
+                "client binding is no longer live; reissue requires a new operation",
+            ));
+        }
+        let bytes = read_existing_output(output)?;
+        if hex::encode(Sha256::digest(&bytes)) != existing.artifact_digest {
+            return Err(ReleaseError::OperationConflict);
+        }
+        return Ok(ClientBindingProjection::from(&existing));
+    }
+
+    let origin = format!("https://{}", state.domain);
+    validate_origin(&origin)?;
+    let request = Ec2IssueRequest {
+        schema: "dirextalk.client-binding-issue",
+        schema_version: 1,
+        deployment_operation_id: &state.operation_id,
+        tenant_id: &state.tenant_id,
+        server_origin: &origin,
+        identity_tls_root_ca_file: REMOTE_CA_FILE,
+        ttl_millis: CLIENT_BINDING_TTL_MILLIS,
+    };
+    let request_bytes = serde_json::to_vec(&request)?;
+    if request_bytes.len() > MAX_BINDING {
+        return Err(contract("client binding request exceeds size limit"));
+    }
+    let local_request =
+        ec2_store.write_artifact("client-binding.request", &request_bytes, 0o600)?;
+    let request_digest = hex::encode(Sha256::digest(&request_bytes));
+    reconcile_remote_request(
+        &state,
+        &ec2_store,
+        &local_request,
+        &request_digest,
+        request_bytes.len(),
+        executor,
+    )?;
+
+    let release = format!(
+        "{REMOTE_RELEASE_ROOT}/{}/{}",
+        facts.bundle_sha256, REMOTE_HELPER_RELATIVE
+    );
+    let cleanup = format!(
+        "{REMOTE_RELEASE_ROOT}/{}/{}",
+        facts.bundle_sha256, REMOTE_CLEANUP_RELATIVE
+    );
+    let operation = issue_remote_binding(&state, &ec2_store, &release, &cleanup, output, executor);
+    ec2_store.remove_artifact("client-binding.request")?;
+    let response = operation?;
+    let bytes = binding_bytes(&response)?;
+    write_protected_output(output, &bytes)?;
+    let state = ClientBindingState {
+        schema_version: 1,
+        operation_id: state.operation_id.clone(),
+        target: state.target.clone(),
+        tenant_id: state.tenant_id.clone(),
+        server_origin: origin,
+        artifact_digest: hex::encode(Sha256::digest(&bytes)),
+        binding_id: response.binding_id.clone(),
+        expires_at_unix_ms: response.expires_at_unix_ms,
+        state: BindingState::Issued,
+        server_receipt_digest: response.issuance_receipt_digest.clone(),
+    };
+    validate_state(&state)?;
+    binding_store.write(&state)?;
+    Ok(ClientBindingProjection::from(&state))
+}
+
+fn validate_ec2_terminal(
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &aws_ec2::bundle::BundleFacts,
+) -> Result<()> {
+    if state.target != manifest.target
+        || state.domain != manifest.domain
+        || state.phase != LifecyclePhase::Verified
+        || state.current_receipt.is_none()
+        || state.host_ready_receipt.is_none()
+        || state.current.as_ref().map(|record| &record.bundle_sha256) != Some(&facts.bundle_sha256)
+    {
+        return Err(contract(
+            "client binding requires a terminal-successful EC2 deployment",
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_remote_request(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    local: &Path,
+    digest: &str,
+    size: usize,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let metadata = executor.run(&aws_ec2::workflow::ssh_command(
+        "inspect-client-binding-request",
+        state,
+        store,
+        [
+            "/usr/bin/find",
+            "/home/ubuntu",
+            "-maxdepth",
+            "1",
+            "-type",
+            "f",
+            "-name",
+            "dirextalk-client-binding.request",
+            "-printf",
+            "%u %g %m %h %s %p\\n",
+        ],
+        false,
+        30,
+    )?)?;
+    executor.run(&aws_ec2::workflow::ssh_command(
+        "reject-client-binding-request-symlink",
+        state,
+        store,
+        ["/usr/bin/test", "!", "-L", REMOTE_BINDING_REQUEST],
+        false,
+        30,
+    )?)?;
+    if metadata.stdout.trim().is_empty() {
+        executor.run(&aws_ec2::workflow::scp_command(
+            "stage-client-binding-request",
+            state,
+            store,
+            local,
+            REMOTE_BINDING_REQUEST,
+        )?)?;
+        executor.run(&aws_ec2::workflow::ssh_command(
+            "protect-client-binding-request",
+            state,
+            store,
+            ["/usr/bin/chmod", "0400", REMOTE_BINDING_REQUEST],
+            true,
+            30,
+        )?)?;
+    }
+    executor.run(&aws_ec2::workflow::ssh_command(
+        "verify-client-binding-request-regular",
+        state,
+        store,
+        ["/usr/bin/test", "-f", REMOTE_BINDING_REQUEST],
+        false,
+        30,
+    )?)?;
+    executor.run(&aws_ec2::workflow::ssh_command(
+        "verify-client-binding-request-not-symlink",
+        state,
+        store,
+        ["/usr/bin/test", "!", "-L", REMOTE_BINDING_REQUEST],
+        false,
+        30,
+    )?)?;
+    let metadata = executor.run(&aws_ec2::workflow::ssh_command(
+        "verify-client-binding-request",
+        state,
+        store,
+        [
+            "/usr/bin/stat",
+            "--format=%u %g %a %h %s",
+            REMOTE_BINDING_REQUEST,
+        ],
+        false,
+        30,
+    )?)?;
+    let fields = metadata.stdout.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5
+        || fields[0] != "1000"
+        || fields[1] != "1000"
+        || fields[2] != "400"
+        || fields[3] != "1"
+        || fields[4].parse::<usize>().ok() != Some(size)
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    verify_remote_hash(
+        state,
+        store,
+        executor,
+        "hash-client-binding-request",
+        REMOTE_BINDING_REQUEST,
+        digest,
+    )
+}
+
+fn verify_remote_hash(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    executor: &dyn AwsExecutor,
+    id: &str,
+    path: &str,
+    expected: &str,
+) -> Result<()> {
+    let output = executor.run(&aws_ec2::workflow::ssh_command(
+        id,
+        state,
+        store,
+        ["/usr/bin/sha256sum", path],
+        false,
+        30,
+    )?)?;
+    let mut fields = output.stdout.split_ascii_whitespace();
+    if fields.next() != Some(expected) || fields.next() != Some(path) || fields.next().is_some() {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(())
+}
+
+fn issue_remote_binding(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    helper: &str,
+    cleanup: &str,
+    output: &Path,
+    executor: &dyn AwsExecutor,
+) -> Result<ClientBindingIssueResponse> {
+    let run = aws_ec2::workflow::ssh_command(
+        "run-client-binding-issue",
+        state,
+        store,
+        ["/usr/bin/sudo", "--non-interactive", helper],
+        true,
+        900,
+    )
+    .and_then(|command| executor.run(&command));
+    let result = run.and_then(|_| pull_import(state, store, output, executor));
+    let cleaned = aws_ec2::workflow::ssh_command(
+        "cleanup-client-binding-export",
+        state,
+        store,
+        ["/usr/bin/sudo", "--non-interactive", cleanup],
+        true,
+        120,
+    )
+    .and_then(|command| executor.run(&command));
+    match (result, cleaned) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(_)) => Err(contract("client binding cleanup failed")),
+        (Ok(response), Ok(_)) => Ok(response),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn pull_import(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    output: &Path,
+    executor: &dyn AwsExecutor,
+) -> Result<ClientBindingIssueResponse> {
+    executor.run(&aws_ec2::workflow::ssh_command(
+        "verify-client-binding-import-regular",
+        state,
+        store,
+        ["/usr/bin/test", "-f", REMOTE_BINDING_IMPORT],
+        false,
+        30,
+    )?)?;
+    executor.run(&aws_ec2::workflow::ssh_command(
+        "verify-client-binding-import-not-symlink",
+        state,
+        store,
+        ["/usr/bin/test", "!", "-L", REMOTE_BINDING_IMPORT],
+        false,
+        30,
+    )?)?;
+    let metadata = executor.run(&aws_ec2::workflow::ssh_command(
+        "inspect-client-binding-import",
+        state,
+        store,
+        [
+            "/usr/bin/stat",
+            "--format=%u %g %a %h %s",
+            REMOTE_BINDING_IMPORT,
+        ],
+        false,
+        30,
+    )?)?;
+    let fields = metadata.stdout.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5
+        || fields[0] != "1000"
+        || fields[1] != "1000"
+        || fields[2] != "400"
+        || fields[3] != "1"
+        || fields[4]
+            .parse::<usize>()
+            .ok()
+            .is_none_or(|size| size == 0 || size > MAX_BINDING)
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let remote_size = fields[4]
+        .parse::<usize>()
+        .map_err(|_| ReleaseError::OperationConflict)?;
+    let remote_hash = executor.run(&aws_ec2::workflow::ssh_command(
+        "hash-client-binding-import",
+        state,
+        store,
+        ["/usr/bin/sha256sum", REMOTE_BINDING_IMPORT],
+        false,
+        30,
+    )?)?;
+    let mut hash_fields = remote_hash.stdout.split_ascii_whitespace();
+    let expected_digest = hash_fields
+        .next()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or(ReleaseError::OperationConflict)?
+        .to_owned();
+    if hash_fields.next() != Some(REMOTE_BINDING_IMPORT) || hash_fields.next().is_some() {
+        return Err(ReleaseError::OperationConflict);
+    }
+    validate_output_path(output)?;
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(io_error(parent))?;
+    let temp = output.with_file_name(format!(
+        ".{}.client-binding.tmp",
+        output.file_name().unwrap().to_string_lossy()
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
+        .map_err(io_error(&temp))?;
+    drop(file);
+    let result = (|| {
+        executor.run(&aws_ec2::workflow::scp_from_command(
+            "pull-client-binding-import",
+            state,
+            store,
+            REMOTE_BINDING_IMPORT,
+            &temp,
+        )?)?;
+        let bytes = fs::read(&temp).map_err(io_error(&temp))?;
+        validate_output_file(&File::open(&temp).map_err(io_error(&temp))?)?;
+        if bytes.len() != remote_size
+            || hex::encode(Sha256::digest(&bytes)) != expected_digest
+            || bytes.is_empty()
+            || bytes.len() > MAX_BINDING
+        {
+            return Err(contract("client binding import is invalid"));
+        }
+        let artifact: Ec2ImportArtifact = serde_json::from_slice(&bytes)?;
+        let receipt_digest = hex::encode(Sha256::digest(&bytes));
+        let response = ClientBindingIssueResponse {
+            schema: artifact.schema,
+            schema_version: artifact.schema_version,
+            binding_id: artifact.binding_id,
+            deployment_operation_id: artifact.deployment_operation_id,
+            tenant_id: artifact.tenant_id,
+            server_origin: artifact.server_origin,
+            identity_tls_root_ca_pem: artifact.identity_tls_root_ca_pem,
+            identity_tls_root_ca_sha256: artifact.identity_tls_root_ca_sha256,
+            expires_at_unix_ms: artifact.expires_at_unix_ms,
+            authorization: artifact.authorization,
+            issuance_receipt_digest: receipt_digest,
+        };
+        let request = ClientBindingIssueRequest {
+            deployment_operation_id: response.deployment_operation_id.clone(),
+            target: state.target.clone(),
+            tenant_id: response.tenant_id.clone(),
+            server_origin: response.server_origin.clone(),
+            artifact_digest: state.desired.bundle_sha256.clone(),
+        };
+        validate_response(&response, &request)?;
+        Ok(response)
+    })();
+    let _ = fs::remove_file(&temp);
+    result
+}
+
+fn read_existing_output(path: &Path) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| ReleaseError::OperationConflict)?;
+    validate_output_file(&file)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BINDING as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReleaseError::OperationConflict)?;
+    if bytes.len() > MAX_BINDING {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(bytes)
 }
 
 fn validate_terminal_operation(
@@ -659,5 +1100,54 @@ mod tests {
         ] {
             assert!(validate_origin(origin).is_err());
         }
+    }
+
+    #[test]
+    fn ec2_issue_request_has_only_fixed_server_fields() {
+        let request = Ec2IssueRequest {
+            schema: "dirextalk.client-binding-issue",
+            schema_version: 1,
+            deployment_operation_id: "018f856e-e0bd-71d2-9428-58d50cf77eaf",
+            tenant_id: "018f856e-e0bd-71d2-9428-58d50cf77eaf",
+            server_origin: "https://example.com",
+            identity_tls_root_ca_file: REMOTE_CA_FILE,
+            ttl_millis: CLIENT_BINDING_TTL_MILLIS,
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&request).expect("request serialization"))
+                .expect("request JSON");
+        assert_eq!(
+            value
+                .as_object()
+                .expect("request object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec![
+                "deployment_operation_id",
+                "identity_tls_root_ca_file",
+                "schema",
+                "schema_version",
+                "server_origin",
+                "tenant_id",
+                "ttl_millis",
+            ]
+        );
+        assert_eq!(value["identity_tls_root_ca_file"], REMOTE_CA_FILE);
+    }
+
+    #[test]
+    fn local_issuer_path_is_fail_closed() {
+        let executor = ProductionClientBindingExecutor;
+        let request = ClientBindingIssueRequest {
+            deployment_operation_id: "018f856e-e0bd-71d2-9428-58d50cf77eaf".into(),
+            target: "x6".into(),
+            tenant_id: "018f856e-e0bd-71d2-9428-58d50cf77eaf".into(),
+            server_origin: "https://example.com".into(),
+            artifact_digest: "0".repeat(64),
+        };
+        assert!(matches!(
+            executor.issue(&request),
+            Err(ReleaseError::Deployment(message)) if message.contains("EC2 transport")
+        ));
     }
 }
