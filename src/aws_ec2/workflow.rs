@@ -1693,7 +1693,7 @@ pub fn recover_runtime_011_to_014(
     let store = Store::lock(state_dir, &manifest.target)?;
     let mut state = load_state(&store, manifest)?;
     admit_runtime_recovery(&state, manifest, &facts, &store)?;
-    authenticate_update_recovery_artifacts(&store, &state, manifest)?;
+    authenticate_runtime_recovery_evidence(&store, &state, manifest, &facts)?;
     if !execute {
         let bytes =
             read_hash_bound_helper(helper, RUNTIME_RECOVERY_SHA256, "runtime recovery helper")?;
@@ -1805,15 +1805,14 @@ fn admit_runtime_recovery(
     state: &Ec2State,
     manifest: &AwsEc2Manifest,
     facts: &BundleFacts,
-    store: &Store,
+    _store: &Store,
 ) -> Result<()> {
     state.verify()?;
-    if state.pending_effect.as_deref().is_some_and(|effect| {
-        !matches!(
-            effect,
-            "run-fixed-runtime-recovery-011-to-014" | "run-fixed-runtime-attester-011-to-014"
-        )
-    }) {
+    if state
+        .pending_effect
+        .as_deref()
+        .is_some_and(|effect| !runtime_recovery_pending_effect(effect))
+    {
         return Err(contract(
             "runtime recovery has an unexpected pending effect",
         ));
@@ -1845,22 +1844,106 @@ fn admit_runtime_recovery(
             "runtime recovery receipt chain is not exactly 0.1.1 to 0.1.4",
         ));
     }
+    Ok(())
+}
+
+fn runtime_recovery_pending_effect(effect: &str) -> bool {
+    matches!(
+        effect,
+        "clear-upload-runtime-recovery-011-to-014"
+            | "stage-runtime-recovery-011-to-014"
+            | "protect-uploaded-runtime-recovery-011-to-014"
+            | "clear-atomic-runtime-recovery-011-to-014"
+            | "prepare-atomic-runtime-recovery-011-to-014"
+            | "activate-runtime-recovery-011-to-014"
+            | "clear-upload-runtime-attester-011-to-014"
+            | "stage-runtime-attester-011-to-014"
+            | "protect-uploaded-runtime-attester-011-to-014"
+            | "clear-atomic-runtime-attester-011-to-014"
+            | "prepare-atomic-runtime-attester-011-to-014"
+            | "activate-runtime-attester-011-to-014"
+            | "run-fixed-runtime-recovery-011-to-014"
+            | "run-fixed-runtime-attester-011-to-014"
+    )
+}
+
+#[cfg(test)]
+mod runtime_recovery_pending_tests {
+    use super::runtime_recovery_pending_effect;
+
+    #[test]
+    fn accepts_only_exact_recovery_helper_effect_ids() {
+        for effect in [
+            "clear-upload-runtime-recovery-011-to-014",
+            "stage-runtime-recovery-011-to-014",
+            "protect-uploaded-runtime-recovery-011-to-014",
+            "clear-atomic-runtime-recovery-011-to-014",
+            "prepare-atomic-runtime-recovery-011-to-014",
+            "activate-runtime-recovery-011-to-014",
+            "clear-upload-runtime-attester-011-to-014",
+            "stage-runtime-attester-011-to-014",
+            "protect-uploaded-runtime-attester-011-to-014",
+            "clear-atomic-runtime-attester-011-to-014",
+            "prepare-atomic-runtime-attester-011-to-014",
+            "activate-runtime-attester-011-to-014",
+            "run-fixed-runtime-recovery-011-to-014",
+            "run-fixed-runtime-attester-011-to-014",
+        ] {
+            assert!(runtime_recovery_pending_effect(effect));
+        }
+        for effect in [
+            "run-fixed-runtime-recovery",
+            "stage-runtime-attester-011-to-014-extra",
+            "destroy-instance",
+        ] {
+            assert!(!runtime_recovery_pending_effect(effect));
+        }
+    }
+}
+
+fn authenticate_runtime_recovery_evidence(
+    store: &Store,
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+) -> Result<()> {
+    let current = state
+        .current
+        .as_ref()
+        .ok_or_else(|| contract("current candidate is absent"))?;
+    let current_receipt = state
+        .current_receipt
+        .as_ref()
+        .ok_or_else(|| contract("current receipt is absent"))?;
+    let previous_receipt = state
+        .previous_receipt
+        .as_ref()
+        .ok_or_else(|| contract("previous receipt is absent"))?;
     let (Some(bundle_suffix), Some(request_suffix)) =
         (&state.current_bundle_suffix, &state.current_request_suffix)
     else {
-        return Err(contract(
-            "runtime recovery authenticated artifacts are absent",
-        ));
+        return Err(contract("runtime recovery current artifacts are absent"));
     };
     authenticate_bundle_artifact(store, manifest, current, bundle_suffix)?;
-    authenticate_install_request_artifact(
+    let request = authenticate_install_request_artifact(
         store,
         state,
         current,
         request_suffix,
-        current_receipt.previous_receipt_sha256.as_deref(),
+        Some(&previous_receipt.receipt_sha256),
     )?;
-    Ok(())
+    if InstalledReceipt::parse_and_verify(
+        &canonical_json(current_receipt)?,
+        &request,
+        ReceiptState::Installed,
+    )? != *current_receipt
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    if current != &state.desired || current.bundle_sha256 != facts.bundle_sha256 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    authenticate_update_recovery_artifacts(store, state, manifest)
 }
 
 pub(crate) fn attest_runtime_011_to_014_locked(
@@ -1871,6 +1954,7 @@ pub(crate) fn attest_runtime_011_to_014_locked(
     executor: &dyn AwsExecutor,
 ) -> Result<()> {
     admit_runtime_recovery(state, manifest, facts, store)?;
+    authenticate_runtime_recovery_evidence(store, state, manifest, facts)?;
     // A missing or substituted helper is never self-healed here: recovery is
     // the sole authority that seals and stages this exceptional executable.
     let sealed =
@@ -3657,13 +3741,27 @@ fn authenticate_update_recovery_artifacts(
         .as_deref()
         .ok_or_else(|| contract("candidate request fact is absent"))?;
     authenticate_bundle_artifact(store, manifest, &state.desired, candidate_bundle_suffix)?;
-    authenticate_install_request_artifact(
+    let candidate_request = authenticate_install_request_artifact(
         store,
         state,
         &state.desired,
         candidate_request_suffix,
         Some(&retained_receipt.receipt_sha256),
     )?;
+    if state.current.as_ref() == Some(&state.desired) {
+        let candidate_receipt = state
+            .current_receipt
+            .as_ref()
+            .ok_or_else(|| contract("candidate receipt fact is absent"))?;
+        if InstalledReceipt::parse_and_verify(
+            &canonical_json(candidate_receipt)?,
+            &candidate_request,
+            ReceiptState::Installed,
+        )? != *candidate_receipt
+        {
+            return Err(ReleaseError::OperationConflict);
+        }
+    }
     Ok(())
 }
 

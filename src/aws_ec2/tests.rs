@@ -27,17 +27,11 @@ const STACK_INSTALLER: &str = "scripts/production-stack/install.sh";
 fn admitted_cross_version_bootstrap(manifest: &mut AwsEc2Manifest) {
     let dir = tempfile::tempdir().expect("legacy bootstrap tempdir");
     let path = dir.path().join("install-vnext");
-    let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            "/home/adam/dirextalk/dirextalk-vnext-server",
-            "show",
-            "ff51245ca7ce03301692e970e2e411b0175d0b8e:scripts/production-stack/host/install-vnext",
-        ])
-        .output()
-        .expect("legacy bootstrap source");
-    assert!(output.status.success());
-    fs::write(&path, output.stdout).expect("legacy bootstrap fixture");
+    fs::write(
+        &path,
+        include_bytes!("../../tests/fixtures/legacy/cross-version-install-vnext"),
+    )
+    .expect("legacy bootstrap fixture");
     assert_eq!(
         hash(&fs::read(&path).expect("admitted bootstrap")),
         CROSS_VERSION_BOOTSTRAP_SHA256

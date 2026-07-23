@@ -1918,6 +1918,51 @@ mod tests {
         }
         let bundle = archive.into_inner().expect("bundle");
         let bundle_path = root.path().join("dirextalk-vnext.bundle");
+        let mut prior_stack_manifest = stack_manifest.clone();
+        prior_stack_manifest.version = "0.1.1".into();
+        let mut prior_archive = tar::Builder::new(Vec::new());
+        for directory in [
+            "dirextalk-vnext-stack",
+            "dirextalk-vnext-stack/docker",
+            "dirextalk-vnext-stack/docker/production",
+            "dirextalk-vnext-stack/scripts",
+            "dirextalk-vnext-stack/scripts/production-stack",
+            "dirextalk-vnext-stack/scripts/production-stack/host",
+        ] {
+            append_bundle_directory(&mut prior_archive, directory);
+        }
+        append_bundle_file(
+            &mut prior_archive,
+            "dirextalk-vnext-stack/manifest.json",
+            0o444,
+            &canonical_bundle_json(&prior_stack_manifest),
+        );
+        for (path, mode, bytes) in [
+            (
+                "dirextalk-vnext-stack/docker/production/docker-compose.yml",
+                0o444,
+                compose.as_slice(),
+            ),
+            (
+                "dirextalk-vnext-stack/scripts/production-stack/host/client-binding-export-cleanup",
+                0o555,
+                cleanup_helper.as_slice(),
+            ),
+            (
+                "dirextalk-vnext-stack/scripts/production-stack/host/client-binding-issue",
+                0o555,
+                issue_helper.as_slice(),
+            ),
+            (
+                "dirextalk-vnext-stack/scripts/production-stack/install.sh",
+                0o555,
+                installer.as_slice(),
+            ),
+        ] {
+            append_bundle_file(&mut prior_archive, path, mode, bytes);
+        }
+        let prior_bundle = prior_archive.into_inner().expect("prior bundle");
+        let prior_bundle_path = root.path().join("dirextalk-vnext-011.bundle");
         let host_installer_path = root.path().join("install-vnext");
         let host_provisioner_path = root.path().join("provision-vnext");
         let receipt_reader_path = root.path().join("read-vnext-receipt");
@@ -1925,6 +1970,7 @@ mod tests {
         let host_provisioner = b"#!/bin/sh\nexit 0\n";
         let receipt_reader = b"#!/bin/sh\nexit 0\n";
         fs::write(&bundle_path, &bundle).expect("bundle write");
+        fs::write(&prior_bundle_path, &prior_bundle).expect("prior bundle write");
         fs::write(&host_installer_path, host_installer).expect("host installer");
         fs::write(&host_provisioner_path, host_provisioner).expect("host provisioner");
         fs::write(&receipt_reader_path, receipt_reader).expect("receipt reader");
@@ -1959,6 +2005,11 @@ mod tests {
             key_name: "x6-key".into(),
         };
         let facts = manifest.bundle().expect("bundle facts");
+        let mut prior_manifest = manifest.clone();
+        prior_manifest.stack_bundle_path = prior_bundle_path;
+        prior_manifest.stack_bundle_sha256 = hash(&prior_bundle);
+        prior_manifest.release_version = "0.1.1".into();
+        let prior_facts = prior_manifest.bundle().expect("prior bundle facts");
         let operation_id = "018f856e-e0bd-71d2-9428-58d50cf77eaf".to_owned();
         let tenant_id = operation_id.clone();
         let mut ownership_tags = BTreeMap::new();
@@ -1971,10 +2022,7 @@ mod tests {
         );
         ownership_tags.insert("DirextalkDomain".into(), manifest.domain.clone());
         let desired = aws_ec2::BundleRecord::from_facts(&facts, &manifest);
-        let mut previous = desired.clone();
-        previous.version = "0.1.1".into();
-        previous.bundle_sha256 = "9".repeat(64);
-        previous.manifest_sha256 = "8".repeat(64);
+        let previous = aws_ec2::BundleRecord::from_facts(&prior_facts, &prior_manifest);
         let receipt = |version: &str,
                        bundle_sha256: String,
                        manifest_sha256: String,
@@ -2060,10 +2108,10 @@ mod tests {
             ),
             current_bundle_suffix: Some("current.bundle".into()),
             current_request_suffix: Some("current.request".into()),
-            previous_bundle_suffix: None,
-            previous_request_suffix: None,
-            candidate_bundle_suffix: None,
-            candidate_request_suffix: None,
+            previous_bundle_suffix: Some("previous.bundle".into()),
+            previous_request_suffix: Some("previous.request".into()),
+            candidate_bundle_suffix: Some("candidate.bundle".into()),
+            candidate_request_suffix: Some("candidate.request".into()),
             provision_request_suffix: None,
             phase: LifecyclePhase::Verified,
             pending_effect: None,
@@ -2143,6 +2191,14 @@ mod tests {
                 &facts.bundle_sha256,
             )
             .expect("current bundle");
+        let previous_bundle = fixture.state.previous.as_ref().expect("previous bundle");
+        store
+            .copy_artifact(
+                "previous.bundle",
+                &fixture.root.path().join("dirextalk-vnext-011.bundle"),
+                &previous_bundle.bundle_sha256,
+            )
+            .expect("previous bundle");
         let previous = fixture
             .state
             .previous_receipt
@@ -2160,18 +2216,46 @@ mod tests {
                 0o600,
             )
             .expect("current request");
-        let helper = std::process::Command::new("git")
-            .args([
-                "-C",
-                "/home/adam/dirextalk/dirextalk-vnext-server",
-                "show",
-                "f36b1c8:scripts/production-stack/host/install-vnext",
-            ])
-            .output()
-            .expect("runtime helper source");
-        assert!(helper.status.success());
         store
-            .write_artifact("runtime-recovery-011-to-014", &helper.stdout, 0o600)
+            .copy_artifact(
+                "candidate.bundle",
+                &fixture.manifest.stack_bundle_path,
+                &facts.bundle_sha256,
+            )
+            .expect("candidate bundle");
+        store
+            .write_artifact(
+                "candidate.request",
+                &request.canonical_bytes().expect("candidate request"),
+                0o600,
+            )
+            .expect("candidate request");
+        let prior_request = InstallRequest {
+            schema: "dirextalk.vnext-install-request".into(),
+            schema_version: 1,
+            target: "linux-amd64".into(),
+            domain: fixture.state.domain.clone(),
+            version: previous_bundle.version.clone(),
+            source_commit: previous_bundle.source_commit.clone(),
+            bundle_sha256: previous_bundle.bundle_sha256.clone(),
+            manifest_sha256: previous_bundle.manifest_sha256.clone(),
+            server_image: previous_bundle.server_image.clone(),
+            migrator_image: previous_bundle.migrator_image.clone(),
+            previous_receipt_sha256: None,
+        };
+        store
+            .write_artifact(
+                "previous.request",
+                &prior_request.canonical_bytes().expect("previous request"),
+                0o600,
+            )
+            .expect("previous request");
+        store
+            .write_artifact(
+                "runtime-recovery-011-to-014",
+                include_bytes!("../tests/fixtures/runtime-recovery/install-vnext"),
+                0o600,
+            )
             .expect("sealed runtime helper");
         store.write(&fixture.state).expect("EC2 state");
     }
