@@ -117,6 +117,17 @@ It performs V2 prepare, ordinary V1 start, independent V1 Running observation,
 and V2 finalize. No secret handoff, enrollment token, bearer, raw receipt, or
 operator output is written to state or printed.
 
+## Client binding issue
+
+After a terminal-successful Server deployment, the root-only
+`deployment-client-binding-issue --execute` action invokes the fixed
+server-owned `dtx-identity-provision client-binding-issue` typed transport. It
+validates the operation, target, tenant, and canonical HTTPS origin, then writes
+one short-lived client-binding JSON artifact as a no-follow operator-local
+`0600` file. Authorization, PEM contents, and the secret-bearing output path
+are never printed or retained in durable state; replay is exact and conflicts
+fail closed.
+
 ## Current boundary
 
 The generic offline deployment foundation owns release artifact planning,
