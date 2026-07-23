@@ -12,14 +12,22 @@ use std::{
     io::Read,
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::{ReleaseError, Result, error::io_error};
 use bundle::{BundleFacts, InstalledReceipt, ReceiptState, digest, image, load_bundle};
@@ -251,43 +259,69 @@ impl RegistryExecutor for ProductionRegistryExecutor {
 }
 
 fn run_process(program: &str, argv: &[&str], timeout: Duration) -> Result<ExecOutput> {
-    let mut child = Command::new(program)
+    enum Completion {
+        Status(std::process::ExitStatus),
+        Timeout,
+        WaitError(std::io::Error),
+    }
+
+    let mut command = Command::new(program);
+    command
         .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|_| ReleaseError::CommandStart(program.into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| contract("external command output pipe is unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| contract("external command output pipe is unavailable"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        terminate_process_tree(&mut child);
+        return Err(contract("external command output pipe is unavailable"));
+    };
+    #[cfg(unix)]
+    if set_nonblocking(&stdout).is_err() || set_nonblocking(&stderr).is_err() {
+        terminate_process_tree(&mut child);
+        return Err(contract("external command output pipe setup failed"));
+    }
+    let cancel_readers = Arc::new(AtomicBool::new(false));
     let stdout_program = program.to_owned();
     let stderr_program = program.to_owned();
-    let stdout_reader = thread::spawn(move || read_output(stdout, &stdout_program));
-    let stderr_reader = thread::spawn(move || read_output(stderr, &stderr_program));
+    let stdout_cancel = Arc::clone(&cancel_readers);
+    let stderr_cancel = Arc::clone(&cancel_readers);
+    let stdout_reader = thread::spawn(move || read_output(stdout, &stdout_program, &stdout_cancel));
+    let stderr_reader = thread::spawn(move || read_output(stderr, &stderr_program, &stderr_cancel));
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(io_error(program))? {
-            break status;
+    let completion = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Completion::Status(status),
+            Ok(None) if Instant::now() >= deadline => break Completion::Timeout,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => break Completion::WaitError(error),
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(contract(&format!("{program} deadline exceeded")));
-        }
-        thread::sleep(Duration::from_millis(10));
     };
-    let stdout = stdout_reader
+    if !matches!(completion, Completion::Status(_)) {
+        terminate_process_tree(&mut child);
+    }
+    cancel_readers.store(true, Ordering::Release);
+    let stdout_result = stdout_reader
         .join()
-        .map_err(|_| contract("external command stdout reader failed"))??;
-    let stderr = stderr_reader
+        .map_err(|_| contract("external command stdout reader failed"))
+        .and_then(|result| result);
+    let stderr_result = stderr_reader
         .join()
-        .map_err(|_| contract("external command stderr reader failed"))??;
+        .map_err(|_| contract("external command stderr reader failed"))
+        .and_then(|result| result);
+    let mut stdout = stdout_result?;
+    let mut stderr = stderr_result?;
+    let status = match completion {
+        Completion::Status(status) => status,
+        Completion::Timeout => return Err(contract(&format!("{program} deadline exceeded"))),
+        Completion::WaitError(error) => return Err(io_error(program)(error)),
+    };
     if !status.success() {
         if program == DOCKER {
             return Err(classify_registry_failure(&stderr));
@@ -299,26 +333,61 @@ fn run_process(program: &str, argv: &[&str], timeout: Duration) -> Result<ExecOu
     }
     Ok(ExecOutput {
         status: status.code().unwrap_or(1),
-        stdout,
-        stderr,
+        stdout: std::mem::take(&mut *stdout),
+        stderr: std::mem::take(&mut *stderr),
     })
 }
 
-fn read_output(mut stream: impl Read, program: &str) -> Result<String> {
-    let mut bytes = Vec::new();
-    stream
-        .by_ref()
-        .take(MAX_OUTPUT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io_error(program))?;
-    if bytes.len() as u64 > MAX_OUTPUT {
-        return Err(contract("external command output exceeded the fixed limit"));
+fn terminate_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    let _ = rustix::process::kill_process_group(
+        rustix::process::Pid::from_child(child),
+        rustix::process::Signal::KILL,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn set_nonblocking(stream: &impl std::os::fd::AsFd) -> Result<()> {
+    let flags = rustix::fs::fcntl_getfl(stream)
+        .map_err(|_| contract("external command output pipe setup failed"))?;
+    rustix::fs::fcntl_setfl(stream, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|_| contract("external command output pipe setup failed"))
+}
+
+fn read_output(
+    mut stream: impl Read,
+    program: &str,
+    cancel: &AtomicBool,
+) -> Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    let mut chunk = Zeroizing::new([0_u8; 8 * 1024]);
+    loop {
+        match stream.read(chunk.as_mut()) {
+            Ok(0) => break,
+            Ok(count) => {
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.len() as u64 > MAX_OUTPUT {
+                    return Err(contract("external command output exceeded the fixed limit"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(io_error(program)(error)),
+        }
     }
-    String::from_utf8(bytes).map_err(|_| contract("external command output is not UTF-8"))
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| contract("external command output is not UTF-8"))?;
+    Ok(Zeroizing::new(text.to_owned()))
 }
 
 fn classify_registry_failure(stderr: &str) -> ReleaseError {
-    let lower = stderr.to_ascii_lowercase();
+    let lower = Zeroizing::new(stderr.to_ascii_lowercase());
     if lower.contains("unauthorized") || lower.contains("authentication required") {
         contract("Docker Hub latest discovery authentication failed")
     } else if lower.contains("too many requests") || lower.contains("rate limit") {

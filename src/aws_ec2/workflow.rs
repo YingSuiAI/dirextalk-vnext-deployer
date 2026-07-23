@@ -2478,7 +2478,8 @@ pub(crate) fn scp_from_command(
         .ok_or_else(|| contract("EIP state is missing"))?;
     let private = store.artifact_path(PRIVATE_KEY_SUFFIX)?;
     let known_hosts = store.artifact_path(KNOWN_HOSTS_SUFFIX)?;
-    let local = fs::canonicalize(local).map_err(crate::error::io_error(local))?;
+    let local = fs::canonicalize(local)
+        .map_err(|_| contract("client binding SCP staging path is unavailable"))?;
     Ok(FixedCommand::new(
         id,
         SCP,
