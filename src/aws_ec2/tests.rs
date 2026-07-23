@@ -164,7 +164,16 @@ fn fixture_with_directories(
         ),
         migrator_image: format!("dirextalk/vnet-server@sha256:{}", "c".repeat(64)),
         installer_sha256: hash(stack_installer),
-        cross_version_compatibility: None,
+        cross_version_compatibility: matches!(version, "0.1.1" | "0.1.4").then(|| {
+            bundle::CrossVersionCompatibility {
+                schema: "dirextalk.vnext.cross-version-compatibility".into(),
+                schema_version: 1,
+                retained_version: "0.1.1".into(),
+                candidate_version: "0.1.4".into(),
+                forward_migrations_only: true,
+                code_only_rollback: true,
+            }
+        }),
         files,
     };
     let mut tar = tar::Builder::new(Vec::new());
@@ -405,6 +414,107 @@ fn rebind_state(
 struct ExistingReceipt {
     receipt: String,
     calls: Mutex<Vec<String>>,
+}
+
+struct UpdateReplayExecutor {
+    receipt: String,
+    ready: String,
+    calls: Mutex<Vec<String>>,
+}
+impl AwsExecutor for UpdateReplayExecutor {
+    fn run(&self, command: &FixedCommand) -> Result<ExecOutput> {
+        self.calls.lock().expect("calls").push(command.id.clone());
+        let stdout = match command.id.as_str() {
+            "check-authenticated-update-capacity" => "Avail IAvail\n134217728 128\n".into(),
+            "inspect-current-installed-receipt" => format!(
+                "f root root 600 1 {} {}\n",
+                self.receipt.len(),
+                REMOTE_CURRENT_RECEIPT
+            ),
+            "read-existing-installed-receipt" | "verify-authenticated-installed-receipt" => {
+                self.receipt.clone()
+            }
+            "verify-caller-account" => "{\"Account\":\"123456789012\"}".into(),
+            "verify-dns-to-owned-eip" => "203.0.113.8 STREAM x\n".into(),
+            "verify-system-tls-https-health" | "verify-host-ready-receipt-regular-file" => {
+                String::new()
+            }
+            "verify-host-ready-receipt-metadata" => format!("0 0 600 1 {}\n", self.ready.len()),
+            "read-sanitized-host-ready-receipt" => self.ready.clone(),
+            _ => return Err(contract("unexpected update replay command")),
+        };
+        Ok(ExecOutput {
+            status: 0,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
+fn ready_for(request: &ProvisionRequest) -> HostReadyReceipt {
+    let mut ready = HostReadyReceipt {
+        schema: "dirextalk.vnext-host-provision-ready".into(),
+        schema_version: 1,
+        state: "ready".into(),
+        request_sha256: request.sha256().expect("sha"),
+        target: request.target.clone(),
+        domain: request.domain.clone(),
+        tenant_id: request.tenant_id.clone(),
+        indexer_id: request.indexer_id.clone(),
+        release_version: request.release_version.clone(),
+        bundle_sha256: request.bundle_sha256.clone(),
+        compose_sha256: request.compose_sha256.clone(),
+        receipt_sha256: String::new(),
+    };
+    let mut body = serde_json::to_value(&ready).expect("value");
+    body.as_object_mut().expect("obj").remove("receipt_sha256");
+    ready.receipt_sha256 = hash(&canonical(&body));
+    ready
+}
+
+fn update_ready_state(
+    dir: &TempDir,
+    old: &AwsEc2Manifest,
+) -> (PathBuf, Ec2State, InstallRequest, ProvisionRequest) {
+    let facts = old.bundle().expect("facts");
+    let state_dir = dir.path().join("update-state");
+    let mut state = apply(old, &state_dir, 100, false, &Never(AtomicUsize::new(0))).expect("state");
+    state.account_id = Some("123456789012".into());
+    state.private_ipv4 = Some("10.0.0.7".into());
+    state.eip = Some(EipRecord {
+        allocation_id: "eipalloc-1".into(),
+        association_id: "eipassoc-1".into(),
+        public_ip: "203.0.113.8".into(),
+    });
+    let request = InstallRequest::new(&old.domain, &facts, None);
+    let provision = ProvisionRequest::new(old, &state, &facts).expect("provision");
+    let ready = ready_for(&provision);
+    state.current = Some(BundleRecord::from_facts(&facts, old));
+    state.current_receipt = Some(receipt_for(&request, ReceiptState::Installed));
+    state.current_bundle_suffix = Some("current.bundle".into());
+    state.current_request_suffix = Some("current.request".into());
+    state.provision_request_suffix = Some("current.provision".into());
+    state.host_ready_receipt = Some(ready);
+    state.phase = LifecyclePhase::Verified;
+    state = state.seal().expect("seal");
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    store
+        .write_artifact(
+            "current.request",
+            &request.canonical_bytes().expect("request"),
+            0o600,
+        )
+        .expect("artifact");
+    store
+        .write_artifact(
+            "current.provision",
+            &provision.canonical_bytes().expect("provision"),
+            0o600,
+        )
+        .expect("artifact");
+    store.write(&state).expect("state");
+    drop(store);
+    (state_dir, state, request, provision)
 }
 
 impl AwsExecutor for ExistingReceipt {
@@ -908,6 +1018,77 @@ fn update_capacity_parser_enforces_exact_bytes_inodes_and_rejects_invalid_values
         "",
     ] {
         assert!(workflow::parse_update_capacity(output).is_err());
+    }
+}
+
+#[test]
+fn executable_cross_version_update_replays_update_installing_and_verifying_without_installer_effect()
+ {
+    let (dir, old) = fixture("0.1.1", 'a');
+    let (state_dir, mut state, _old_request, provision) = update_ready_state(&dir, &old);
+    let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
+    let facts = candidate.bundle().expect("candidate facts");
+    let request = InstallRequest::new(
+        &candidate.domain,
+        &facts,
+        Some(
+            state
+                .current_receipt
+                .as_ref()
+                .expect("prior")
+                .receipt_sha256
+                .clone(),
+        ),
+    );
+    let receipt = String::from_utf8(canonical(&receipt_for(&request, ReceiptState::Installed)))
+        .expect("receipt");
+    let ready = String::from_utf8(canonical(&ready_for(&provision))).expect("ready");
+    let executor = UpdateReplayExecutor {
+        receipt,
+        ready,
+        calls: Mutex::new(Vec::new()),
+    };
+    let updated = update(&candidate, &state_dir, true, &executor).expect("successful update");
+    assert_eq!(updated.phase, LifecyclePhase::Verified);
+    assert_eq!(updated.current.as_ref().expect("current").version, "0.1.4");
+    assert_eq!(
+        updated.previous.as_ref().expect("previous").version,
+        "0.1.1"
+    );
+    assert!(
+        !executor
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|id| id.contains("stage-") || id == "run-fixed-stack-installer")
+    );
+    // Persisted restart from either durable boundary reuses the authenticated candidate receipt.
+    for phase in [
+        LifecyclePhase::UpdateInstalling,
+        LifecyclePhase::UpdateVerifying,
+    ] {
+        state.phase = phase;
+        state.desired = BundleRecord::from_facts(&facts, &candidate);
+        state.previous = state.current.clone();
+        state.previous_receipt = state.current_receipt.clone();
+        state.previous_bundle_suffix = state.current_bundle_suffix.clone();
+        state.previous_request_suffix = state.current_request_suffix.clone();
+        state.candidate_bundle_suffix = Some("update-candidate.bundle".into());
+        state.candidate_request_suffix = Some("update-candidate.request".into());
+        state = state.seal().expect("seal");
+        let store = Store::lock(&state_dir, "x6").expect("store");
+        store
+            .write_artifact(
+                "update-candidate.request",
+                &request.canonical_bytes().expect("request"),
+                0o600,
+            )
+            .expect("artifact");
+        store.write(&state).expect("state");
+        drop(store);
+        let replay = update(&candidate, &state_dir, true, &executor).expect("replay");
+        assert_eq!(replay.phase, LifecyclePhase::Verified);
     }
 }
 
