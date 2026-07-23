@@ -640,6 +640,25 @@ impl AwsExecutor for UpdateReplayExecutor {
     }
 }
 
+fn install_effect_count(calls: &[String]) -> usize {
+    calls
+        .iter()
+        .filter(|id| {
+            matches!(
+                id.as_str(),
+                "clear-retained-install-inputs-before-replay"
+                    | "stage-exact-stack-bundle"
+                    | "protect-staged-stack-bundle"
+                    | "own-protected-stack-bundle"
+                    | "stage-exact-install-request"
+                    | "protect-staged-install-request"
+                    | "own-protected-install-request"
+                    | "run-fixed-stack-installer"
+            )
+        })
+        .count()
+}
+
 fn ready_for(request: &ProvisionRequest) -> HostReadyReceipt {
     let mut ready = HostReadyReceipt {
         schema: "dirextalk.vnext-host-provision-ready".into(),
@@ -816,11 +835,31 @@ fn pre_cross_version_sealed_state_is_exactly_authenticated_and_migrated_under_lo
     migrated.verify().expect("new seal");
     assert_eq!(migrated.candidate_bundle_suffix, None);
     let mut tampered = legacy;
-    tampered[0] = b'[';
-    fs::write(state_dir.join("x6.json"), tampered).expect("tamper");
+    let field = b"\"monthly_estimate_cents\": 4620";
+    let offset = tampered
+        .windows(field.len())
+        .position(|window| window == field)
+        .expect("literal field");
+    tampered[offset + field.len() - 1] = b'1';
+    let tampered_state: Ec2State =
+        serde_json::from_slice(&tampered).expect("tamper remains exact-shape JSON");
+    assert_eq!(
+        tampered_state.integrity_sha256,
+        legacy_state.integrity_sha256
+    );
+    assert!(
+        tampered_state.verify_legacy_bytes(&tampered).is_err(),
+        "one changed value with the old digest must fail old-seal verification"
+    );
+    fs::write(state_dir.join("x6.json"), &tampered).expect("tamper");
     fs::set_permissions(state_dir.join("x6.json"), fs::Permissions::from_mode(0o600))
         .expect("mode");
     assert!(status(&manifest, &state_dir).is_err());
+    assert_eq!(
+        fs::read(state_dir.join("x6.json")).expect("rejected state remains"),
+        tampered,
+        "failed migration must not reseal the tampered state"
+    );
 }
 
 #[test]
@@ -1494,9 +1533,10 @@ fn code_only_rollback_replays_rolled_back_receipt_and_rejects_third_identity() {
     let ready = String::from_utf8(canonical(&ready_for(&provision))).expect("ready");
     let candidate_receipt_text =
         String::from_utf8(canonical(&candidate_receipt)).expect("candidate");
+    let rollback_receipt_text = String::from_utf8(canonical(&rollback_receipt)).expect("rollback");
     let executor = UpdateReplayExecutor {
         candidate_receipt: candidate_receipt_text.clone(),
-        rollback_receipt: Some(String::from_utf8(canonical(&rollback_receipt)).expect("rollback")),
+        rollback_receipt: Some(rollback_receipt_text.clone()),
         ready,
         state_path: state_dir.join("x6.json"),
         bundle_size: candidate_bundle.len(),
@@ -1558,16 +1598,112 @@ fn code_only_rollback_replays_rolled_back_receipt_and_rejects_third_identity() {
         .cloned()
         .collect();
     assert_eq!(effects.len(), 8);
+
+    state.phase = LifecyclePhase::RollbackInstalling;
+    state.pending_effect = None;
+    state.rollback_receipt = None;
+    state = state.seal().expect("restart seal");
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    store.write(&state).expect("authentic rollback restart");
+    let persisted_restart: Ec2State = store
+        .read()
+        .expect("read restart")
+        .expect("persisted restart");
+    persisted_restart.verify().expect("restart integrity");
+    assert_eq!(persisted_restart.phase, LifecyclePhase::RollbackInstalling);
+    assert_eq!(
+        persisted_restart
+            .current
+            .as_ref()
+            .expect("candidate current")
+            .version,
+        "0.1.4"
+    );
+    assert_eq!(
+        persisted_restart
+            .current_receipt
+            .as_ref()
+            .expect("candidate receipt")
+            .receipt_sha256,
+        candidate_receipt.receipt_sha256
+    );
+    assert_eq!(
+        persisted_restart
+            .previous
+            .as_ref()
+            .expect("retained previous")
+            .version,
+        "0.1.1"
+    );
+    assert!(persisted_restart.rollback_receipt.is_none());
+    drop(store);
+    *executor.remote_receipt.lock().expect("receipt") = rollback_receipt_text;
+    let calls_before_replay = executor.calls.lock().expect("calls").len();
+    let replayed =
+        rollback_update(&candidate, &state_dir, true, &executor).expect("receipt replay");
+    assert_eq!(replayed.phase, LifecyclePhase::RolledBack);
+    assert_eq!(
+        replayed
+            .current
+            .as_ref()
+            .expect("rolled-back current")
+            .version,
+        "0.1.1"
+    );
+    assert_eq!(
+        replayed
+            .rollback_receipt
+            .as_ref()
+            .expect("replayed rollback receipt")
+            .receipt_sha256,
+        rollback_receipt.receipt_sha256
+    );
+    assert_eq!(
+        install_effect_count(&executor.calls.lock().expect("calls")[calls_before_replay..]),
+        0,
+        "exact rolled_back receipt replay must perform no host effects"
+    );
+    assert_eq!(
+        &executor.calls.lock().expect("calls")[calls_before_replay..],
+        [
+            "inspect-current-installed-receipt",
+            "read-existing-installed-receipt"
+        ]
+    );
+
     let mut third = candidate_request.clone();
     third.target = "other".into();
+    let third_receipt = canonical(&receipt_for(&third, ReceiptState::RolledBack));
     assert!(
         workflow::classify_existing_install_receipt(
-            &canonical(&receipt_for(&third, ReceiptState::RolledBack)),
+            &third_receipt,
             &rollback_request,
             ReceiptState::RolledBack,
             Some((&candidate_request, ReceiptState::Installed))
         )
         .is_err()
+    );
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    store.write(&state).expect("third-receipt restart");
+    drop(store);
+    *executor.remote_receipt.lock().expect("receipt") =
+        String::from_utf8(third_receipt).expect("third receipt");
+    let calls_before_third = executor.calls.lock().expect("calls").len();
+    assert!(
+        rollback_update(&candidate, &state_dir, true, &executor).is_err(),
+        "a third remote receipt identity must fail closed"
+    );
+    assert_eq!(
+        install_effect_count(&executor.calls.lock().expect("calls")[calls_before_third..]),
+        0,
+        "third receipt rejection must precede every host effect"
+    );
+    assert_eq!(
+        &executor.calls.lock().expect("calls")[calls_before_third..],
+        [
+            "inspect-current-installed-receipt",
+            "read-existing-installed-receipt"
+        ]
     );
 }
 
