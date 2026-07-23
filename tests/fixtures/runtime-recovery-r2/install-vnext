@@ -46,6 +46,7 @@ MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RECEIPT_BYTES = 64 * 1024
+MAX_COMPOSE_PS_BYTES = 64 * 1024
 MAX_MEMBERS = 256
 STATE_OWNER_UID = 0
 STATE_OWNER_GID = 0
@@ -1332,6 +1333,53 @@ def validate_runtime_attestation(raw: bytes, receipt: dict[str, object]) -> dict
     return value
 
 
+REQUIRED_RUNTIME_SERVICES = frozenset({"dtx-node", "realtime-gateway", "agent-control"})
+
+
+def parse_compose_ps_images(raw: bytes) -> dict[str, str]:
+    """Parse bounded Compose JSON output without exposing untrusted output."""
+    if not isinstance(raw, bytes) or not raw or len(raw) > MAX_COMPOSE_PS_BYTES:
+        raise ContractError("running service image attestation is invalid")
+    try:
+        text = raw.decode()
+    except UnicodeDecodeError as error:
+        raise ContractError("running service image attestation is invalid") from error
+    try:
+        decoded = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except (json.JSONDecodeError, ContractError):
+        lines = text.splitlines()
+        if not lines or any(not line.strip() for line in lines):
+            raise ContractError("running service image attestation is invalid")
+        records: list[object] = []
+        try:
+            for line in lines:
+                records.append(json.loads(line, object_pairs_hook=reject_duplicate_keys))
+        except (json.JSONDecodeError, ContractError) as error:
+            raise ContractError("running service image attestation is invalid") from error
+    else:
+        if isinstance(decoded, list):
+            records = decoded
+        else:
+            records = [decoded]
+    if not records:
+        raise ContractError("running service image attestation is invalid")
+    images: dict[str, str] = {}
+    seen_required: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ContractError("running service image attestation is invalid")
+        service = record.get("Service")
+        image = record.get("Image")
+        if not isinstance(service, str) or not isinstance(image, str):
+            raise ContractError("running service image attestation is invalid")
+        if service in REQUIRED_RUNTIME_SERVICES:
+            if service in seen_required:
+                raise ContractError("running service image attestation is invalid")
+            seen_required.add(service)
+        images[service] = image
+    return images
+
+
 def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) -> tuple[str, str, str]:
     environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
     result = subprocess.run(
@@ -1340,15 +1388,11 @@ def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) ->
         env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         check=True, timeout=120,
     )
-    try:
-        records = json.loads(result.stdout)
-        if not isinstance(records, list):
-            raise ValueError
-        images = {record.get("Service"): record.get("Image") for record in records if isinstance(record, dict)}
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise ContractError("running service image attestation is invalid") from error
-    required = {"dtx-node", "realtime-gateway", "agent-control"}
-    if set(images) & required != required or any(images[name] != manifest["server_image"] for name in required):
+    images = parse_compose_ps_images(result.stdout)
+    if (
+        set(images) & REQUIRED_RUNTIME_SERVICES != REQUIRED_RUNTIME_SERVICES
+        or any(images[name] != manifest["server_image"] for name in REQUIRED_RUNTIME_SERVICES)
+    ):
         raise ContractError("running candidate service image differs from authenticated release")
     binary_test = ["test", "-x", "/usr/local/bin/dtx-identity-provision"] if migrations_present else [
         "test", "!", "-e", "/usr/local/bin/dtx-identity-provision"
@@ -1376,7 +1420,7 @@ def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) ->
     if migrations.stdout != b"ok\n":
         raise ContractError("fixed migration runtime proof failed")
     return (
-        digest(canonical({name: images[name] for name in sorted(required)})),
+        digest(canonical({name: images[name] for name in sorted(REQUIRED_RUNTIME_SERVICES)})),
         digest(str(manifest["server_image"]).encode() + b"\0dtx-identity-provision"),
         digest(canonical({"versions": [202607230056, 202607230057, 202607230058], "success": migrations_present})),
     )
@@ -1649,7 +1693,7 @@ def main() -> int:
         print("install-vnext requires root", file=sys.stderr)
         return 1
     basename = Path(sys.argv[0]).name
-    if basename not in {"install-vnext", "recover-vnext-011-to-014", "attest-vnext-011-to-014"}:
+    if basename not in {"install-vnext", "recover-vnext-011-to-014-r2", "attest-vnext-011-to-014-r2"}:
         print("install-vnext: unrecognized helper basename", file=sys.stderr)
         return 1
     try:
@@ -1660,9 +1704,9 @@ def main() -> int:
         lock = open_lock()
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if basename == "recover-vnext-011-to-014":
+            if basename == "recover-vnext-011-to-014-r2":
                 recover_false_runtime_once()
-            elif basename == "attest-vnext-011-to-014":
+            elif basename == "attest-vnext-011-to-014-r2":
                 attest_candidate_runtime_once()
             else:
                 install_once()

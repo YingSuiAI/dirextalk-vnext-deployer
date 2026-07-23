@@ -1711,10 +1711,10 @@ mod tests {
         ) -> String {
             match state {
                 RuntimeHelperState::Absent => String::new(),
-                RuntimeHelperState::Uploaded => format!("f ubuntu ubuntu 600 1 76217 {upload}\n"),
-                RuntimeHelperState::Protected => format!("f ubuntu ubuntu 400 1 76217 {upload}\n"),
-                RuntimeHelperState::Atomic => format!("f root root 555 1 76217 {atomic}\n"),
-                RuntimeHelperState::Installed => format!("f root root 555 1 76217 {installed}\n"),
+                RuntimeHelperState::Uploaded => format!("f ubuntu ubuntu 600 1 78057 {upload}\n"),
+                RuntimeHelperState::Protected => format!("f ubuntu ubuntu 400 1 78057 {upload}\n"),
+                RuntimeHelperState::Atomic => format!("f root root 555 1 78057 {atomic}\n"),
+                RuntimeHelperState::Installed => format!("f root root 555 1 78057 {installed}\n"),
             }
         }
     }
@@ -1801,8 +1801,8 @@ mod tests {
                     *state = RuntimeHelperState::Installed;
                     String::new()
                 }
-                "run-fixed-runtime-recovery-011-to-014"
-                | "run-fixed-runtime-attester-011-to-014" => String::new(),
+                "run-fixed-runtime-recovery-011-to-014-r2"
+                | "run-fixed-runtime-attester-011-to-014-r2" => String::new(),
                 "inspect-runtime-attestation" => format!(
                     "f root root 600 1 {} {}\n",
                     self.runtime_attestation.len(),
@@ -1855,7 +1855,7 @@ mod tests {
                 runtime_attestation: fixture.runtime_attestation.clone(),
                 current_receipt: fixture.current_receipt.clone(),
                 runtime_attester_metadata: format!(
-                    "f root root 555 1 76217 {}\n",
+                    "f root root 555 1 78057 {}\n",
                     aws_ec2::REMOTE_RUNTIME_ATTESTER
                 ),
                 runtime_attester_digest: aws_ec2::RUNTIME_RECOVERY_SHA256.into(),
@@ -1869,6 +1869,14 @@ mod tests {
 
         fn calls(&self) -> Vec<String> {
             self.calls.lock().expect("calls").clone()
+        }
+
+        fn has_mutation(&self) -> bool {
+            self.commands
+                .lock()
+                .expect("commands")
+                .iter()
+                .any(|command| command.mutation)
         }
 
         fn command(&self, id: &str) -> aws_ec2::FixedCommand {
@@ -1894,10 +1902,10 @@ mod tests {
                 .expect("commands")
                 .push(command.clone());
             let stdout = match command.id.as_str() {
-                "inspect-installed-runtime-attester-011-to-014" => {
+                "inspect-installed-runtime-attester-011-to-014-r2" => {
                     self.runtime_attester_metadata.clone()
                 }
-                "verify-installed-runtime-attester-011-to-014" => format!(
+                "verify-installed-runtime-attester-011-to-014-r2" => format!(
                     "{}  {}\n",
                     self.runtime_attester_digest,
                     aws_ec2::REMOTE_RUNTIME_ATTESTER
@@ -1975,7 +1983,7 @@ mod tests {
                 | "run-client-binding-issue"
                 | "verify-client-binding-import-regular"
                 | "verify-client-binding-import-not-symlink"
-                | "run-fixed-runtime-attester-011-to-014" => String::new(),
+                | "run-fixed-runtime-attester-011-to-014-r2" => String::new(),
                 other => return Err(contract(&format!("unexpected test command {other}"))),
             };
             Ok(aws_ec2::ExecOutput {
@@ -2446,12 +2454,22 @@ mod tests {
             .expect("previous request");
         store
             .write_artifact(
-                "runtime-recovery-011-to-014",
-                include_bytes!("../tests/fixtures/runtime-recovery/install-vnext"),
+                "runtime-recovery-011-to-014-r2",
+                include_bytes!("../tests/fixtures/runtime-recovery-r2/install-vnext"),
                 0o600,
             )
             .expect("sealed runtime helper");
         store.write(&fixture.state).expect("EC2 state");
+    }
+
+    #[test]
+    fn runtime_recovery_r2_fixture_matches_compiled_contract() {
+        let helper = include_bytes!("../tests/fixtures/runtime-recovery-r2/install-vnext");
+        assert_eq!(helper.len(), aws_ec2::RUNTIME_RECOVERY_SIZE);
+        assert_eq!(
+            aws_ec2::bundle::hash(helper),
+            aws_ec2::RUNTIME_RECOVERY_SHA256
+        );
     }
 
     fn recovery_fixture() -> (IssueEc2Fixture, PathBuf, PathBuf) {
@@ -2460,12 +2478,12 @@ mod tests {
         let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
         write_issue_ec2_state(&store, &fixture);
         store
-            .remove_artifact("runtime-recovery-011-to-014")
+            .remove_artifact("runtime-recovery-011-to-014-r2")
             .expect("remove unsealed recovery helper");
-        let helper = fixture.root.path().join("recover-vnext-011-to-014");
+        let helper = fixture.root.path().join("recover-vnext-011-to-014-r2");
         fs::write(
             &helper,
-            include_bytes!("../tests/fixtures/runtime-recovery/install-vnext"),
+            include_bytes!("../tests/fixtures/runtime-recovery-r2/install-vnext"),
         )
         .expect("recovery helper");
         (fixture, state_dir, helper)
@@ -2492,7 +2510,7 @@ mod tests {
         assert!(
             aws_ec2::store::Store::lock(&state_dir, "x6")
                 .expect("store")
-                .read_artifact("runtime-recovery-011-to-014", 76_218)
+                .read_artifact("runtime-recovery-011-to-014-r2", 78_058)
                 .is_err()
         );
 
@@ -2529,21 +2547,21 @@ mod tests {
         state.verify().expect("sealed state");
         let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
         let sealed = store
-            .read_artifact("runtime-recovery-011-to-014", 76_218)
+            .read_artifact("runtime-recovery-011-to-014-r2", 78_058)
             .expect("sealed helper");
-        assert_eq!(sealed.len(), 76_217);
+        assert_eq!(sealed.len(), 78_057);
         assert_eq!(
             sealed,
-            include_bytes!("../tests/fixtures/runtime-recovery/install-vnext")
+            include_bytes!("../tests/fixtures/runtime-recovery-r2/install-vnext")
         );
         let calls = executor.calls();
         for (id, basename) in [
             (
-                "stage-runtime-recovery-011-to-014",
+                "stage-runtime-recovery-011-to-014-r2",
                 aws_ec2::REMOTE_RUNTIME_RECOVERY_UPLOAD,
             ),
             (
-                "stage-runtime-attester-011-to-014",
+                "stage-runtime-attester-011-to-014-r2",
                 aws_ec2::REMOTE_RUNTIME_ATTESTER_UPLOAD,
             ),
         ] {
@@ -2557,17 +2575,17 @@ mod tests {
             );
         }
         for id in [
-            "run-fixed-runtime-recovery-011-to-014",
-            "run-fixed-runtime-attester-011-to-014",
+            "run-fixed-runtime-recovery-011-to-014-r2",
+            "run-fixed-runtime-attester-011-to-014-r2",
         ] {
             let command = calls.iter().find(|command| command.id == id).expect(id);
             assert!(command.mutation);
             assert_eq!(
                 command.argv.last().map(String::as_str),
-                Some(if id.ends_with("recovery-011-to-014") {
-                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/recover-vnext-011-to-014'"
+                Some(if id == "run-fixed-runtime-recovery-011-to-014-r2" {
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/recover-vnext-011-to-014-r2'"
                 } else {
-                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/attest-vnext-011-to-014'"
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2'"
                 })
             );
         }
@@ -2583,64 +2601,64 @@ mod tests {
     fn recover_runtime_accepts_only_exact_pending_effect_classes() {
         for (pending, recovery, attester, expected) in [
             (
-                "stage-runtime-recovery-011-to-014",
+                "stage-runtime-recovery-011-to-014-r2",
                 RuntimeHelperState::Absent,
                 RuntimeHelperState::Installed,
-                "stage-runtime-recovery-011-to-014",
+                "stage-runtime-recovery-011-to-014-r2",
             ),
             (
-                "protect-uploaded-runtime-recovery-011-to-014",
+                "protect-uploaded-runtime-recovery-011-to-014-r2",
                 RuntimeHelperState::Uploaded,
                 RuntimeHelperState::Installed,
-                "protect-uploaded-runtime-recovery-011-to-014",
+                "protect-uploaded-runtime-recovery-011-to-014-r2",
             ),
             (
-                "prepare-atomic-runtime-recovery-011-to-014",
+                "prepare-atomic-runtime-recovery-011-to-014-r2",
                 RuntimeHelperState::Protected,
                 RuntimeHelperState::Installed,
-                "prepare-atomic-runtime-recovery-011-to-014",
+                "prepare-atomic-runtime-recovery-011-to-014-r2",
             ),
             (
-                "activate-runtime-recovery-011-to-014",
+                "activate-runtime-recovery-011-to-014-r2",
                 RuntimeHelperState::Atomic,
                 RuntimeHelperState::Installed,
-                "activate-runtime-recovery-011-to-014",
+                "activate-runtime-recovery-011-to-014-r2",
             ),
             (
-                "activate-runtime-recovery-011-to-014",
+                "activate-runtime-recovery-011-to-014-r2",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Installed,
-                "run-fixed-runtime-recovery-011-to-014",
+                "run-fixed-runtime-recovery-011-to-014-r2",
             ),
             (
-                "stage-runtime-attester-011-to-014",
+                "stage-runtime-attester-011-to-014-r2",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Absent,
-                "stage-runtime-attester-011-to-014",
+                "stage-runtime-attester-011-to-014-r2",
             ),
             (
-                "protect-uploaded-runtime-attester-011-to-014",
+                "protect-uploaded-runtime-attester-011-to-014-r2",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Uploaded,
-                "protect-uploaded-runtime-attester-011-to-014",
+                "protect-uploaded-runtime-attester-011-to-014-r2",
             ),
             (
-                "prepare-atomic-runtime-attester-011-to-014",
+                "prepare-atomic-runtime-attester-011-to-014-r2",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Protected,
-                "prepare-atomic-runtime-attester-011-to-014",
+                "prepare-atomic-runtime-attester-011-to-014-r2",
             ),
             (
-                "activate-runtime-attester-011-to-014",
+                "activate-runtime-attester-011-to-014-r2",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Atomic,
-                "activate-runtime-attester-011-to-014",
+                "activate-runtime-attester-011-to-014-r2",
             ),
             (
-                "activate-runtime-attester-011-to-014",
+                "activate-runtime-attester-011-to-014-r2",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Installed,
-                "run-fixed-runtime-attester-011-to-014",
+                "run-fixed-runtime-attester-011-to-014-r2",
             ),
         ] {
             let (fixture, state_dir, helper) = recovery_fixture();
@@ -2816,31 +2834,38 @@ mod tests {
             ),
             (
                 "wrong-size",
-                "f root root 555 1 76216 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                "f root root 555 1 78056 /usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2\n"
                     .into(),
                 aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
             ),
             (
+                "old-basename-only",
+                "f root root 555 1 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                    .into(),
+                "8707a76e869ea5869bce7fa13e0cf23993460be80baca1018be2cf0346868885"
+                    .into(),
+            ),
+            (
                 "wrong-owner",
-                "f ubuntu root 555 1 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                "f ubuntu root 555 1 78057 /usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2\n"
                     .into(),
                 aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
             ),
             (
                 "wrong-mode",
-                "f root root 755 1 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                "f root root 755 1 78057 /usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2\n"
                     .into(),
                 aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
             ),
             (
                 "wrong-links",
-                "f root root 555 2 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                "f root root 555 2 78057 /usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2\n"
                     .into(),
                 aws_ec2::RUNTIME_RECOVERY_SHA256.to_owned(),
             ),
             (
                 "wrong-digest",
-                "f root root 555 1 76217 /usr/local/libexec/dirextalk/attest-vnext-011-to-014\n"
+                "f root root 555 1 78057 /usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2\n"
                     .into(),
                 "0".repeat(64),
             ),
@@ -2867,6 +2892,10 @@ mod tests {
                 "{label}"
             );
             let calls = executor.calls();
+            assert!(
+                !executor.has_mutation(),
+                "{label}: an untrusted helper must never be removed or replaced"
+            );
             assert!(!calls.iter().any(|id| id == "inspect-client-binding-root"
                 || id == "create-client-binding-root"
                 || id == "inspect-client-binding-request"

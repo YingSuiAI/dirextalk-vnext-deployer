@@ -63,8 +63,9 @@ manifest `sha256:<64>` and compare it to the installed immutable
 used to gate `ec2-update`.
 
 `ec2-recover-runtime-011-to-014` admits only the sealed, verified 0.1.1 to
-0.1.4 receipt chain and fixed helper bytes. It stages the sealed helper under
-the fixed recovery and attestation basenames, runs no-argument recovery, then
+0.1.4 receipt chain and the reviewed r2 helper bytes. It stages the sealed
+helper only under the fixed `recover-vnext-011-to-014-r2` and
+`attest-vnext-011-to-014-r2` basenames, runs no-argument recovery, then
 requires canonical runtime attestation and an unchanged current receipt.
 Client-binding issuance performs that proof-only attestation before it can
 create a request or remote binding root.

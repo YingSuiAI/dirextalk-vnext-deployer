@@ -50,7 +50,7 @@ pub(super) const CROSS_VERSION_BOOTSTRAP_SUFFIX: &str = "cross-version-bootstrap
 const ROLLBACK_REQUEST_SUFFIX: &str = "rollback.request";
 const UPDATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
 const UPDATE_CAPACITY_INODES: u64 = 128;
-const RUNTIME_RECOVERY_SUFFIX: &str = "runtime-recovery-011-to-014";
+const RUNTIME_RECOVERY_SUFFIX: &str = "runtime-recovery-011-to-014-r2";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1705,7 +1705,7 @@ pub fn recover_runtime_011_to_014(
     seal_runtime_recovery_helper(&store, helper)?;
     ensure_runtime_recovery_helpers(&store, &mut state, executor)?;
     let command = ssh_command(
-        "run-fixed-runtime-recovery-011-to-014",
+        "run-fixed-runtime-recovery-011-to-014-r2",
         &state,
         &store,
         [
@@ -1772,28 +1772,28 @@ fn ensure_runtime_recovery_helpers(
     let local = store.artifact_path(RUNTIME_RECOVERY_SUFFIX)?;
     for helper in [
         HostHelperSpec {
-            label: "runtime-recovery-011-to-014",
+            label: "runtime-recovery-011-to-014-r2",
             local: &local,
             sha256: RUNTIME_RECOVERY_SHA256,
             size: bytes.len(),
             upload: REMOTE_RUNTIME_RECOVERY_UPLOAD,
-            upload_name: "recover-vnext-011-to-014.upload",
+            upload_name: "recover-vnext-011-to-014-r2.upload",
             atomic: REMOTE_RUNTIME_RECOVERY_ATOMIC,
-            atomic_name: ".recover-vnext-011-to-014.new",
+            atomic_name: ".recover-vnext-011-to-014-r2.new",
             installed: REMOTE_RUNTIME_RECOVERY,
-            installed_name: "recover-vnext-011-to-014",
+            installed_name: "recover-vnext-011-to-014-r2",
         },
         HostHelperSpec {
-            label: "runtime-attester-011-to-014",
+            label: "runtime-attester-011-to-014-r2",
             local: &local,
             sha256: RUNTIME_RECOVERY_SHA256,
             size: bytes.len(),
             upload: REMOTE_RUNTIME_ATTESTER_UPLOAD,
-            upload_name: "attest-vnext-011-to-014.upload",
+            upload_name: "attest-vnext-011-to-014-r2.upload",
             atomic: REMOTE_RUNTIME_ATTESTER_ATOMIC,
-            atomic_name: ".attest-vnext-011-to-014.new",
+            atomic_name: ".attest-vnext-011-to-014-r2.new",
             installed: REMOTE_RUNTIME_ATTESTER,
-            installed_name: "attest-vnext-011-to-014",
+            installed_name: "attest-vnext-011-to-014-r2",
         },
     ] {
         ensure_host_helper(store, state, &helper, executor)?;
@@ -1850,20 +1850,20 @@ fn admit_runtime_recovery(
 fn runtime_recovery_pending_effect(effect: &str) -> bool {
     matches!(
         effect,
-        "clear-upload-runtime-recovery-011-to-014"
-            | "stage-runtime-recovery-011-to-014"
-            | "protect-uploaded-runtime-recovery-011-to-014"
-            | "clear-atomic-runtime-recovery-011-to-014"
-            | "prepare-atomic-runtime-recovery-011-to-014"
-            | "activate-runtime-recovery-011-to-014"
-            | "clear-upload-runtime-attester-011-to-014"
-            | "stage-runtime-attester-011-to-014"
-            | "protect-uploaded-runtime-attester-011-to-014"
-            | "clear-atomic-runtime-attester-011-to-014"
-            | "prepare-atomic-runtime-attester-011-to-014"
-            | "activate-runtime-attester-011-to-014"
-            | "run-fixed-runtime-recovery-011-to-014"
-            | "run-fixed-runtime-attester-011-to-014"
+        "clear-upload-runtime-recovery-011-to-014-r2"
+            | "stage-runtime-recovery-011-to-014-r2"
+            | "protect-uploaded-runtime-recovery-011-to-014-r2"
+            | "clear-atomic-runtime-recovery-011-to-014-r2"
+            | "prepare-atomic-runtime-recovery-011-to-014-r2"
+            | "activate-runtime-recovery-011-to-014-r2"
+            | "clear-upload-runtime-attester-011-to-014-r2"
+            | "stage-runtime-attester-011-to-014-r2"
+            | "protect-uploaded-runtime-attester-011-to-014-r2"
+            | "clear-atomic-runtime-attester-011-to-014-r2"
+            | "prepare-atomic-runtime-attester-011-to-014-r2"
+            | "activate-runtime-attester-011-to-014-r2"
+            | "run-fixed-runtime-recovery-011-to-014-r2"
+            | "run-fixed-runtime-attester-011-to-014-r2"
     )
 }
 
@@ -1874,26 +1874,28 @@ mod runtime_recovery_pending_tests {
     #[test]
     fn accepts_only_exact_recovery_helper_effect_ids() {
         for effect in [
-            "clear-upload-runtime-recovery-011-to-014",
-            "stage-runtime-recovery-011-to-014",
-            "protect-uploaded-runtime-recovery-011-to-014",
-            "clear-atomic-runtime-recovery-011-to-014",
-            "prepare-atomic-runtime-recovery-011-to-014",
-            "activate-runtime-recovery-011-to-014",
-            "clear-upload-runtime-attester-011-to-014",
-            "stage-runtime-attester-011-to-014",
-            "protect-uploaded-runtime-attester-011-to-014",
-            "clear-atomic-runtime-attester-011-to-014",
-            "prepare-atomic-runtime-attester-011-to-014",
-            "activate-runtime-attester-011-to-014",
-            "run-fixed-runtime-recovery-011-to-014",
-            "run-fixed-runtime-attester-011-to-014",
+            "clear-upload-runtime-recovery-011-to-014-r2",
+            "stage-runtime-recovery-011-to-014-r2",
+            "protect-uploaded-runtime-recovery-011-to-014-r2",
+            "clear-atomic-runtime-recovery-011-to-014-r2",
+            "prepare-atomic-runtime-recovery-011-to-014-r2",
+            "activate-runtime-recovery-011-to-014-r2",
+            "clear-upload-runtime-attester-011-to-014-r2",
+            "stage-runtime-attester-011-to-014-r2",
+            "protect-uploaded-runtime-attester-011-to-014-r2",
+            "clear-atomic-runtime-attester-011-to-014-r2",
+            "prepare-atomic-runtime-attester-011-to-014-r2",
+            "activate-runtime-attester-011-to-014-r2",
+            "run-fixed-runtime-recovery-011-to-014-r2",
+            "run-fixed-runtime-attester-011-to-014-r2",
         ] {
             assert!(runtime_recovery_pending_effect(effect));
         }
         for effect in [
             "run-fixed-runtime-recovery",
-            "stage-runtime-attester-011-to-014-extra",
+            "run-fixed-runtime-recovery-011-to-014",
+            "stage-runtime-attester-011-to-014",
+            "stage-runtime-attester-011-to-014-r2-extra",
             "destroy-instance",
         ] {
             assert!(!runtime_recovery_pending_effect(effect));
@@ -1966,9 +1968,9 @@ pub(crate) fn attest_runtime_011_to_014_locked(
         state,
         store,
         executor,
-        "inspect-installed-runtime-attester-011-to-014",
+        "inspect-installed-runtime-attester-011-to-014-r2",
         "/usr/local/libexec/dirextalk",
-        "attest-vnext-011-to-014",
+        "attest-vnext-011-to-014-r2",
     )?
     .ok_or(ReleaseError::OperationConflict)?;
     require_remote_metadata(
@@ -1983,7 +1985,7 @@ pub(crate) fn attest_runtime_011_to_014_locked(
         state,
         store,
         executor,
-        "verify-installed-runtime-attester-011-to-014",
+        "verify-installed-runtime-attester-011-to-014-r2",
         REMOTE_RUNTIME_ATTESTER,
         RUNTIME_RECOVERY_SHA256,
         true,
@@ -1992,7 +1994,7 @@ pub(crate) fn attest_runtime_011_to_014_locked(
         store,
         state,
         &ssh_command(
-            "run-fixed-runtime-attester-011-to-014",
+            "run-fixed-runtime-attester-011-to-014-r2",
             state,
             store,
             [
