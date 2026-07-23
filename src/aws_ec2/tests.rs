@@ -832,6 +832,86 @@ fn initial_install_resume_accepts_exact_post_effect_receipt_without_reinstall() 
 }
 
 #[test]
+fn update_receipt_classifier_distinguishes_retained_candidate_rollback_and_third_identity() {
+    let (_dir, manifest) = fixture("0.1.1", 'a');
+    let retained_facts = manifest.bundle().expect("retained");
+    let retained = InstallRequest::new(&manifest.domain, &retained_facts, None);
+    let mut candidate = retained.clone();
+    candidate.version = "0.1.4".into();
+    candidate.bundle_sha256 = "b".repeat(64);
+    candidate.manifest_sha256 = "c".repeat(64);
+    candidate.server_image = format!("dirextalk/vnet-server@sha256:{}", "b".repeat(64));
+    candidate.previous_receipt_sha256 =
+        Some(receipt_for(&retained, ReceiptState::Installed).receipt_sha256);
+    let prior = canonical(&receipt_for(&retained, ReceiptState::Installed));
+    assert!(matches!(
+        workflow::classify_existing_install_receipt(
+            &prior,
+            &candidate,
+            ReceiptState::Installed,
+            Some((&retained, ReceiptState::Installed))
+        )
+        .expect("prior"),
+        workflow::ExistingInstallReceipt::PreEffect
+    ));
+    let installed = canonical(&receipt_for(&candidate, ReceiptState::Installed));
+    assert!(matches!(
+        workflow::classify_existing_install_receipt(
+            &installed,
+            &candidate,
+            ReceiptState::Installed,
+            Some((&retained, ReceiptState::Installed))
+        )
+        .expect("candidate"),
+        workflow::ExistingInstallReceipt::PostEffect(_)
+    ));
+    let rollback = canonical(&receipt_for(&candidate, ReceiptState::RolledBack));
+    assert!(matches!(
+        workflow::classify_existing_install_receipt(
+            &rollback,
+            &candidate,
+            ReceiptState::RolledBack,
+            Some((&retained, ReceiptState::Installed))
+        )
+        .expect("rollback"),
+        workflow::ExistingInstallReceipt::PostEffect(_)
+    ));
+    let mut third = candidate.clone();
+    third.target = "other".into();
+    let third_bytes = canonical(&receipt_for(&third, ReceiptState::Installed));
+    assert!(
+        workflow::classify_existing_install_receipt(
+            &third_bytes,
+            &candidate,
+            ReceiptState::Installed,
+            Some((&retained, ReceiptState::Installed))
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn update_capacity_parser_enforces_exact_bytes_inodes_and_rejects_invalid_values() {
+    for (bytes, inodes, accepted) in [
+        (128_u64 * 1024 * 1024 - 1, 128, false),
+        (128_u64 * 1024 * 1024, 127, false),
+        (128_u64 * 1024 * 1024, 128, true),
+        (u64::MAX, u64::MAX, true),
+    ] {
+        let output = format!("Avail IAvail\n{bytes} {inodes}\n");
+        assert_eq!(workflow::parse_update_capacity(&output).is_ok(), accepted);
+    }
+    for output in [
+        "Avail IAvail\n18446744073709551616 128\n",
+        "Avail IAvail\n1 nope\n",
+        "Avail IAvail\n1 2 3\n",
+        "",
+    ] {
+        assert!(workflow::parse_update_capacity(output).is_err());
+    }
+}
+
+#[test]
 fn lifecycle_state_is_persisted_before_every_effect() {
     let (dir, manifest) = fixture("1.2.3", 'a');
     let state_dir = dir.path().join("effect-state");

@@ -2180,7 +2180,7 @@ pub(super) fn stage_install_read_receipt(
     InstalledReceipt::parse_and_verify(receipt.stdout.as_bytes(), request, expected_state)
 }
 
-enum ExistingInstallReceipt {
+pub(super) enum ExistingInstallReceipt {
     Absent,
     PreEffect,
     PostEffect(Box<InstalledReceipt>),
@@ -2240,18 +2240,20 @@ fn read_existing_install_receipt(
     if output.stdout.len() != metadata.size {
         return Err(ReleaseError::OperationConflict);
     }
-    if let Ok(receipt) =
-        InstalledReceipt::parse_and_verify(output.stdout.as_bytes(), request, expected_state)
-    {
+    classify_existing_install_receipt(output.stdout.as_bytes(), request, expected_state, retained)
+}
+
+pub(super) fn classify_existing_install_receipt(
+    bytes: &[u8],
+    request: &InstallRequest,
+    expected_state: ReceiptState,
+    retained: Option<(&InstallRequest, ReceiptState)>,
+) -> Result<ExistingInstallReceipt> {
+    if let Ok(receipt) = InstalledReceipt::parse_and_verify(bytes, request, expected_state) {
         return Ok(ExistingInstallReceipt::PostEffect(Box::new(receipt)));
     }
     if let Some((retained_request, retained_state)) = retained
-        && InstalledReceipt::parse_and_verify(
-            output.stdout.as_bytes(),
-            retained_request,
-            retained_state,
-        )
-        .is_ok()
+        && InstalledReceipt::parse_and_verify(bytes, retained_request, retained_state).is_ok()
     {
         return Ok(ExistingInstallReceipt::PreEffect);
     }
@@ -2995,8 +2997,11 @@ fn ensure_update_capacity(
         false,
         30,
     )?)?;
+    parse_update_capacity(&output.stdout)
+}
+
+pub(super) fn parse_update_capacity(output: &str) -> Result<()> {
     let values = output
-        .stdout
         .lines()
         .skip(1)
         .flat_map(str::split_ascii_whitespace)
