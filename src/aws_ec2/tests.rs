@@ -1311,9 +1311,26 @@ fn initial_install_resume_accepts_exact_post_effect_receipt_without_reinstall() 
         public_ip: "203.0.113.8".into(),
     });
     let store = Store::lock(&state_dir, "x6").expect("store");
+    store
+        .write_artifact(
+            "missing.bundle",
+            &fs::read(&manifest.stack_bundle_path).expect("bundle"),
+            0o600,
+        )
+        .expect("bundle artifact");
+    store
+        .write_artifact(
+            "missing.request",
+            &request.canonical_bytes().expect("request"),
+            0o600,
+        )
+        .expect("request artifact");
+    let bundle = BundleRecord::from_facts(&facts, &manifest);
     let actual = workflow::stage_install_read_receipt(
         &store,
         &mut state,
+        &manifest,
+        &bundle,
         "missing.bundle",
         "missing.request",
         &request,
@@ -1666,7 +1683,7 @@ fn code_only_rollback_replays_rolled_back_receipt_and_rejects_third_identity() {
     let rollback_request = InstallRequest {
         schema: "dirextalk.vnext-install-request".into(),
         schema_version: 1,
-        target: state.target.clone(),
+        target: "linux-amd64".into(),
         domain: state.domain.clone(),
         version: old_facts.manifest.version.clone(),
         source_commit: old_facts.manifest.source_commit.clone(),
@@ -1706,6 +1723,45 @@ fn code_only_rollback_replays_rolled_back_receipt_and_rejects_third_identity() {
             0o600,
         )
         .expect("candidate request");
+    workflow::authenticate_bundle_artifact(
+        &store,
+        &candidate,
+        state.previous.as_ref().expect("prior"),
+        "current.bundle",
+    )
+    .expect("retained bundle evidence");
+    workflow::authenticate_install_request_artifact(
+        &store,
+        &state,
+        state.previous.as_ref().expect("prior"),
+        "current.request",
+        None,
+    )
+    .expect("retained request evidence");
+    workflow::authenticate_bundle_artifact(
+        &store,
+        &candidate,
+        state.current.as_ref().expect("candidate"),
+        "update-candidate.bundle",
+    )
+    .expect("candidate bundle evidence");
+    workflow::authenticate_install_request_artifact(
+        &store,
+        &state,
+        state.current.as_ref().expect("candidate"),
+        "update-candidate.request",
+        state
+            .previous_receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_sha256.as_str()),
+    )
+    .expect("candidate request evidence");
+    InstalledReceipt::parse_and_verify(
+        &canonical(&candidate_receipt),
+        &candidate_request,
+        ReceiptState::Installed,
+    )
+    .expect("candidate receipt evidence");
     store.write(&state).expect("rollback state");
     drop(store);
     let ready = String::from_utf8(canonical(&ready_for(&provision))).expect("ready");

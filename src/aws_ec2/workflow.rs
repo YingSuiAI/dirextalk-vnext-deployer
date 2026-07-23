@@ -1957,9 +1957,12 @@ fn install_initial(
     )?;
     let request = InstallRequest::new(&state.domain, facts, None);
     store.write_artifact(APPLY_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
+    let bundle = BundleRecord::from_facts(facts, manifest);
     let receipt = stage_install_read_receipt(
         store,
         state,
+        manifest,
+        &bundle,
         APPLY_BUNDLE_SUFFIX,
         APPLY_REQUEST_SUFFIX,
         &request,
@@ -1967,7 +1970,7 @@ fn install_initial(
         None,
         executor,
     )?;
-    state.current = Some(BundleRecord::from_facts(facts, manifest));
+    state.current = Some(bundle);
     state.current_receipt = Some(receipt);
     state.current_bundle_suffix = Some(APPLY_BUNDLE_SUFFIX.into());
     state.current_request_suffix = Some(APPLY_REQUEST_SUFFIX.into());
@@ -2113,6 +2116,8 @@ fn provision_initial(
 pub(super) fn stage_install_read_receipt(
     store: &Store,
     state: &mut Ec2State,
+    manifest: &AwsEc2Manifest,
+    bundle: &BundleRecord,
     bundle_suffix: &str,
     request_suffix: &str,
     request: &InstallRequest,
@@ -2120,6 +2125,14 @@ pub(super) fn stage_install_read_receipt(
     retained: Option<(&InstallRequest, ReceiptState)>,
     executor: &dyn AwsExecutor,
 ) -> Result<InstalledReceipt> {
+    authenticate_bundle_artifact(store, manifest, bundle, bundle_suffix)?;
+    authenticate_install_request_artifact(
+        store,
+        state,
+        bundle,
+        request_suffix,
+        request.previous_receipt_sha256.as_deref(),
+    )?;
     match read_existing_install_receipt(state, store, request, expected_state, retained, executor)?
     {
         ExistingInstallReceipt::PostEffect(receipt) => return Ok(*receipt),
@@ -2128,8 +2141,8 @@ pub(super) fn stage_install_read_receipt(
     }
     let bundle_path = store.artifact_path(bundle_suffix)?;
     let request_path = store.artifact_path(request_suffix)?;
-    let bundle_bytes = fs::read(&bundle_path).map_err(crate::error::io_error(&bundle_path))?;
-    let request_bytes = fs::read(&request_path).map_err(crate::error::io_error(&request_path))?;
+    let bundle_bytes = store.read_artifact(bundle_suffix, 32 * 1024 * 1024)?;
+    let request_bytes = store.read_artifact(request_suffix, 64 * 1024)?;
     for (label, local, remote, name, bytes) in [
         (
             "stack-bundle",
@@ -2840,7 +2853,7 @@ pub fn update(
     manifest.validate()?;
     let facts = manifest.bundle()?;
     let store = Store::lock(state_dir, &manifest.target)?;
-    let mut state = load_state(&store, manifest)?;
+    let (mut state, legacy_state) = load_state_for_update(&store, manifest)?;
     if state.phase == LifecyclePhase::RolledBack {
         return Err(contract(
             "a rolled-back lifecycle cannot start a new forward update",
@@ -2905,6 +2918,12 @@ pub fn update(
         return Ok(state);
     }
 
+    if legacy_state {
+        // Update evidence has now authenticated the legacy shape; execution may
+        // migrate it only as part of this authorized lifecycle transition.
+        persist(&store, &mut state)?;
+    }
+
     if matches!(
         state.phase,
         LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack
@@ -2935,6 +2954,7 @@ pub fn update(
         state.pending_effect = None;
         persist(&store, &mut state)?;
     }
+    authenticate_update_recovery_artifacts(&store, &state, manifest)?;
     ensure_update_capacity(&store, &state, executor)?;
     let bundle_suffix = state
         .candidate_bundle_suffix
@@ -2974,9 +2994,12 @@ pub fn update(
     }
     state.phase = LifecyclePhase::UpdateInstalling;
     persist(&store, &mut state)?;
+    let desired = state.desired.clone();
     let receipt = stage_install_read_receipt(
         &store,
         &mut state,
+        manifest,
+        &desired,
         &bundle_suffix,
         &request_suffix,
         &request,
@@ -3077,6 +3100,118 @@ fn authenticate_retained_install_evidence(
     Ok(())
 }
 
+pub(super) fn authenticate_bundle_artifact(
+    store: &Store,
+    manifest: &AwsEc2Manifest,
+    record: &BundleRecord,
+    suffix: &str,
+) -> Result<()> {
+    let artifact = store.artifact_path(suffix)?;
+    let facts = load_bundle(
+        &artifact,
+        &record.bundle_sha256,
+        &manifest.host_installer_path,
+        &record.host_installer_sha256,
+        &manifest.host_provisioner_path,
+        &record.host_provisioner_sha256,
+        &manifest.receipt_reader_path,
+        &record.receipt_reader_sha256,
+    )?;
+    if facts.manifest.version != record.version
+        || facts.manifest.source_commit != record.source_commit
+        || facts.manifest_sha256 != record.manifest_sha256
+        || facts.compose_sha256 != record.compose_sha256
+        || facts.manifest.server_image != record.server_image
+        || facts.manifest.migrator_image != record.migrator_image
+        || facts.manifest.installer_sha256 != record.installer_sha256
+        || facts.cross_version_compatibility != record.cross_version_compatibility
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(())
+}
+
+fn authenticate_update_recovery_artifacts(
+    store: &Store,
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+) -> Result<()> {
+    let retained = state
+        .previous
+        .as_ref()
+        .ok_or_else(|| contract("retained bundle fact is absent"))?;
+    let retained_receipt = state
+        .previous_receipt
+        .as_ref()
+        .ok_or_else(|| contract("retained receipt fact is absent"))?;
+    let retained_bundle_suffix = state
+        .previous_bundle_suffix
+        .as_deref()
+        .ok_or_else(|| contract("retained bundle artifact fact is absent"))?;
+    authenticate_bundle_artifact(store, manifest, retained, retained_bundle_suffix)?;
+    let retained_request_suffix = state
+        .previous_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("retained install request fact is absent"))?;
+    let retained_request = authenticate_install_request_artifact(
+        store,
+        state,
+        retained,
+        retained_request_suffix,
+        None,
+    )?;
+    if InstalledReceipt::parse_and_verify(
+        &canonical_json(retained_receipt)?,
+        &retained_request,
+        ReceiptState::Installed,
+    )? != *retained_receipt
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let candidate_bundle_suffix = state
+        .candidate_bundle_suffix
+        .as_deref()
+        .ok_or_else(|| contract("candidate bundle artifact fact is absent"))?;
+    let candidate_request_suffix = state
+        .candidate_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("candidate request fact is absent"))?;
+    authenticate_bundle_artifact(store, manifest, &state.desired, candidate_bundle_suffix)?;
+    authenticate_install_request_artifact(
+        store,
+        state,
+        &state.desired,
+        candidate_request_suffix,
+        Some(&retained_receipt.receipt_sha256),
+    )?;
+    Ok(())
+}
+
+pub(super) fn authenticate_install_request_artifact(
+    store: &Store,
+    state: &Ec2State,
+    record: &BundleRecord,
+    suffix: &str,
+    predecessor: Option<&str>,
+) -> Result<InstallRequest> {
+    let bytes = store.read_artifact(suffix, 64 * 1024)?;
+    let request: InstallRequest = serde_json::from_slice(&bytes)?;
+    if request.canonical_bytes()? != bytes
+        || request.target != "linux-amd64"
+        || request.domain != state.domain
+        || request.version != record.version
+        || request.source_commit != record.source_commit
+        || request.bundle_sha256 != record.bundle_sha256
+        || request.manifest_sha256 != record.manifest_sha256
+        || request.server_image != record.server_image
+        || request.migrator_image != record.migrator_image
+        || request.previous_receipt_sha256.as_deref() != predecessor
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(request)
+}
+
 fn ensure_cross_version_contract(
     prior: &BundleRecord,
     prior_receipt: &InstalledReceipt,
@@ -3170,7 +3305,7 @@ pub fn rollback_update(
 ) -> Result<Ec2State> {
     manifest.validate()?;
     let store = Store::lock(state_dir, &manifest.target)?;
-    let mut state = load_state(&store, manifest)?;
+    let (mut state, legacy_state) = load_state_for_update(&store, manifest)?;
     if !matches!(
         state.phase,
         LifecyclePhase::UpdateVerifying
@@ -3201,6 +3336,12 @@ pub fn rollback_update(
     if !execute {
         return Ok(state);
     }
+    authenticate_rollback_recovery_artifacts(&store, &state, manifest, &prior, &candidate_receipt)?;
+    if legacy_state {
+        // Rollback evidence below is authenticated before this first durable
+        // transition, so an execute-only schema migration is safe here.
+        persist(&store, &mut state)?;
+    }
     let previous_bundle = state
         .previous_bundle_suffix
         .clone()
@@ -3208,7 +3349,7 @@ pub fn rollback_update(
     let request = InstallRequest {
         schema: "dirextalk.vnext-install-request".into(),
         schema_version: 1,
-        target: state.target.clone(),
+        target: "linux-amd64".into(),
         domain: state.domain.clone(),
         version: prior.version.clone(),
         source_commit: prior.source_commit.clone(),
@@ -3232,6 +3373,8 @@ pub fn rollback_update(
     let receipt = stage_install_read_receipt(
         &store,
         &mut state,
+        manifest,
+        &prior,
         &previous_bundle,
         ROLLBACK_REQUEST_SUFFIX,
         &request,
@@ -3248,6 +3391,58 @@ pub fn rollback_update(
     state.pending_effect = None;
     persist(&store, &mut state)?;
     Ok(state)
+}
+
+fn authenticate_rollback_recovery_artifacts(
+    store: &Store,
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+    prior: &BundleRecord,
+    candidate_receipt: &InstalledReceipt,
+) -> Result<()> {
+    let retained_bundle = state
+        .previous_bundle_suffix
+        .as_deref()
+        .ok_or_else(|| contract("retained bundle artifact is absent"))?;
+    let retained_request = state
+        .previous_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("retained request artifact is absent"))?;
+    authenticate_bundle_artifact(store, manifest, prior, retained_bundle)
+        .map_err(|_| contract("retained rollback bundle authentication failed"))?;
+    authenticate_install_request_artifact(store, state, prior, retained_request, None)
+        .map_err(|_| contract("retained rollback request authentication failed"))?;
+    let candidate = state
+        .current
+        .as_ref()
+        .ok_or_else(|| contract("candidate bundle is absent"))?;
+    let candidate_bundle = state
+        .current_bundle_suffix
+        .as_deref()
+        .ok_or_else(|| contract("candidate bundle artifact is absent"))?;
+    let candidate_request = state
+        .current_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("candidate request artifact is absent"))?;
+    authenticate_bundle_artifact(store, manifest, candidate, candidate_bundle)
+        .map_err(|_| contract("candidate rollback bundle authentication failed"))?;
+    let request = authenticate_install_request_artifact(
+        store,
+        state,
+        candidate,
+        candidate_request,
+        state
+            .previous_receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_sha256.as_str()),
+    )
+    .map_err(|_| contract("candidate rollback request authentication failed"))?;
+    InstalledReceipt::parse_and_verify(
+        &canonical_json(candidate_receipt)?,
+        &request,
+        ReceiptState::Installed,
+    )?;
+    Ok(())
 }
 
 /// Reconcile a narrowly fenced operator SSH CIDR recovery without changing lifecycle phase.
@@ -3539,6 +3734,26 @@ fn load_state(store: &Store, manifest: &AwsEc2Manifest) -> Result<Ec2State> {
         return Err(ReleaseError::OperationConflict);
     }
     Ok(state)
+}
+
+fn load_state_for_update(store: &Store, manifest: &AwsEc2Manifest) -> Result<(Ec2State, bool)> {
+    let Some((state, bytes)) = store.read_with_bytes::<Ec2State>()? else {
+        return Err(contract("no owned EC2 lifecycle state exists"));
+    };
+    let legacy = if state.verify().is_ok() {
+        false
+    } else {
+        state.verify_legacy_bytes(&bytes)?;
+        true
+    };
+    if state.target != manifest.target
+        || state.region != manifest.region
+        || state.domain != manifest.domain
+        || state.infrastructure != InfrastructureRecord::from_manifest(manifest)
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok((state, legacy))
 }
 
 fn read_verified_state(store: &Store) -> Result<Option<Ec2State>> {
