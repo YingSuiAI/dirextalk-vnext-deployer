@@ -402,10 +402,11 @@ pub fn issue(
 
 const REMOTE_BINDING_REQUEST: &str = "/home/ubuntu/dirextalk-client-binding.request";
 const REMOTE_BINDING_IMPORT: &str = "/home/ubuntu/dirextalk-client-binding.import.json";
-const REMOTE_RELEASE_ROOT: &str = "/var/lib/dirextalk/vnext/releases";
+const REMOTE_RELEASE_ROOT: &str = "/opt/dirextalk-vnext/releases";
 const REMOTE_HELPER_RELATIVE: &str = "scripts/production-stack/host/client-binding-issue";
 const REMOTE_CLEANUP_RELATIVE: &str = "scripts/production-stack/host/client-binding-export-cleanup";
 const REMOTE_CA_FILE: &str = "/run/dtx-client-binding/private-ca.pem";
+const REMOTE_CLIENT_BINDING_ROOT: &str = "/etc/dirextalk/vnext/client-binding";
 const CLIENT_BINDING_TTL_MILLIS: u64 = 900_000;
 
 #[derive(Clone, Debug, Serialize)]
@@ -501,6 +502,7 @@ pub fn issue_ec2(
         "verify-client-binding-cleanup-helper",
         executor,
     )?;
+    reconcile_remote_client_binding_root(&state, &ec2_store, executor)?;
 
     let origin = format!("https://{}", state.domain);
     validate_origin(&origin)?;
@@ -573,6 +575,79 @@ pub fn issue_ec2(
     completed.state = BindingState::Issued;
     binding_store.write(&completed)?;
     Ok(ClientBindingProjection::from(&completed))
+}
+
+fn reconcile_remote_client_binding_root(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let mut metadata = inspect_remote_client_binding_root(state, store, executor)?;
+    if metadata.trim().is_empty() {
+        let output = executor.run(&aws_ec2::workflow::ssh_command(
+            "create-client-binding-root",
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0700",
+                "--",
+                REMOTE_CLIENT_BINDING_ROOT,
+            ],
+            true,
+            30,
+        )?)?;
+        if output.status != 0 || !output.stdout.is_empty() || !output.stderr.is_empty() {
+            return Err(contract("client binding root creation failed"));
+        }
+        metadata = inspect_remote_client_binding_root(state, store, executor)?;
+    }
+    if metadata.split_ascii_whitespace().collect::<Vec<_>>()
+        != ["d", "0", "0", "700", REMOTE_CLIENT_BINDING_ROOT]
+    {
+        return Err(contract("client binding root is unsafe"));
+    }
+    Ok(())
+}
+
+fn inspect_remote_client_binding_root(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    executor: &dyn AwsExecutor,
+) -> Result<String> {
+    let output = executor.run(&aws_ec2::workflow::ssh_command(
+        "inspect-client-binding-root",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/find",
+            "/etc/dirextalk/vnext",
+            "-maxdepth",
+            "1",
+            "-mindepth",
+            "1",
+            "-name",
+            "client-binding",
+            "-printf",
+            "%y %U %G %m %p\\n",
+        ],
+        false,
+        30,
+    )?)?;
+    if output.status != 0 || !output.stderr.is_empty() {
+        return Err(contract("client binding root inspection failed"));
+    }
+    Ok(output.stdout)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1517,6 +1592,7 @@ mod tests {
         request_digest: String,
         pending_path: Option<PathBuf>,
         pending_observed: Mutex<bool>,
+        root_outputs: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -1542,8 +1618,17 @@ mod tests {
                 request_digest: hex::encode(Sha256::digest(&request_bytes)),
                 pending_path,
                 pending_observed: Mutex::new(false),
+                root_outputs: Mutex::new(vec![
+                    format!("d 0 0 700 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+                    format!("d 0 0 700 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+                ]),
                 calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_root_outputs(mut self, outputs: Vec<String>) -> Self {
+            self.root_outputs = Mutex::new(outputs);
+            self
         }
 
         fn calls(&self) -> Vec<String> {
@@ -1580,6 +1665,19 @@ mod tests {
                     "{}  {REMOTE_BINDING_IMPORT}\n",
                     hex::encode(Sha256::digest(&self.import))
                 ),
+                "inspect-client-binding-root" => {
+                    self.root_outputs.lock().expect("root outputs").remove(0)
+                }
+                "create-client-binding-root" => {
+                    assert!(command.mutation);
+                    assert_eq!(
+                        command.argv.last().map(String::as_str),
+                        Some(
+                            "'/usr/bin/sudo' '--non-interactive' '/usr/bin/install' '-d' '-o' 'root' '-g' 'root' '-m' '0700' '--' '/etc/dirextalk/vnext/client-binding'"
+                        )
+                    );
+                    String::new()
+                }
                 "pull-client-binding-import" => {
                     let local = command
                         .argv
@@ -2231,6 +2329,18 @@ mod tests {
                 .iter()
                 .any(|id| id == "cleanup-client-binding-export")
         );
+        let calls = executor.calls();
+        assert!(!calls.iter().any(|id| id == "create-client-binding-root"));
+        assert!(
+            calls
+                .iter()
+                .position(|id| id == "inspect-client-binding-root")
+                .expect("root inspection")
+                > calls
+                    .iter()
+                    .position(|id| id == "verify-client-binding-cleanup-helper-digest")
+                    .expect("cleanup helper digest")
+        );
         let after = fs::symlink_metadata(&output).expect("output metadata");
         assert_eq!(after.ino(), before.ino());
         assert_eq!(
@@ -2245,6 +2355,138 @@ mod tests {
                 .state,
             BindingState::Issued
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_ec2_creates_missing_client_binding_root_only_after_helpers_are_verified() {
+        let fixture = issue_ec2_fixture();
+        assert!(
+            fixture
+                .issue_path
+                .starts_with("/opt/dirextalk-vnext/releases/")
+        );
+        let state_dir = fixture.root.path().join("ec2-state");
+        {
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
+            store.write(&fixture.state).expect("EC2 state");
+        }
+        let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
+        let output = fixture.root.path().join("binding.import.json");
+        let executor = IssueReplayExecutor::new(&fixture, None).with_root_outputs(vec![
+            String::new(),
+            format!("d 0 0 700 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+        ]);
+
+        issue_ec2(
+            &fixture.manifest,
+            &state_dir,
+            &output,
+            &binding_store,
+            &executor,
+        )
+        .expect("issue after fixed root creation");
+
+        let calls = executor.calls();
+        let create = calls
+            .iter()
+            .position(|id| id == "create-client-binding-root")
+            .expect("fixed root creation");
+        assert!(
+            create
+                > calls
+                    .iter()
+                    .position(|id| id == "verify-client-binding-cleanup-helper-digest")
+                    .expect("cleanup helper digest")
+        );
+        assert!(
+            create
+                < calls
+                    .iter()
+                    .position(|id| id == "inspect-client-binding-request")
+                    .expect("request inspection")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_client_binding_root_fails_before_request_or_helper_execution_without_secrets() {
+        for metadata in [
+            format!("l 0 0 777 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+            format!("f 0 0 700 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+            format!("d 1000 0 700 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+            format!("d 0 1000 700 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+            format!("d 0 0 755 {REMOTE_CLIENT_BINDING_ROOT}\n"),
+        ] {
+            let fixture = issue_ec2_fixture();
+            let state_dir = fixture.root.path().join("ec2-state");
+            {
+                let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
+                store.write(&fixture.state).expect("EC2 state");
+            }
+            let binding_store =
+                ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
+            let secret_output_marker = "secret-client-binding-output";
+            let output = fixture.root.path().join(secret_output_marker);
+            let executor =
+                IssueReplayExecutor::new(&fixture, None).with_root_outputs(vec![metadata]);
+
+            let error = issue_ec2(
+                &fixture.manifest,
+                &state_dir,
+                &output,
+                &binding_store,
+                &executor,
+            )
+            .expect_err("unsafe root must fail closed");
+            assert!(!error.to_string().contains("client-binding"));
+            assert!(!error.to_string().contains(secret_output_marker));
+            let calls = executor.calls();
+            assert!(!calls.iter().any(|id| id == "create-client-binding-root"));
+            assert!(
+                !calls
+                    .iter()
+                    .any(|id| id == "inspect-client-binding-request")
+            );
+            assert!(!calls.iter().any(|id| id == "stage-client-binding-request"));
+            assert!(!calls.iter().any(|id| id == "run-client-binding-issue"));
+            assert!(
+                binding_store
+                    .read(&fixture.state.operation_id)
+                    .expect("binding state")
+                    .is_none()
+            );
+            assert!(!output.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_verification_failure_prevents_client_binding_root_creation() {
+        let fixture = issue_ec2_fixture();
+        let state_dir = fixture.root.path().join("ec2-state");
+        {
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
+            store.write(&fixture.state).expect("EC2 state");
+        }
+        let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
+        let output = fixture.root.path().join("binding.import.json");
+        let mut executor = IssueReplayExecutor::new(&fixture, None);
+        executor.issue_digest = "0".repeat(64);
+
+        assert!(
+            issue_ec2(
+                &fixture.manifest,
+                &state_dir,
+                &output,
+                &binding_store,
+                &executor,
+            )
+            .is_err()
+        );
+        let calls = executor.calls();
+        assert!(!calls.iter().any(|id| id == "inspect-client-binding-root"));
+        assert!(!calls.iter().any(|id| id == "create-client-binding-root"));
     }
 
     #[cfg(unix)]
