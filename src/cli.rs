@@ -194,7 +194,7 @@ enum Commands {
         #[arg(long, default_value = ".dirextalk-ec2-state")]
         state_dir: PathBuf,
     },
-    /// Validate an exact update request; mutation currently fails closed.
+    /// Apply or resume the authenticated forward update; dry-run unless --execute.
     Ec2Update {
         #[arg(long)]
         manifest: PathBuf,
