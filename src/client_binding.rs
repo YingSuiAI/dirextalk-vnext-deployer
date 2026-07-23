@@ -458,11 +458,16 @@ pub fn issue_ec2(
     manifest.validate()?;
     let facts = manifest.bundle()?;
     let ec2_store = aws_ec2::store::Store::lock(state_dir, &manifest.target)?;
-    let state = ec2_store
+    let mut state = ec2_store
         .read::<Ec2State>()?
         .ok_or_else(|| contract("EC2 lifecycle state is missing"))?;
     state.verify()?;
     validate_ec2_terminal(&state, manifest, &facts)?;
+    // The EC2 lock remains held from state read through proof and all binding
+    // effects, so a receipt/runtime cannot change between admission and use.
+    aws_ec2::workflow::attest_runtime_011_to_014_locked(
+        &ec2_store, &mut state, manifest, &facts, executor,
+    )?;
     let _binding_lock = binding_store.lock(&state.operation_id)?;
     let release = format!(
         "{REMOTE_RELEASE_ROOT}/{}/{}",
@@ -1608,6 +1613,8 @@ mod tests {
         issue_digest: String,
         cleanup_path: String,
         cleanup_digest: String,
+        runtime_attestation: String,
+        current_receipt: String,
     }
 
     struct IssueReplayExecutor {
@@ -1623,6 +1630,8 @@ mod tests {
         root_outputs: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
         commands: Mutex<Vec<aws_ec2::FixedCommand>>,
+        runtime_attestation: String,
+        current_receipt: String,
     }
 
     impl IssueReplayExecutor {
@@ -1653,6 +1662,8 @@ mod tests {
                 ]),
                 calls: Mutex::new(Vec::new()),
                 commands: Mutex::new(Vec::new()),
+                runtime_attestation: fixture.runtime_attestation.clone(),
+                current_receipt: fixture.current_receipt.clone(),
             }
         }
 
@@ -1688,6 +1699,22 @@ mod tests {
                 .expect("commands")
                 .push(command.clone());
             let stdout = match command.id.as_str() {
+                "inspect-installed-runtime-attester-011-to-014" => format!(
+                    "f root root 555 1 76217 {}\n",
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER
+                ),
+                "verify-installed-runtime-attester-011-to-014" => format!(
+                    "{}  {}\n",
+                    aws_ec2::RUNTIME_RECOVERY_SHA256,
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER
+                ),
+                "inspect-runtime-attestation" => format!(
+                    "f root root 600 1 {} {}\n",
+                    self.runtime_attestation.len(),
+                    aws_ec2::REMOTE_RUNTIME_ATTESTATION
+                ),
+                "read-runtime-attestation" => self.runtime_attestation.clone(),
+                "read-runtime-attestation-current-receipt" => self.current_receipt.clone(),
                 "verify-client-binding-issue-helper-metadata"
                 | "verify-client-binding-cleanup-helper-metadata" => "0 0 555 1\n".into(),
                 "verify-client-binding-issue-helper-digest" => {
@@ -1753,7 +1780,8 @@ mod tests {
                 | "verify-client-binding-request-not-symlink"
                 | "run-client-binding-issue"
                 | "verify-client-binding-import-regular"
-                | "verify-client-binding-import-not-symlink" => String::new(),
+                | "verify-client-binding-import-not-symlink"
+                | "run-fixed-runtime-attester-011-to-014" => String::new(),
                 other => return Err(contract(&format!("unexpected test command {other}"))),
             };
             Ok(aws_ec2::ExecOutput {
@@ -1838,7 +1866,7 @@ mod tests {
         let stack_manifest = StackManifest {
             schema: "dirextalk.vnext-stack-bundle".into(),
             schema_version: 1,
-            version: "1.0.0".into(),
+            version: "0.1.4".into(),
             source_commit: "d".repeat(40),
             target: "linux-amd64".into(),
             server_image: format!("dirextalk/vnet-server@sha256:{}", "a".repeat(64)),
@@ -1919,7 +1947,7 @@ mod tests {
             host_provisioner_sha256: hash(host_provisioner),
             receipt_reader_path,
             receipt_reader_sha256: hash(receipt_reader),
-            release_version: "1.0.0".into(),
+            release_version: "0.1.4".into(),
             source_commit: "d".repeat(40),
             server_image: stack_manifest.server_image,
             migrator_image: stack_manifest.migrator_image,
@@ -1943,6 +1971,40 @@ mod tests {
         );
         ownership_tags.insert("DirextalkDomain".into(), manifest.domain.clone());
         let desired = aws_ec2::BundleRecord::from_facts(&facts, &manifest);
+        let mut previous = desired.clone();
+        previous.version = "0.1.1".into();
+        previous.bundle_sha256 = "9".repeat(64);
+        previous.manifest_sha256 = "8".repeat(64);
+        let receipt = |version: &str,
+                       bundle_sha256: String,
+                       manifest_sha256: String,
+                       previous_receipt_sha256: Option<String>| {
+            let mut body = serde_json::json!({
+                "schema":"dirextalk.vnext-installed-release", "schema_version":1,
+                "state":"installed", "target":"linux-amd64", "domain":"example.com", "version":version,
+                "source_commit":"d".repeat(40), "bundle_sha256":bundle_sha256,
+                "manifest_sha256":manifest_sha256, "server_image":facts.manifest.server_image,
+                "migrator_image":facts.manifest.migrator_image, "previous_receipt_sha256":previous_receipt_sha256,
+                "installed_at_ms":1,
+            });
+            let digest = hash(&canonical_bundle_json(&body));
+            body.as_object_mut()
+                .expect("receipt object")
+                .insert("receipt_sha256".into(), serde_json::Value::String(digest));
+            serde_json::from_value::<aws_ec2::bundle::InstalledReceipt>(body).expect("receipt")
+        };
+        let previous_receipt = receipt(
+            "0.1.1",
+            previous.bundle_sha256.clone(),
+            previous.manifest_sha256.clone(),
+            None,
+        );
+        let current_receipt = receipt(
+            "0.1.4",
+            facts.bundle_sha256.clone(),
+            facts.manifest_sha256.clone(),
+            Some(previous_receipt.receipt_sha256.clone()),
+        );
         let state = Ec2State {
             schema: "dirextalk.aws-ec2-lifecycle".into(),
             schema_version: 1,
@@ -1961,7 +2023,7 @@ mod tests {
             infrastructure: aws_ec2::InfrastructureRecord::from_manifest(&manifest),
             desired: desired.clone(),
             current: Some(desired),
-            previous: None,
+            previous: Some(previous),
             ami: None,
             key: None,
             vpc_id: None,
@@ -1976,25 +2038,8 @@ mod tests {
             }),
             dns: None,
             host_key: None,
-            current_receipt: Some(
-                serde_json::from_value(serde_json::json!({
-                    "schema":"dirextalk.vnext-installed-release",
-                    "schema_version":1,
-                    "state":"installed",
-                    "target":"x6",
-                    "domain":"example.com",
-                    "version":"1.0.0",
-                    "source_commit":"d".repeat(40),
-                    "bundle_sha256":facts.bundle_sha256,
-                    "manifest_sha256":facts.manifest_sha256,
-                    "server_image":facts.manifest.server_image,
-                    "migrator_image":facts.manifest.migrator_image,
-                    "installed_at_ms":1,
-                    "receipt_sha256":"f".repeat(64)
-                }))
-                .expect("installed receipt"),
-            ),
-            previous_receipt: None,
+            current_receipt: Some(current_receipt.clone()),
+            previous_receipt: Some(previous_receipt),
             rollback_receipt: None,
             host_ready_receipt: Some(
                 serde_json::from_value(serde_json::json!({
@@ -2006,15 +2051,15 @@ mod tests {
                     "domain":"example.com",
                     "tenant_id":tenant_id,
                     "indexer_id":"018f856e-e0bd-71d2-9428-58d50cf77eb0",
-                    "release_version":"1.0.0",
+                    "release_version":"0.1.4",
                     "bundle_sha256":facts.bundle_sha256,
                     "compose_sha256":facts.compose_sha256,
                     "receipt_sha256":"2".repeat(64)
                 }))
                 .expect("host ready receipt"),
             ),
-            current_bundle_suffix: None,
-            current_request_suffix: None,
+            current_bundle_suffix: Some("current.bundle".into()),
+            current_request_suffix: Some("current.request".into()),
             previous_bundle_suffix: None,
             previous_request_suffix: None,
             candidate_bundle_suffix: None,
@@ -2049,6 +2094,25 @@ mod tests {
         );
         let issue_digest = hash(issue_helper);
         let cleanup_digest = hash(cleanup_helper);
+        let mut attestation_body = serde_json::json!({
+            "schema":"dirextalk.vnext-runtime-attestation", "schema_version":1,
+            "bundle_sha256":facts.bundle_sha256, "version":"0.1.4",
+            "server_image":facts.manifest.server_image, "migrator_image":facts.manifest.migrator_image,
+            "production_env_sha256":"1".repeat(64), "compose_sha256":"2".repeat(64), "caddy_sha256":"3".repeat(64),
+            "running_services_sha256":"4".repeat(64), "client_binding_binary_sha256":"5".repeat(64), "migration_proof_sha256":"6".repeat(64)
+        });
+        let attest_digest = hash(&canonical_bundle_json(&attestation_body));
+        attestation_body
+            .as_object_mut()
+            .expect("attestation object")
+            .insert(
+                "attestation_sha256".into(),
+                serde_json::Value::String(attest_digest),
+            );
+        let runtime_attestation =
+            String::from_utf8(canonical_bundle_json(&attestation_body)).expect("attestation text");
+        let current_receipt =
+            String::from_utf8(canonical_bundle_json(&current_receipt)).expect("receipt text");
         IssueEc2Fixture {
             issue_path: format!(
                 "{REMOTE_RELEASE_ROOT}/{}/{}",
@@ -2064,7 +2128,52 @@ mod tests {
             import,
             issue_digest,
             cleanup_digest,
+            runtime_attestation,
+            current_receipt,
         }
+    }
+
+    fn write_issue_ec2_state(store: &aws_ec2::store::Store, fixture: &IssueEc2Fixture) {
+        use aws_ec2::bundle::InstallRequest;
+        let facts = fixture.manifest.bundle().expect("fixture facts");
+        store
+            .copy_artifact(
+                "current.bundle",
+                &fixture.manifest.stack_bundle_path,
+                &facts.bundle_sha256,
+            )
+            .expect("current bundle");
+        let previous = fixture
+            .state
+            .previous_receipt
+            .as_ref()
+            .expect("previous receipt");
+        let request = InstallRequest::new(
+            &fixture.state.domain,
+            &facts,
+            Some(previous.receipt_sha256.clone()),
+        );
+        store
+            .write_artifact(
+                "current.request",
+                &request.canonical_bytes().expect("current request"),
+                0o600,
+            )
+            .expect("current request");
+        let helper = std::process::Command::new("git")
+            .args([
+                "-C",
+                "/home/adam/dirextalk/dirextalk-vnext-server",
+                "show",
+                "f36b1c8:scripts/production-stack/host/install-vnext",
+            ])
+            .output()
+            .expect("runtime helper source");
+        assert!(helper.status.success());
+        store
+            .write_artifact("runtime-recovery-011-to-014", &helper.stdout, 0o600)
+            .expect("sealed runtime helper");
+        store.write(&fixture.state).expect("EC2 state");
     }
 
     fn recovery_state() -> Ec2State {
@@ -2340,7 +2449,7 @@ mod tests {
         let state_dir = fixture.root.path().join("ec2-state");
         {
             let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
-            store.write(&fixture.state).expect("EC2 state");
+            write_issue_ec2_state(&store, &fixture);
         }
         let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
         let output = fixture.root.path().join("binding.import.json");
@@ -2413,7 +2522,7 @@ mod tests {
         let state_dir = fixture.root.path().join("ec2-state");
         {
             let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
-            store.write(&fixture.state).expect("EC2 state");
+            write_issue_ec2_state(&store, &fixture);
         }
         let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
         let output = fixture.root.path().join("binding.import.json");
@@ -2496,7 +2605,7 @@ mod tests {
             let state_dir = fixture.root.path().join("ec2-state");
             {
                 let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
-                store.write(&fixture.state).expect("EC2 state");
+                write_issue_ec2_state(&store, &fixture);
             }
             let binding_store =
                 ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
@@ -2541,7 +2650,7 @@ mod tests {
         let state_dir = fixture.root.path().join("ec2-state");
         {
             let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
-            store.write(&fixture.state).expect("EC2 state");
+            write_issue_ec2_state(&store, &fixture);
         }
         let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
         let output = fixture.root.path().join("binding.import.json");
@@ -2572,7 +2681,7 @@ mod tests {
         let state_dir = fixture.root.path().join("ec2-state");
         {
             let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
-            store.write(&fixture.state).expect("EC2 state");
+            write_issue_ec2_state(&store, &fixture);
         }
         let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
         let output = fixture.root.path().join("binding.import.json");

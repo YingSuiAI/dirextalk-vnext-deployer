@@ -9,6 +9,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -26,7 +27,10 @@ use super::{
     REMOTE_CURRENT_RECEIPT, REMOTE_INSTALLER, REMOTE_INSTALLER_ATOMIC, REMOTE_INSTALLER_UPLOAD,
     REMOTE_PROVISION_REQUEST, REMOTE_PROVISIONER, REMOTE_PROVISIONER_ATOMIC,
     REMOTE_PROVISIONER_UPLOAD, REMOTE_READY_RECEIPT, REMOTE_RECEIPT_READER,
-    REMOTE_RECEIPT_READER_ATOMIC, REMOTE_RECEIPT_READER_UPLOAD, REMOTE_REQUEST, ReceiptState,
+    REMOTE_RECEIPT_READER_ATOMIC, REMOTE_RECEIPT_READER_UPLOAD, REMOTE_REQUEST,
+    REMOTE_RUNTIME_ATTESTATION, REMOTE_RUNTIME_ATTESTER, REMOTE_RUNTIME_ATTESTER_ATOMIC,
+    REMOTE_RUNTIME_ATTESTER_UPLOAD, REMOTE_RUNTIME_RECOVERY, REMOTE_RUNTIME_RECOVERY_ATOMIC,
+    REMOTE_RUNTIME_RECOVERY_UPLOAD, RUNTIME_RECOVERY_SHA256, RUNTIME_RECOVERY_SIZE, ReceiptState,
     RegistryExecutor, SCP, SSH, SSH_KEYGEN, SSH_KEYSCAN, StatusReport, UBUNTU_OWNER,
     UBUNTU_PATTERN, VerifyReport, contract, enforce_cost_guard, expected_tags,
     resolve_latest_digest,
@@ -46,6 +50,25 @@ pub(super) const CROSS_VERSION_BOOTSTRAP_SUFFIX: &str = "cross-version-bootstrap
 const ROLLBACK_REQUEST_SUFFIX: &str = "rollback.request";
 const UPDATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
 const UPDATE_CAPACITY_INODES: u64 = 128;
+const RUNTIME_RECOVERY_SUFFIX: &str = "runtime-recovery-011-to-014";
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeAttestation {
+    schema: String,
+    schema_version: u32,
+    bundle_sha256: String,
+    version: String,
+    server_image: String,
+    migrator_image: String,
+    production_env_sha256: String,
+    compose_sha256: String,
+    caddy_sha256: String,
+    running_services_sha256: String,
+    client_binding_binary_sha256: String,
+    migration_proof_sha256: String,
+    attestation_sha256: String,
+}
 
 pub fn apply(
     manifest: &AwsEc2Manifest,
@@ -1653,6 +1676,372 @@ fn ensure_cross_version_bootstrap(
         installed_name: "install-vnext-0.1.1-to-0.1.4",
     };
     ensure_host_helper(store, state, &helper, executor)
+}
+
+/// Seal and run the single admitted false-runtime recovery.  The caller may
+/// supply a local source only once; all subsequent remote use is of the sealed
+/// Store artifact, never the caller path.
+pub fn recover_runtime_011_to_014(
+    manifest: &AwsEc2Manifest,
+    state_dir: &Path,
+    helper: &Path,
+    execute: bool,
+    executor: &dyn AwsExecutor,
+) -> Result<Ec2State> {
+    manifest.validate()?;
+    let facts = manifest.bundle()?;
+    let store = Store::lock(state_dir, &manifest.target)?;
+    let mut state = load_state(&store, manifest)?;
+    admit_runtime_recovery(&state, manifest, &facts, &store)?;
+    authenticate_update_recovery_artifacts(&store, &state, manifest)?;
+    if !execute {
+        let bytes =
+            read_hash_bound_helper(helper, RUNTIME_RECOVERY_SHA256, "runtime recovery helper")?;
+        if bytes.len() != RUNTIME_RECOVERY_SIZE {
+            return Err(ReleaseError::SourceMismatch(helper.to_owned()));
+        }
+        return Ok(state);
+    }
+    seal_runtime_recovery_helper(&store, helper)?;
+    ensure_runtime_recovery_helpers(&store, &mut state, executor)?;
+    let command = ssh_command(
+        "run-fixed-runtime-recovery-011-to-014",
+        &state,
+        &store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            REMOTE_RUNTIME_RECOVERY,
+        ],
+        true,
+        900,
+    )?;
+    run_effect(&store, &mut state, &command, executor)?;
+    attest_runtime_011_to_014_locked(&store, &mut state, manifest, &facts, executor)?;
+    state.pending_effect = None;
+    persist(&store, &mut state)?;
+    Ok(state)
+}
+
+/// Re-run only the fixed proof helper and validate canonical runtime evidence.
+/// This is intentionally reusable by client-binding admission.
+pub fn attest_runtime_011_to_014(
+    manifest: &AwsEc2Manifest,
+    state_dir: &Path,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    manifest.validate()?;
+    let facts = manifest.bundle()?;
+    let store = Store::lock(state_dir, &manifest.target)?;
+    let mut state = load_state(&store, manifest)?;
+    attest_runtime_011_to_014_locked(&store, &mut state, manifest, &facts, executor)
+}
+
+fn seal_runtime_recovery_helper(store: &Store, helper: &Path) -> Result<()> {
+    match store.read_artifact(RUNTIME_RECOVERY_SUFFIX, (RUNTIME_RECOVERY_SIZE + 1) as u64) {
+        Ok(bytes)
+            if bytes.len() == RUNTIME_RECOVERY_SIZE && hash(&bytes) == RUNTIME_RECOVERY_SHA256 =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(ReleaseError::SourceMismatch(
+            store.artifact_path(RUNTIME_RECOVERY_SUFFIX)?,
+        )),
+        Err(ReleaseError::MissingArtifact(_)) => {
+            let bytes =
+                read_hash_bound_helper(helper, RUNTIME_RECOVERY_SHA256, "runtime recovery helper")?;
+            if bytes.len() != RUNTIME_RECOVERY_SIZE {
+                return Err(ReleaseError::SourceMismatch(helper.to_owned()));
+            }
+            store.write_artifact(RUNTIME_RECOVERY_SUFFIX, &bytes, 0o600)?;
+            seal_runtime_recovery_helper(store, helper)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_runtime_recovery_helpers(
+    store: &Store,
+    state: &mut Ec2State,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let bytes = store.read_artifact(RUNTIME_RECOVERY_SUFFIX, (RUNTIME_RECOVERY_SIZE + 1) as u64)?;
+    if bytes.len() != RUNTIME_RECOVERY_SIZE || hash(&bytes) != RUNTIME_RECOVERY_SHA256 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let local = store.artifact_path(RUNTIME_RECOVERY_SUFFIX)?;
+    for helper in [
+        HostHelperSpec {
+            label: "runtime-recovery-011-to-014",
+            local: &local,
+            sha256: RUNTIME_RECOVERY_SHA256,
+            size: bytes.len(),
+            upload: REMOTE_RUNTIME_RECOVERY_UPLOAD,
+            upload_name: "recover-vnext-011-to-014.upload",
+            atomic: REMOTE_RUNTIME_RECOVERY_ATOMIC,
+            atomic_name: ".recover-vnext-011-to-014.new",
+            installed: REMOTE_RUNTIME_RECOVERY,
+            installed_name: "recover-vnext-011-to-014",
+        },
+        HostHelperSpec {
+            label: "runtime-attester-011-to-014",
+            local: &local,
+            sha256: RUNTIME_RECOVERY_SHA256,
+            size: bytes.len(),
+            upload: REMOTE_RUNTIME_ATTESTER_UPLOAD,
+            upload_name: "attest-vnext-011-to-014.upload",
+            atomic: REMOTE_RUNTIME_ATTESTER_ATOMIC,
+            atomic_name: ".attest-vnext-011-to-014.new",
+            installed: REMOTE_RUNTIME_ATTESTER,
+            installed_name: "attest-vnext-011-to-014",
+        },
+    ] {
+        ensure_host_helper(store, state, &helper, executor)?;
+    }
+    Ok(())
+}
+
+fn admit_runtime_recovery(
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+    store: &Store,
+) -> Result<()> {
+    state.verify()?;
+    if state.pending_effect.as_deref().is_some_and(|effect| {
+        !matches!(
+            effect,
+            "run-fixed-runtime-recovery-011-to-014" | "run-fixed-runtime-attester-011-to-014"
+        )
+    }) {
+        return Err(contract(
+            "runtime recovery has an unexpected pending effect",
+        ));
+    }
+    if state.phase != LifecyclePhase::Verified
+        || state.desired != BundleRecord::from_facts(facts, manifest)
+    {
+        return Err(contract(
+            "runtime recovery requires the exact verified desired candidate",
+        ));
+    }
+    let (Some(current), Some(previous), Some(current_receipt), Some(previous_receipt)) = (
+        &state.current,
+        &state.previous,
+        &state.current_receipt,
+        &state.previous_receipt,
+    ) else {
+        return Err(contract("runtime recovery receipts are incomplete"));
+    };
+    if current != &state.desired
+        || current.version != "0.1.4"
+        || previous.version != "0.1.1"
+        || current_receipt.version != "0.1.4"
+        || previous_receipt.version != "0.1.1"
+        || current_receipt.previous_receipt_sha256.as_deref()
+            != Some(&previous_receipt.receipt_sha256)
+    {
+        return Err(contract(
+            "runtime recovery receipt chain is not exactly 0.1.1 to 0.1.4",
+        ));
+    }
+    let (Some(bundle_suffix), Some(request_suffix)) =
+        (&state.current_bundle_suffix, &state.current_request_suffix)
+    else {
+        return Err(contract(
+            "runtime recovery authenticated artifacts are absent",
+        ));
+    };
+    authenticate_bundle_artifact(store, manifest, current, bundle_suffix)?;
+    authenticate_install_request_artifact(
+        store,
+        state,
+        current,
+        request_suffix,
+        current_receipt.previous_receipt_sha256.as_deref(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn attest_runtime_011_to_014_locked(
+    store: &Store,
+    state: &mut Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    admit_runtime_recovery(state, manifest, facts, store)?;
+    // A missing or substituted helper is never self-healed here: recovery is
+    // the sole authority that seals and stages this exceptional executable.
+    let sealed =
+        store.read_artifact(RUNTIME_RECOVERY_SUFFIX, (RUNTIME_RECOVERY_SIZE + 1) as u64)?;
+    if sealed.len() != RUNTIME_RECOVERY_SIZE || hash(&sealed) != RUNTIME_RECOVERY_SHA256 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let installed = inspect_remote_file(
+        state,
+        store,
+        executor,
+        "inspect-installed-runtime-attester-011-to-014",
+        "/usr/local/libexec/dirextalk",
+        "attest-vnext-011-to-014",
+    )?
+    .ok_or(ReleaseError::OperationConflict)?;
+    require_remote_metadata(
+        &installed,
+        REMOTE_RUNTIME_ATTESTER,
+        "root",
+        "root",
+        "555",
+        RUNTIME_RECOVERY_SIZE,
+    )?;
+    verify_remote_helper_hash(
+        state,
+        store,
+        executor,
+        "verify-installed-runtime-attester-011-to-014",
+        REMOTE_RUNTIME_ATTESTER,
+        RUNTIME_RECOVERY_SHA256,
+        true,
+    )?;
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            "run-fixed-runtime-attester-011-to-014",
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                REMOTE_RUNTIME_ATTESTER,
+            ],
+            true,
+            900,
+        )?,
+        executor,
+    )?;
+    let metadata = inspect_remote_file(
+        state,
+        store,
+        executor,
+        "inspect-runtime-attestation",
+        "/var/lib/dirextalk-vnext",
+        "runtime-attestation.json",
+    )?
+    .ok_or(ReleaseError::OperationConflict)?;
+    require_remote_metadata(
+        &metadata,
+        REMOTE_RUNTIME_ATTESTATION,
+        "root",
+        "root",
+        "600",
+        metadata.size,
+    )?;
+    if metadata.size == 0 || metadata.size > 64 * 1024 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let output = executor.run(&ssh_command(
+        "read-runtime-attestation",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/cat",
+            REMOTE_RUNTIME_ATTESTATION,
+        ],
+        false,
+        30,
+    )?)?;
+    if output.status != 0 || !output.stderr.is_empty() || output.stdout.len() != metadata.size {
+        return Err(ReleaseError::OperationConflict);
+    }
+    validate_runtime_attestation(output.stdout.as_bytes(), state, manifest, facts)?;
+    let request = InstallRequest::new(
+        &state.domain,
+        facts,
+        state
+            .previous_receipt
+            .as_ref()
+            .map(|r| r.receipt_sha256.clone()),
+    );
+    let receipt = executor.run(&ssh_command(
+        "read-runtime-attestation-current-receipt",
+        state,
+        store,
+        ["/usr/bin/sudo", "--non-interactive", REMOTE_RECEIPT_READER],
+        false,
+        30,
+    )?)?;
+    if !receipt.stderr.is_empty() {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let current = InstalledReceipt::parse_and_verify(
+        receipt.stdout.as_bytes(),
+        &request,
+        ReceiptState::Installed,
+    )?;
+    if state.current_receipt.as_ref() != Some(&current) {
+        return Err(contract(
+            "current receipt changed after runtime attestation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_attestation(
+    raw: &[u8],
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+) -> Result<()> {
+    let value: Value = serde_json::from_slice(raw)?;
+    if canonical_json(&value)? != raw {
+        return Err(contract("runtime attestation is not canonical"));
+    }
+    let attestation: RuntimeAttestation = serde_json::from_value(value.clone())?;
+    if attestation.schema != "dirextalk.vnext-runtime-attestation"
+        || attestation.schema_version != 1
+    {
+        return Err(contract("runtime attestation schema is invalid"));
+    }
+    let mut body = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| contract("runtime attestation is not an object"))?;
+    let claimed = body
+        .remove("attestation_sha256")
+        .ok_or_else(|| contract("runtime attestation digest is absent"))?;
+    if claimed.as_str() != Some(attestation.attestation_sha256.as_str())
+        || hash(&canonical_json(&body)?) != attestation.attestation_sha256
+    {
+        return Err(contract("runtime attestation digest is invalid"));
+    }
+    if attestation.bundle_sha256 != facts.bundle_sha256
+        || attestation.version != "0.1.4"
+        || attestation.server_image != manifest.server_image
+        || attestation.migrator_image != manifest.migrator_image
+        || state
+            .current
+            .as_ref()
+            .is_none_or(|c| c.bundle_sha256 != attestation.bundle_sha256)
+    {
+        return Err(contract(
+            "runtime attestation tuple differs from current receipt",
+        ));
+    }
+    for digest in [
+        &attestation.production_env_sha256,
+        &attestation.compose_sha256,
+        &attestation.caddy_sha256,
+        &attestation.running_services_sha256,
+        &attestation.client_binding_binary_sha256,
+        &attestation.migration_proof_sha256,
+    ] {
+        super::bundle::digest(digest, "runtime attestation digest")?;
+    }
+    Ok(())
 }
 
 fn ensure_host_helper(

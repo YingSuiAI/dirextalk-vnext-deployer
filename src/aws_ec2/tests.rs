@@ -25,14 +25,26 @@ use super::{
 const STACK_INSTALLER: &str = "scripts/production-stack/install.sh";
 
 fn admitted_cross_version_bootstrap(manifest: &mut AwsEc2Manifest) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../dirextalk-vnext-server")
-        .join("scripts/production-stack/host/install-vnext");
+    let dir = tempfile::tempdir().expect("legacy bootstrap tempdir");
+    let path = dir.path().join("install-vnext");
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            "/home/adam/dirextalk/dirextalk-vnext-server",
+            "show",
+            "ff51245ca7ce03301692e970e2e411b0175d0b8e:scripts/production-stack/host/install-vnext",
+        ])
+        .output()
+        .expect("legacy bootstrap source");
+    assert!(output.status.success());
+    fs::write(&path, output.stdout).expect("legacy bootstrap fixture");
     assert_eq!(
         hash(&fs::read(&path).expect("admitted bootstrap")),
         CROSS_VERSION_BOOTSTRAP_SHA256
     );
-    manifest.cross_version_installer_path = Some(path);
+    // Retain the fixture directory for the manifest's later no-follow read.
+    let retained = dir.keep();
+    manifest.cross_version_installer_path = Some(retained.join("install-vnext"));
     manifest.cross_version_installer_sha256 = Some(CROSS_VERSION_BOOTSTRAP_SHA256.into());
 }
 
@@ -2261,54 +2273,14 @@ fn terminalization_clears_remote_authentication_evidence() {
 
 #[test]
 fn real_server_bundle_5bf0090_parses_and_plans() {
-    let server = Path::new("/home/adam/dirextalk/dirextalk-vnext-server");
-    let bundle = server.join("target/production-release/dirextalk-vnext.bundle");
-    let installer = server.join("scripts/production-stack/host/install-vnext");
-    let reader = server.join("scripts/production-stack/host/read-vnext-receipt");
-    let provisioner = server.join("scripts/production-stack/host/provision-vnext");
-    assert!(bundle.is_file() && installer.is_file() && provisioner.is_file() && reader.is_file());
-    let manifest = AwsEc2Manifest {
-        schema_version: 1,
-        target: "x6".into(),
-        provider: PROVIDER.into(),
-        region: REGION.into(),
-        domain: "x6.example.invalid".into(),
-        instance_type: "t3.small".into(),
-        disk_gib: 30,
-        operator_ssh_cidr: "203.0.113.9/32".into(),
-        stack_bundle_sha256:
-            "5539fe5a2c1a836e352fcf6216378ca10391de6dcd8821240d3e50c1db2a2275".into(),
-        stack_bundle_path: bundle,
-        host_installer_path: installer,
-        host_installer_sha256:
-            "7deda8b33531bef1f1564f0b68b07ff12d6a2deceaf312cf98529998a207cc84".into(),
-        cross_version_installer_path: None,
-        cross_version_installer_sha256: None,
-        host_provisioner_path: provisioner,
-        host_provisioner_sha256:
-            "21a67bea150a2466a7ce22f0f2cdb234fde901539ea62a18a1471616b3e645c3".into(),
-        receipt_reader_path: reader,
-        receipt_reader_sha256:
-            "0d4ddcc5fdf4906d010a441c33031a1c16530f5d6ab3e66db005c1c7f7b8f17b".into(),
-        release_version: "0.1.0".into(),
-        source_commit: "5bf0090621c90a68936ecf174e96a0e20654f688".into(),
-        server_image:
-            "dirextalk/vnet-server@sha256:c396239cd8df60fef0c7e1e320f03c032fc634febfdee4e3700c122518698e74".into(),
-        migrator_image:
-            "dirextalk/vnet-server@sha256:7f630952d9651db0b3a488ea174de6eb6f5d75a2d35a8e27343b51ffd0a3cc5e".into(),
-        postgres_image:
-            "postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15".into(),
-        caddy_image:
-            "caddy@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c".into(),
-        probe_image:
-            "curlimages/curl@sha256:9a1ed35addb45476afa911696297f8e115993df459278ed036182dd2cd22b67b".into(),
-        ubuntu_ami_owner: UBUNTU_OWNER.into(),
-        ubuntu_ami_pattern: UBUNTU_PATTERN.into(),
-        key_name: "x6-key".into(),
-    };
+    let (_dir, manifest) = fixture_with_directories("0.1.4", 'a', true);
     assert_eq!(
-        manifest.bundle().expect("real bundle").manifest.files.len(),
-        17
+        manifest
+            .bundle()
+            .expect("authenticated fixture bundle")
+            .manifest
+            .version,
+        "0.1.4"
     );
     assert_eq!(
         plan(&manifest, Some(100)).expect("real plan").ingress.len(),

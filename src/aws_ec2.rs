@@ -37,8 +37,8 @@ use bundle::{
 use provision::HostReadyReceipt;
 
 pub use workflow::{
-    apply, destroy, rebind_operator_cidr, resume, rollback_update, status, status_with_registry,
-    update, verify,
+    apply, attest_runtime_011_to_014, destroy, rebind_operator_cidr, recover_runtime_011_to_014,
+    resume, rollback_update, status, status_with_registry, update, verify,
 };
 
 pub(super) const REGION: &str = "ap-east-1";
@@ -78,6 +78,20 @@ pub(super) const REMOTE_PROVISIONER_ATOMIC: &str =
     "/usr/local/libexec/dirextalk/.provision-vnext.new";
 pub(super) const REMOTE_RECEIPT_READER_ATOMIC: &str =
     "/usr/local/libexec/dirextalk/.read-vnext-receipt.new";
+pub(super) const REMOTE_RUNTIME_RECOVERY_UPLOAD: &str =
+    "/home/ubuntu/recover-vnext-011-to-014.upload";
+pub(super) const REMOTE_RUNTIME_RECOVERY_ATOMIC: &str =
+    "/usr/local/libexec/dirextalk/.recover-vnext-011-to-014.new";
+pub(super) const REMOTE_RUNTIME_RECOVERY: &str =
+    "/usr/local/libexec/dirextalk/recover-vnext-011-to-014";
+pub(super) const REMOTE_RUNTIME_ATTESTER_UPLOAD: &str =
+    "/home/ubuntu/attest-vnext-011-to-014.upload";
+pub(super) const REMOTE_RUNTIME_ATTESTER_ATOMIC: &str =
+    "/usr/local/libexec/dirextalk/.attest-vnext-011-to-014.new";
+pub(super) const REMOTE_RUNTIME_ATTESTER: &str =
+    "/usr/local/libexec/dirextalk/attest-vnext-011-to-014";
+pub(super) const REMOTE_RUNTIME_ATTESTATION: &str =
+    "/var/lib/dirextalk-vnext/runtime-attestation.json";
 pub(super) const REMOTE_READY_RECEIPT: &str = "/var/lib/dirextalk-vnext/host-provision/ready.json";
 pub(super) const HEALTH_PATH: &str = "/healthz";
 pub(super) const MAX_OUTPUT: u64 = 256 * 1024;
@@ -222,6 +236,9 @@ impl AwsEc2Manifest {
 
 pub(super) const CROSS_VERSION_BOOTSTRAP_SHA256: &str =
     "7b20ee7f048d7d813610659af60b597ab1e74b03b60a159fb685586cab7ac4da";
+pub(super) const RUNTIME_RECOVERY_SHA256: &str =
+    "8707a76e869ea5869bce7fa13e0cf23993460be80baca1018be2cf0346868885";
+pub(super) const RUNTIME_RECOVERY_SIZE: usize = 76_217;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

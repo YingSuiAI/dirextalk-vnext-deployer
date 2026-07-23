@@ -151,6 +151,17 @@ enum Commands {
         #[arg(long)]
         execute: bool,
     },
+    /// Recover only the admitted 0.1.1-to-0.1.4 false-runtime incident.
+    Ec2RecoverRuntime011To014 {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".dirextalk-ec2-state")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        recovery_helper: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
     /// Plan one immutable AWS EC2 vNext node (dry run).
     Ec2Plan {
         #[arg(long)]
@@ -395,6 +406,21 @@ pub fn run(cli: Cli) -> Result<()> {
                 &crate::aws_ec2::ProductionAwsExecutor,
             )?;
             print_json(&result)?;
+        }
+        Commands::Ec2RecoverRuntime011To014 {
+            manifest,
+            state_dir,
+            recovery_helper,
+            execute,
+        } => {
+            let manifest = AwsEc2Manifest::load(&manifest)?;
+            print_json(&aws_ec2::recover_runtime_011_to_014(
+                &manifest,
+                &state_dir,
+                &recovery_helper,
+                execute,
+                &ProductionAwsExecutor,
+            )?)?;
         }
         Commands::Ec2Plan {
             manifest,

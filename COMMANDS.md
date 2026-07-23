@@ -23,6 +23,7 @@ Run from the repository root.
 | Connector-host lifecycle apply | `sudo cargo run --locked -- deployment-connector-apply --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <id> --plan <plan.json> --handoff <handoff.json> --config <config.toml> --enrollment-ca <ca.pem> --control-ca <ca.pem> --issuer-ca <ca.pem>` |
 | Connector-host operation claim | `sudo cargo run --locked -- deployment-connector-claim --execute --operation-id <deployment-uuidv7> --manifest deployment.json --target <connector-host-id> [--predecessor-operation-id <terminal-deployment-uuidv7>]` |
 | Client binding issue (verified EC2 deployment only) | `sudo cargo run --locked -- ec2-client-binding-issue --execute --manifest aws-ec2.example.json --state-dir .dirextalk-ec2-state --output <operator-file>` |
+| One-time X6 runtime recovery (dry run unless `--execute`) | `cargo run --locked -- ec2-recover-runtime-011-to-014 --manifest aws-ec2.example.json --state-dir .dirextalk-ec2-state --recovery-helper <exact-local-install-vnext> [--execute]` |
 
 `build` only executes commands when `--execute` is supplied. `publish` also
 requires `--execute` plus one or more destination flags.
@@ -60,6 +61,13 @@ read-only `docker buildx imagetools inspect` argv. It parses only a canonical
 manifest `sha256:<64>` and compare it to the installed immutable
 `dirextalk/vnet-server@sha256:<64>` receipt; `latest` is never installed or
 used to gate `ec2-update`.
+
+`ec2-recover-runtime-011-to-014` admits only the sealed, verified 0.1.1 to
+0.1.4 receipt chain and fixed helper bytes. It stages the sealed helper under
+the fixed recovery and attestation basenames, runs no-argument recovery, then
+requires canonical runtime attestation and an unchanged current receipt.
+Client-binding issuance performs that proof-only attestation before it can
+create a request or remote binding root.
 
 On Windows without Visual C++ Build Tools, use the repository's development
 wrapper, for example `powershell -File scripts\cargo.ps1 test --locked`. It
