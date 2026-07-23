@@ -485,6 +485,42 @@ fn bundle_manifest_and_dry_run_are_digest_bound_without_effects() {
     state.verify().expect("integrity-sealed state");
 }
 
+#[cfg(unix)]
+#[test]
+fn pre_cross_version_sealed_state_is_exactly_authenticated_and_migrated_under_lock() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, manifest) = fixture("1.2.3", 'a');
+    let state_dir = dir.path().join("legacy-state");
+    let state = apply(
+        &manifest,
+        &state_dir,
+        100,
+        false,
+        &Never(AtomicUsize::new(0)),
+    )
+    .expect("state");
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    let legacy = state.legacy_sealed_bytes_for_test().expect("legacy bytes");
+    fs::write(store.state_path(), &legacy).expect("legacy state");
+    fs::set_permissions(store.state_path(), fs::Permissions::from_mode(0o600)).expect("mode");
+    drop(store);
+    status(&manifest, &state_dir).expect("locked migration");
+    let migrated: Ec2State = Store::lock(&state_dir, "x6")
+        .expect("store")
+        .read()
+        .expect("state")
+        .expect("present");
+    migrated.verify().expect("new seal");
+    assert_eq!(migrated.candidate_bundle_suffix, None);
+    let mut tampered = legacy;
+    tampered[0] = b'[';
+    fs::write(state_dir.join("x6.json"), tampered).expect("tamper");
+    fs::set_permissions(state_dir.join("x6.json"), fs::Permissions::from_mode(0o600))
+        .expect("mode");
+    assert!(status(&manifest, &state_dir).is_err());
+}
+
 #[test]
 fn missing_derived_directory_and_helper_tamper_fail_closed() {
     let (_dir, missing_directory) = fixture_with_directories("1.2.3", 'a', false);
@@ -781,6 +817,7 @@ fn initial_install_resume_accepts_exact_post_effect_receipt_without_reinstall() 
         "missing.request",
         &request,
         ReceiptState::Installed,
+        None,
         &executor,
     )
     .expect("resume receipt");

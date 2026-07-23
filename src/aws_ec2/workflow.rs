@@ -55,8 +55,7 @@ pub fn apply(
         return new_state(manifest, &facts, estimate, max_monthly_usd);
     }
     let store = Store::lock(state_dir, &manifest.target)?;
-    let mut state = if let Some(state) = store.read::<Ec2State>()? {
-        state.verify()?;
+    let mut state = if let Some(state) = read_verified_state(&store)? {
         ensure_apply_resumable_phase(&state.phase)?;
         ensure_apply_identity(&state, manifest, &facts)?;
         state
@@ -1963,6 +1962,7 @@ fn install_initial(
         APPLY_REQUEST_SUFFIX,
         &request,
         ReceiptState::Installed,
+        None,
         executor,
     )?;
     state.current = Some(BundleRecord::from_facts(facts, manifest));
@@ -2107,6 +2107,7 @@ fn provision_initial(
     persist(store, state)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_install_read_receipt(
     store: &Store,
     state: &mut Ec2State,
@@ -2114,10 +2115,14 @@ pub(super) fn stage_install_read_receipt(
     request_suffix: &str,
     request: &InstallRequest,
     expected_state: ReceiptState,
+    retained: Option<(&InstallRequest, ReceiptState)>,
     executor: &dyn AwsExecutor,
 ) -> Result<InstalledReceipt> {
-    if let Some(receipt) = read_existing_install_receipt(state, store, request, executor)? {
-        return Ok(receipt);
+    match read_existing_install_receipt(state, store, request, expected_state, retained, executor)?
+    {
+        ExistingInstallReceipt::PostEffect(receipt) => return Ok(*receipt),
+        ExistingInstallReceipt::PreEffect => clear_remote_install_inputs(store, state, executor)?,
+        ExistingInstallReceipt::Absent => {}
     }
     let bundle_path = store.artifact_path(bundle_suffix)?;
     let request_path = store.artifact_path(request_suffix)?;
@@ -2175,12 +2180,20 @@ pub(super) fn stage_install_read_receipt(
     InstalledReceipt::parse_and_verify(receipt.stdout.as_bytes(), request, expected_state)
 }
 
+enum ExistingInstallReceipt {
+    Absent,
+    PreEffect,
+    PostEffect(Box<InstalledReceipt>),
+}
+
 fn read_existing_install_receipt(
     state: &Ec2State,
     store: &Store,
     request: &InstallRequest,
+    expected_state: ReceiptState,
+    retained: Option<(&InstallRequest, ReceiptState)>,
     executor: &dyn AwsExecutor,
-) -> Result<Option<InstalledReceipt>> {
+) -> Result<ExistingInstallReceipt> {
     let metadata = executor.run(&ssh_command(
         "inspect-current-installed-receipt",
         state,
@@ -2203,7 +2216,7 @@ fn read_existing_install_receipt(
         30,
     )?)?;
     let Some(metadata) = parse_remote_file_metadata(&metadata.stdout)? else {
-        return Ok(None);
+        return Ok(ExistingInstallReceipt::Absent);
     };
     if metadata.kind != "f"
         || metadata.owner != "root"
@@ -2227,8 +2240,46 @@ fn read_existing_install_receipt(
     if output.stdout.len() != metadata.size {
         return Err(ReleaseError::OperationConflict);
     }
-    InstalledReceipt::parse_and_verify(output.stdout.as_bytes(), request, ReceiptState::Installed)
-        .map(Some)
+    if let Ok(receipt) =
+        InstalledReceipt::parse_and_verify(output.stdout.as_bytes(), request, expected_state)
+    {
+        return Ok(ExistingInstallReceipt::PostEffect(Box::new(receipt)));
+    }
+    if let Some((retained_request, retained_state)) = retained
+        && InstalledReceipt::parse_and_verify(
+            output.stdout.as_bytes(),
+            retained_request,
+            retained_state,
+        )
+        .is_ok()
+    {
+        return Ok(ExistingInstallReceipt::PreEffect);
+    }
+    Err(ReleaseError::OperationConflict)
+}
+
+fn clear_remote_install_inputs(
+    store: &Store,
+    state: &mut Ec2State,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let clear = ssh_command(
+        "clear-retained-install-inputs-before-replay",
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/rm",
+            "--force",
+            "--",
+            REMOTE_BUNDLE,
+            REMOTE_REQUEST,
+        ],
+        true,
+        30,
+    )?;
+    run_effect(store, state, &clear, executor).map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2848,6 +2899,23 @@ pub fn update(
     {
         return Err(ReleaseError::OperationConflict);
     }
+    let prior_request_suffix = state
+        .previous_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("retained install request fact is absent"))?;
+    let prior_request: InstallRequest =
+        serde_json::from_slice(&store.read_artifact(prior_request_suffix, 64 * 1024)?)?;
+    let retained_receipt = state
+        .previous_receipt
+        .as_ref()
+        .ok_or_else(|| contract("retained receipt fact is absent"))?;
+    if retained_receipt.state != ReceiptState::Installed
+        || retained_receipt.bundle_sha256 != prior_request.bundle_sha256
+        || retained_receipt.receipt_sha256
+            != request.previous_receipt_sha256.clone().unwrap_or_default()
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
     state.phase = LifecyclePhase::UpdateInstalling;
     persist(&store, &mut state)?;
     let receipt = stage_install_read_receipt(
@@ -2857,6 +2925,7 @@ pub fn update(
         &request_suffix,
         &request,
         ReceiptState::Installed,
+        Some((&prior_request, ReceiptState::Installed)),
         executor,
     )?;
     state.current = Some(candidate);
@@ -3015,27 +3084,12 @@ pub fn rollback_update(
     persist(&store, &mut state)?;
     state.phase = LifecyclePhase::RollbackInstalling;
     persist(&store, &mut state)?;
-    // The two fixed installer inputs are root-owned after a candidate install.
-    // Replace only those transient inputs, after durable rollback intent, so a
-    // replay can safely converge without touching volumes, secrets, TLS, or
-    // configuration paths.
-    let clear_inputs = ssh_command(
-        "clear-candidate-install-inputs-for-code-only-rollback",
-        &state,
-        &store,
-        [
-            "/usr/bin/sudo",
-            "--non-interactive",
-            "/usr/bin/rm",
-            "--force",
-            "--",
-            REMOTE_BUNDLE,
-            REMOTE_REQUEST,
-        ],
-        true,
-        30,
-    )?;
-    run_effect(&store, &mut state, &clear_inputs, executor)?;
+    let candidate_request_suffix = state
+        .candidate_request_suffix
+        .as_deref()
+        .ok_or_else(|| contract("candidate install request fact is absent"))?;
+    let candidate_request: InstallRequest =
+        serde_json::from_slice(&store.read_artifact(candidate_request_suffix, 64 * 1024)?)?;
     let receipt = stage_install_read_receipt(
         &store,
         &mut state,
@@ -3043,6 +3097,7 @@ pub fn rollback_update(
         ROLLBACK_REQUEST_SUFFIX,
         &request,
         ReceiptState::RolledBack,
+        Some((&candidate_request, ReceiptState::Installed)),
         executor,
     )?;
     state.current = Some(prior);
@@ -3073,10 +3128,8 @@ pub fn rebind_operator_cidr(
         ));
     }
     let store = Store::lock(state_dir, &manifest.target)?;
-    let mut state = store
-        .read::<Ec2State>()?
+    let mut state = read_verified_state(&store)?
         .ok_or_else(|| contract("no owned EC2 lifecycle state exists"))?;
-    state.verify()?;
     ensure_rebind_phase(&state.phase)?;
     ensure_rebind_pending_effect(state.pending_effect.as_deref())?;
     ensure_rebind_identity(&state, manifest, &facts)?;
@@ -3337,10 +3390,8 @@ fn revoke_old_operator_ingress(
 }
 
 fn load_state(store: &Store, manifest: &AwsEc2Manifest) -> Result<Ec2State> {
-    let state = store
-        .read::<Ec2State>()?
+    let state = read_verified_state(store)?
         .ok_or_else(|| contract("no owned EC2 lifecycle state exists"))?;
-    state.verify()?;
     if state.target != manifest.target
         || state.region != manifest.region
         || state.domain != manifest.domain
@@ -3349,6 +3400,19 @@ fn load_state(store: &Store, manifest: &AwsEc2Manifest) -> Result<Ec2State> {
         return Err(ReleaseError::OperationConflict);
     }
     Ok(state)
+}
+
+fn read_verified_state(store: &Store) -> Result<Option<Ec2State>> {
+    let Some((mut state, bytes)) = store.read_with_bytes::<Ec2State>()? else {
+        return Ok(None);
+    };
+    if state.verify().is_err() {
+        state.verify_legacy_bytes(&bytes)?;
+        // The Store lock is already held. Resealing is a local schema migration,
+        // occurs before any later effect, and preserves all lifecycle facts.
+        persist(store, &mut state)?;
+    }
+    Ok(Some(state))
 }
 
 pub fn destroy(
