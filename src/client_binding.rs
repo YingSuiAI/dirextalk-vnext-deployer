@@ -1548,7 +1548,12 @@ fn contract(message: &str) -> ReleaseError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, io::Cursor, sync::Mutex};
+    use serde_json::Value;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        io::Cursor,
+        sync::Mutex,
+    };
 
     use super::*;
 
@@ -1632,6 +1637,159 @@ mod tests {
         commands: Mutex<Vec<aws_ec2::FixedCommand>>,
         runtime_attestation: String,
         current_receipt: String,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RuntimeHelperState {
+        Absent,
+        Uploaded,
+        Protected,
+        Atomic,
+        Installed,
+    }
+
+    struct RuntimeRecoveryExecutor {
+        helper_state: Mutex<HashMap<&'static str, RuntimeHelperState>>,
+        runtime_attestation: String,
+        current_receipt: String,
+        calls: Mutex<Vec<aws_ec2::FixedCommand>>,
+    }
+
+    impl RuntimeRecoveryExecutor {
+        fn new(fixture: &IssueEc2Fixture) -> Self {
+            Self::with_initial_state(fixture, RuntimeHelperState::Absent)
+        }
+
+        fn with_initial_state(fixture: &IssueEc2Fixture, initial: RuntimeHelperState) -> Self {
+            Self {
+                helper_state: Mutex::new(HashMap::from([
+                    ("recovery", initial),
+                    ("attester", initial),
+                ])),
+                runtime_attestation: fixture.runtime_attestation.clone(),
+                current_receipt: fixture.current_receipt.clone(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<aws_ec2::FixedCommand> {
+            self.calls.lock().expect("calls").clone()
+        }
+
+        fn helper_for(id: &str) -> &'static str {
+            if id.contains("attester") {
+                "attester"
+            } else {
+                "recovery"
+            }
+        }
+
+        fn metadata(
+            state: RuntimeHelperState,
+            upload: &str,
+            atomic: &str,
+            installed: &str,
+        ) -> String {
+            match state {
+                RuntimeHelperState::Absent => String::new(),
+                RuntimeHelperState::Uploaded => format!("f ubuntu ubuntu 600 1 76217 {upload}\n"),
+                RuntimeHelperState::Protected => format!("f ubuntu ubuntu 400 1 76217 {upload}\n"),
+                RuntimeHelperState::Atomic => format!("f root root 555 1 76217 {atomic}\n"),
+                RuntimeHelperState::Installed => format!("f root root 555 1 76217 {installed}\n"),
+            }
+        }
+    }
+
+    impl AwsExecutor for RuntimeRecoveryExecutor {
+        fn run(&self, command: &aws_ec2::FixedCommand) -> Result<aws_ec2::ExecOutput> {
+            self.calls.lock().expect("calls").push(command.clone());
+            let id = command.id.as_str();
+            let helper = Self::helper_for(id);
+            let (upload, atomic, installed) = if helper == "attester" {
+                (
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER_UPLOAD,
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER_ATOMIC,
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER,
+                )
+            } else {
+                (
+                    aws_ec2::REMOTE_RUNTIME_RECOVERY_UPLOAD,
+                    aws_ec2::REMOTE_RUNTIME_RECOVERY_ATOMIC,
+                    aws_ec2::REMOTE_RUNTIME_RECOVERY,
+                )
+            };
+            let mut states = self.helper_state.lock().expect("helper state");
+            let state = states.entry(helper).or_insert(RuntimeHelperState::Absent);
+            let stdout = match id {
+                id if id.starts_with("inspect-installed-runtime-") => {
+                    Self::metadata(*state, upload, atomic, installed)
+                }
+                id if id.starts_with("inspect-uploaded-runtime-") => {
+                    Self::metadata(*state, upload, atomic, installed)
+                }
+                id if id.starts_with("inspect-protected-runtime-") => {
+                    Self::metadata(*state, upload, atomic, installed)
+                }
+                id if id.starts_with("inspect-atomic-runtime-") => {
+                    Self::metadata(*state, upload, atomic, installed)
+                }
+                id if id.starts_with("reconcile-installed-runtime-") => {
+                    Self::metadata(*state, upload, atomic, installed)
+                }
+                id if (id.starts_with("verify-") || id.starts_with("reconcile-hash-"))
+                    && id.contains("runtime-") =>
+                {
+                    let path = if id.contains("uploaded") || id.contains("protected") {
+                        upload
+                    } else if id.contains("atomic") {
+                        atomic
+                    } else {
+                        installed
+                    };
+                    format!("{}  {path}\n", aws_ec2::RUNTIME_RECOVERY_SHA256)
+                }
+                id if id.starts_with("clear-upload-runtime-") => {
+                    *state = RuntimeHelperState::Absent;
+                    String::new()
+                }
+                id if id.starts_with("stage-runtime-") => {
+                    *state = RuntimeHelperState::Uploaded;
+                    String::new()
+                }
+                id if id.starts_with("protect-uploaded-runtime-") => {
+                    *state = RuntimeHelperState::Protected;
+                    String::new()
+                }
+                id if id.starts_with("clear-atomic-runtime-") => String::new(),
+                id if id.starts_with("prepare-atomic-runtime-") => {
+                    *state = RuntimeHelperState::Atomic;
+                    String::new()
+                }
+                id if id.starts_with("activate-runtime-") => {
+                    *state = RuntimeHelperState::Installed;
+                    String::new()
+                }
+                "run-fixed-runtime-recovery-011-to-014"
+                | "run-fixed-runtime-attester-011-to-014" => String::new(),
+                "inspect-runtime-attestation" => format!(
+                    "f root root 600 1 {} {}\n",
+                    self.runtime_attestation.len(),
+                    aws_ec2::REMOTE_RUNTIME_ATTESTATION
+                ),
+                "read-runtime-attestation" => self.runtime_attestation.clone(),
+                "read-runtime-attestation-current-receipt" => self.current_receipt.clone(),
+                _ => {
+                    return Err(contract(&format!(
+                        "unexpected runtime recovery command {id}"
+                    )));
+                }
+            };
+            Ok(aws_ec2::ExecOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }
     }
 
     impl IssueReplayExecutor {
@@ -2258,6 +2416,289 @@ mod tests {
             )
             .expect("sealed runtime helper");
         store.write(&fixture.state).expect("EC2 state");
+    }
+
+    fn recovery_fixture() -> (IssueEc2Fixture, PathBuf, PathBuf) {
+        let fixture = issue_ec2_fixture();
+        let state_dir = fixture.root.path().join("ec2-state");
+        let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
+        write_issue_ec2_state(&store, &fixture);
+        store
+            .remove_artifact("runtime-recovery-011-to-014")
+            .expect("remove unsealed recovery helper");
+        let helper = fixture.root.path().join("recover-vnext-011-to-014");
+        fs::write(
+            &helper,
+            include_bytes!("../tests/fixtures/runtime-recovery/install-vnext"),
+        )
+        .expect("recovery helper");
+        (fixture, state_dir, helper)
+    }
+
+    #[test]
+    fn recover_runtime_dry_run_authenticates_without_sealing_or_executor_effects() {
+        let (fixture, state_dir, helper) = recovery_fixture();
+        let before = fs::read(state_dir.join("x6.json")).expect("state bytes");
+        let executor = RuntimeRecoveryExecutor::new(&fixture);
+        aws_ec2::recover_runtime_011_to_014(
+            &fixture.manifest,
+            &state_dir,
+            &helper,
+            false,
+            &executor,
+        )
+        .expect("dry run");
+        assert!(executor.calls().is_empty());
+        assert_eq!(
+            fs::read(state_dir.join("x6.json")).expect("state bytes"),
+            before
+        );
+        assert!(
+            aws_ec2::store::Store::lock(&state_dir, "x6")
+                .expect("store")
+                .read_artifact("runtime-recovery-011-to-014", 76_218)
+                .is_err()
+        );
+
+        fs::write(&helper, b"tampered").expect("tamper helper");
+        assert!(
+            aws_ec2::recover_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &helper,
+                false,
+                &executor,
+            )
+            .is_err()
+        );
+        assert!(executor.calls().is_empty());
+        assert_eq!(
+            fs::read(state_dir.join("x6.json")).expect("state bytes"),
+            before
+        );
+    }
+
+    #[test]
+    fn recover_runtime_execute_seals_both_helpers_and_uses_fixed_attestation_commands() {
+        let (fixture, state_dir, helper) = recovery_fixture();
+        let executor = RuntimeRecoveryExecutor::new(&fixture);
+        let state = aws_ec2::recover_runtime_011_to_014(
+            &fixture.manifest,
+            &state_dir,
+            &helper,
+            true,
+            &executor,
+        )
+        .expect("execute recovery");
+        state.verify().expect("sealed state");
+        let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
+        let sealed = store
+            .read_artifact("runtime-recovery-011-to-014", 76_218)
+            .expect("sealed helper");
+        assert_eq!(sealed.len(), 76_217);
+        assert_eq!(
+            sealed,
+            include_bytes!("../tests/fixtures/runtime-recovery/install-vnext")
+        );
+        let calls = executor.calls();
+        for (id, basename) in [
+            (
+                "stage-runtime-recovery-011-to-014",
+                aws_ec2::REMOTE_RUNTIME_RECOVERY_UPLOAD,
+            ),
+            (
+                "stage-runtime-attester-011-to-014",
+                aws_ec2::REMOTE_RUNTIME_ATTESTER_UPLOAD,
+            ),
+        ] {
+            let command = calls.iter().find(|command| command.id == id).expect(id);
+            assert!(command.mutation);
+            assert!(
+                command
+                    .argv
+                    .last()
+                    .is_some_and(|argv| argv.contains(basename))
+            );
+        }
+        for id in [
+            "run-fixed-runtime-recovery-011-to-014",
+            "run-fixed-runtime-attester-011-to-014",
+        ] {
+            let command = calls.iter().find(|command| command.id == id).expect(id);
+            assert!(command.mutation);
+            assert_eq!(
+                command.argv.last().map(String::as_str),
+                Some(if id.ends_with("recovery-011-to-014") {
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/recover-vnext-011-to-014'"
+                } else {
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/attest-vnext-011-to-014'"
+                })
+            );
+        }
+        assert!(
+            calls
+                .iter()
+                .any(|command| command.id == "inspect-runtime-attestation")
+        );
+    }
+
+    #[test]
+    fn recover_runtime_accepts_only_exact_pending_effect_classes() {
+        for pending in [
+            "clear-upload-runtime-recovery-011-to-014",
+            "stage-runtime-recovery-011-to-014",
+            "protect-uploaded-runtime-recovery-011-to-014",
+            "clear-atomic-runtime-recovery-011-to-014",
+            "prepare-atomic-runtime-recovery-011-to-014",
+            "activate-runtime-recovery-011-to-014",
+            "clear-upload-runtime-attester-011-to-014",
+            "stage-runtime-attester-011-to-014",
+            "protect-uploaded-runtime-attester-011-to-014",
+            "clear-atomic-runtime-attester-011-to-014",
+            "prepare-atomic-runtime-attester-011-to-014",
+            "activate-runtime-attester-011-to-014",
+            "run-fixed-runtime-recovery-011-to-014",
+            "run-fixed-runtime-attester-011-to-014",
+        ] {
+            let (fixture, state_dir, helper) = recovery_fixture();
+            let mut state = fixture.state.clone();
+            state.pending_effect = Some(pending.into());
+            state = state.seal().expect("pending state");
+            aws_ec2::store::Store::lock(&state_dir, "x6")
+                .expect("store")
+                .write(&state)
+                .expect("pending state write");
+            let executor = RuntimeRecoveryExecutor::with_initial_state(
+                &fixture,
+                RuntimeHelperState::Installed,
+            );
+            aws_ec2::recover_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &helper,
+                true,
+                &executor,
+            )
+            .expect("allowed pending effect replay");
+        }
+
+        let (fixture, state_dir, helper) = recovery_fixture();
+        let mut state = fixture.state.clone();
+        state.pending_effect = Some("destroy-instance".into());
+        state = state.seal().expect("pending state");
+        aws_ec2::store::Store::lock(&state_dir, "x6")
+            .expect("store")
+            .write(&state)
+            .expect("pending state write");
+        let executor = RuntimeRecoveryExecutor::new(&fixture);
+        assert!(
+            aws_ec2::recover_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &helper,
+                true,
+                &executor
+            )
+            .is_err()
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn issue_ec2_rejects_tampered_evidence_before_binding_request_root_or_issuer() {
+        let cases = [
+            "current.bundle",
+            "current.request",
+            "previous.bundle",
+            "previous.request",
+            "candidate.bundle",
+            "candidate.request",
+        ];
+        for artifact in cases {
+            let fixture = issue_ec2_fixture();
+            let state_dir = fixture.root.path().join("ec2-state");
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
+            write_issue_ec2_state(&store, &fixture);
+            store
+                .write_artifact(artifact, b"tampered", 0o600)
+                .expect("tamper artifact");
+            let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding"));
+            let output = fixture.root.path().join("binding.import.json");
+            let executor = IssueReplayExecutor::new(&fixture, None);
+            assert!(
+                issue_ec2(
+                    &fixture.manifest,
+                    &state_dir,
+                    &output,
+                    &binding_store,
+                    &executor
+                )
+                .is_err()
+            );
+            let calls = executor.calls();
+            assert!(!calls.iter().any(|id| id == "inspect-client-binding-root"
+                || id == "create-client-binding-root"
+                || id == "run-client-binding-issue"));
+            assert!(!state_dir.join("client-binding.request").exists());
+            assert!(!output.exists());
+        }
+
+        for (label, mutate) in [
+            ("canonical", 0_u8),
+            ("self-digest", 1),
+            ("unknown-key", 2),
+            ("tuple", 3),
+            ("current-receipt", 4),
+        ] {
+            let fixture = issue_ec2_fixture();
+            let state_dir = fixture.root.path().join("ec2-state");
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
+            write_issue_ec2_state(&store, &fixture);
+            let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding"));
+            let output = fixture.root.path().join("binding.import.json");
+            let mut executor = IssueReplayExecutor::new(&fixture, None);
+            if mutate == 4 {
+                executor.current_receipt = "tampered receipt".into();
+            } else if mutate == 0 {
+                executor.runtime_attestation = format!(" {}", fixture.runtime_attestation);
+            } else {
+                let mut value: Value =
+                    serde_json::from_str(&fixture.runtime_attestation).expect("attestation");
+                let object = value.as_object_mut().expect("attestation object");
+                match mutate {
+                    1 => {
+                        object.insert("attestation_sha256".into(), Value::String("0".repeat(64)));
+                    }
+                    2 => {
+                        object.insert("unknown".into(), Value::Bool(true));
+                    }
+                    3 => {
+                        object.insert("version".into(), Value::String("0.1.1".into()));
+                    }
+                    _ => unreachable!(),
+                }
+                executor.runtime_attestation =
+                    String::from_utf8(canonical_bundle_json(&value)).expect("attestation bytes");
+            }
+            assert!(
+                issue_ec2(
+                    &fixture.manifest,
+                    &state_dir,
+                    &output,
+                    &binding_store,
+                    &executor
+                )
+                .is_err(),
+                "{label}"
+            );
+            let calls = executor.calls();
+            assert!(!calls.iter().any(|id| id == "inspect-client-binding-root"
+                || id == "create-client-binding-root"
+                || id == "inspect-client-binding-request"
+                || id == "run-client-binding-issue"));
+            assert!(!state_dir.join("client-binding.request").exists());
+            assert!(!output.exists());
+        }
     }
 
     fn recovery_state() -> Ec2State {
