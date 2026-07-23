@@ -23,6 +23,8 @@ const ROOT_NAME: &str = "dirextalk-vnext-stack";
 const ROOT: &str = "dirextalk-vnext-stack/";
 const MANIFEST_PATH: &str = "dirextalk-vnext-stack/manifest.json";
 const STACK_INSTALLER_PATH: &str = "scripts/production-stack/install.sh";
+const CROSS_VERSION_COMPATIBILITY_PATH: &str = "docker/production/migration-compatibility";
+const CROSS_VERSION_COMPATIBILITY_BYTES: &[u8] = b"forward-schema-compatible-v1\n";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -38,7 +40,7 @@ pub struct StackManifest {
     /// Server-produced, digest-bound evidence that this bundle participates in the
     /// one supported EC2 migration path.  Older bundles deliberately have no
     /// default: an update must refuse them rather than guess database safety.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_version_compatibility: Option<CrossVersionCompatibility>,
     pub files: Vec<StackFile>,
 }
@@ -251,7 +253,7 @@ pub fn load_bundle(
         expected_host_provisioner_sha256,
         "host provisioner",
     )?;
-    let cross_version_compatibility = manifest.cross_version_compatibility.clone();
+    let cross_version_compatibility = cross_version_compatibility(&manifest, &entries)?;
     Ok(BundleFacts {
         bundle_sha256: actual_bundle,
         manifest_sha256: hash(&manifest_bytes),
@@ -265,6 +267,48 @@ pub fn load_bundle(
         receipt_reader_sha256: expected_receipt_reader_sha256.to_owned(),
         cross_version_compatibility,
     })
+}
+
+fn cross_version_compatibility(
+    manifest: &StackManifest,
+    entries: &BTreeMap<String, (String, Vec<u8>)>,
+) -> Result<Option<CrossVersionCompatibility>> {
+    let archive_path = format!("{ROOT}{CROSS_VERSION_COMPATIBILITY_PATH}");
+    let indexed = manifest
+        .files
+        .iter()
+        .find(|file| file.path == CROSS_VERSION_COMPATIBILITY_PATH);
+    let derived = match (indexed, entries.get(&archive_path)) {
+        (None, None) => None,
+        (Some(file), Some((mode, bytes)))
+            if file.mode == "0444"
+                && mode == "0444"
+                && file.sha256 == hash(CROSS_VERSION_COMPATIBILITY_BYTES)
+                && bytes.as_slice() == CROSS_VERSION_COMPATIBILITY_BYTES =>
+        {
+            Some(CrossVersionCompatibility {
+                schema: "dirextalk.vnext.cross-version-compatibility".into(),
+                schema_version: 1,
+                retained_version: "0.1.1".into(),
+                candidate_version: "0.1.4".into(),
+                forward_migrations_only: true,
+                code_only_rollback: true,
+            })
+        }
+        _ => {
+            return Err(deployment(
+                "bundle cross-version compatibility marker is invalid",
+            ));
+        }
+    };
+    if manifest.cross_version_compatibility.is_some()
+        && manifest.cross_version_compatibility.as_ref() != derived.as_ref()
+    {
+        return Err(deployment(
+            "bundle typed cross-version compatibility marker disagrees with indexed marker",
+        ));
+    }
+    Ok(derived)
 }
 
 fn validate_archive_name(value: &str) -> Result<()> {

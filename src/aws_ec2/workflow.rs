@@ -12,7 +12,7 @@ use base64::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::bundle::{BundleFacts, InstallRequest, InstalledReceipt, hash};
+use super::bundle::{BundleFacts, InstallRequest, InstalledReceipt, hash, load_bundle};
 use super::provision::{HostReadyReceipt, ProvisionRequest};
 use super::store::Store;
 use super::{
@@ -2845,7 +2845,7 @@ pub fn update(
         ));
     }
     let candidate = BundleRecord::from_facts(&facts, manifest);
-    let (prior_bundle, prior_receipt) = if state.phase == LifecyclePhase::UpdateVerifying {
+    let (mut prior_bundle, prior_receipt) = if state.phase == LifecyclePhase::UpdateVerifying {
         (
             state
                 .previous
@@ -2876,6 +2876,7 @@ pub fn update(
     {
         return Ok(state);
     }
+    authenticate_legacy_retained_compatibility(&store, &state, manifest, &mut prior_bundle)?;
     ensure_cross_version_contract(&prior_bundle, &prior_receipt, &candidate)?;
     match state.phase {
         LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack => {}
@@ -2986,6 +2987,46 @@ pub fn update(
     state.pending_effect = None;
     persist(&store, &mut state)?;
     Ok(state)
+}
+
+fn authenticate_legacy_retained_compatibility(
+    store: &Store,
+    state: &Ec2State,
+    manifest: &AwsEc2Manifest,
+    prior: &mut BundleRecord,
+) -> Result<()> {
+    if prior.cross_version_compatibility.is_some() || prior.version != "0.1.1" {
+        return Ok(());
+    }
+    let suffix = if state.phase == LifecyclePhase::UpdateVerifying {
+        state.previous_bundle_suffix.as_deref()
+    } else {
+        state.current_bundle_suffix.as_deref()
+    }
+    .ok_or_else(|| contract("retained bundle artifact fact is absent"))?;
+    let artifact = store.artifact_path(suffix)?;
+    let facts = load_bundle(
+        &artifact,
+        &prior.bundle_sha256,
+        &manifest.host_installer_path,
+        &prior.host_installer_sha256,
+        &manifest.host_provisioner_path,
+        &prior.host_provisioner_sha256,
+        &manifest.receipt_reader_path,
+        &prior.receipt_reader_sha256,
+    )?;
+    if facts.manifest.version != prior.version
+        || facts.manifest.source_commit != prior.source_commit
+        || facts.manifest_sha256 != prior.manifest_sha256
+        || facts.compose_sha256 != prior.compose_sha256
+        || facts.manifest.server_image != prior.server_image
+        || facts.manifest.migrator_image != prior.migrator_image
+        || facts.manifest.installer_sha256 != prior.installer_sha256
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    prior.cross_version_compatibility = facts.cross_version_compatibility;
+    Ok(())
 }
 
 fn ensure_cross_version_contract(

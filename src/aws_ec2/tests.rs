@@ -141,7 +141,8 @@ fn fixture_with_directories(
     let host_installer = b"#!/usr/bin/env python3\nprint('install')\n";
     let host_provisioner = b"#!/usr/bin/env python3\nprint('provision')\n";
     let receipt_reader = b"#!/usr/bin/env python3\nprint('{}')\n";
-    let files = vec![
+    let compatibility_marker = b"forward-schema-compatible-v1\n";
+    let mut files = vec![
         StackFile {
             path: "docker/production/docker-compose.yml".into(),
             sha256: hash(compose),
@@ -153,6 +154,14 @@ fn fixture_with_directories(
             mode: "0555".into(),
         },
     ];
+    if matches!(version, "0.1.1" | "0.1.4") {
+        files.push(StackFile {
+            path: "docker/production/migration-compatibility".into(),
+            sha256: hash(compatibility_marker),
+            mode: "0444".into(),
+        });
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+    }
     let manifest = StackManifest {
         schema: "dirextalk.vnext-stack-bundle".into(),
         schema_version: 1,
@@ -165,16 +174,7 @@ fn fixture_with_directories(
         ),
         migrator_image: format!("dirextalk/vnet-server@sha256:{}", "c".repeat(64)),
         installer_sha256: hash(stack_installer),
-        cross_version_compatibility: matches!(version, "0.1.1" | "0.1.4").then(|| {
-            bundle::CrossVersionCompatibility {
-                schema: "dirextalk.vnext.cross-version-compatibility".into(),
-                schema_version: 1,
-                retained_version: "0.1.1".into(),
-                candidate_version: "0.1.4".into(),
-                forward_migrations_only: true,
-                code_only_rollback: true,
-            }
-        }),
+        cross_version_compatibility: None,
         files,
     };
     let mut tar = tar::Builder::new(Vec::new());
@@ -197,6 +197,14 @@ fn fixture_with_directories(
         0o444,
         compose,
     );
+    if matches!(version, "0.1.1" | "0.1.4") {
+        append_file(
+            &mut tar,
+            "dirextalk-vnext-stack/docker/production/migration-compatibility",
+            0o444,
+            compatibility_marker,
+        );
+    }
     append_file(
         &mut tar,
         "dirextalk-vnext-stack/scripts/production-stack/install.sh",
@@ -709,6 +717,13 @@ fn update_ready_state(
     let store = Store::lock(&state_dir, "x6").expect("store");
     store
         .write_artifact(
+            "current.bundle",
+            &fs::read(&old.stack_bundle_path).expect("current bundle"),
+            0o600,
+        )
+        .expect("artifact");
+    store
+        .write_artifact(
             "current.request",
             &request.canonical_bytes().expect("request"),
             0o600,
@@ -724,6 +739,87 @@ fn update_ready_state(
     store.write(&state).expect("state");
     drop(store);
     (state_dir, state, request, provision)
+}
+
+#[test]
+fn update_authenticates_legacy_retained_marker_without_mutating_dry_run() {
+    let (dir, old) = fixture("0.1.1", 'a');
+    let (state_dir, mut state, _, _) = update_ready_state(&dir, &old);
+    state
+        .current
+        .as_mut()
+        .expect("retained bundle")
+        .cross_version_compatibility = None;
+    state = state.seal().expect("legacy seal");
+    Store::lock(&state_dir, "x6")
+        .expect("store")
+        .write(&state)
+        .expect("legacy state");
+    let before = fs::read(state_dir.join("x6.json")).expect("state bytes");
+    let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
+
+    update(&candidate, &state_dir, false, &Never(AtomicUsize::new(0)))
+        .expect("authenticated dry run");
+    assert_eq!(
+        fs::read(state_dir.join("x6.json")).expect("state bytes"),
+        before
+    );
+}
+
+#[test]
+fn legacy_retained_marker_authentication_rejects_missing_changed_or_mismatched_artifacts() {
+    let (dir, old) = fixture("0.1.1", 'a');
+    let (state_dir, mut state, _, _) = update_ready_state(&dir, &old);
+    state
+        .current
+        .as_mut()
+        .expect("retained bundle")
+        .cross_version_compatibility = None;
+    state = state.seal().expect("legacy seal");
+    Store::lock(&state_dir, "x6")
+        .expect("store")
+        .write(&state)
+        .expect("legacy state");
+    let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
+
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    store
+        .write_artifact("current.bundle", b"changed", 0o600)
+        .expect("changed artifact");
+    drop(store);
+    assert!(update(&candidate, &state_dir, false, &Never(AtomicUsize::new(0))).is_err());
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    store
+        .write_artifact(
+            "current.bundle",
+            &fs::read(&candidate.stack_bundle_path).expect("candidate bundle"),
+            0o600,
+        )
+        .expect("mismatched artifact");
+    drop(store);
+    assert!(update(&candidate, &state_dir, false, &Never(AtomicUsize::new(0))).is_err());
+
+    let (missing_dir, missing) = fixture("1.2.3", 'c');
+    let (missing_state_dir, mut missing_state, _, _) = update_ready_state(&missing_dir, &missing);
+    missing_state
+        .current
+        .as_mut()
+        .expect("retained bundle")
+        .cross_version_compatibility = None;
+    missing_state = missing_state.seal().expect("legacy seal");
+    Store::lock(&missing_state_dir, "x6")
+        .expect("store")
+        .write(&missing_state)
+        .expect("legacy state");
+    assert!(
+        update(
+            &candidate,
+            &missing_state_dir,
+            false,
+            &Never(AtomicUsize::new(0))
+        )
+        .is_err()
+    );
 }
 
 impl AwsExecutor for ExistingReceipt {
@@ -1258,6 +1354,16 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
  {
     let (dir, old) = fixture("0.1.1", 'a');
     let (state_dir, mut state, old_request, provision) = update_ready_state(&dir, &old);
+    state
+        .current
+        .as_mut()
+        .expect("retained bundle")
+        .cross_version_compatibility = None;
+    state = state.seal().expect("legacy seal");
+    Store::lock(&state_dir, "x6")
+        .expect("store")
+        .write(&state)
+        .expect("legacy state");
     let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
     let facts = candidate.bundle().expect("candidate facts");
     let request = InstallRequest::new(
@@ -1307,6 +1413,14 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
     assert_eq!(
         updated.previous.as_ref().expect("previous").version,
         "0.1.1"
+    );
+    assert!(
+        updated
+            .previous
+            .as_ref()
+            .expect("authenticated previous")
+            .cross_version_compatibility
+            .is_some()
     );
     let calls = executor.calls.lock().expect("calls").clone();
     let effects: Vec<&str> = calls
