@@ -799,7 +799,7 @@ fn verify_remote_helper(
     if metadata.stdout.split_ascii_whitespace().collect::<Vec<_>>() != ["0", "0", "555", "1"] {
         return Err(ReleaseError::OperationConflict);
     }
-    verify_remote_hash(
+    verify_root_owned_remote_hash(
         state,
         store,
         executor,
@@ -807,6 +807,34 @@ fn verify_remote_helper(
         path,
         expected_digest,
     )
+}
+
+fn verify_root_owned_remote_hash(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    executor: &dyn AwsExecutor,
+    id: &str,
+    path: &str,
+    expected: &str,
+) -> Result<()> {
+    let output = executor.run(&aws_ec2::workflow::ssh_command(
+        id,
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/sha256sum",
+            path,
+        ],
+        false,
+        30,
+    )?)?;
+    let mut fields = output.stdout.split_ascii_whitespace();
+    if fields.next() != Some(expected) || fields.next() != Some(path) || fields.next().is_some() {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(())
 }
 
 fn reconcile_remote_request(
@@ -1594,6 +1622,7 @@ mod tests {
         pending_observed: Mutex<bool>,
         root_outputs: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
+        commands: Mutex<Vec<aws_ec2::FixedCommand>>,
     }
 
     impl IssueReplayExecutor {
@@ -1623,6 +1652,7 @@ mod tests {
                     format!("d 0 0 700 {REMOTE_CLIENT_BINDING_ROOT}\n"),
                 ]),
                 calls: Mutex::new(Vec::new()),
+                commands: Mutex::new(Vec::new()),
             }
         }
 
@@ -1635,6 +1665,16 @@ mod tests {
             self.calls.lock().expect("calls").clone()
         }
 
+        fn command(&self, id: &str) -> aws_ec2::FixedCommand {
+            self.commands
+                .lock()
+                .expect("commands")
+                .iter()
+                .find(|command| command.id == id)
+                .cloned()
+                .expect("command")
+        }
+
         fn pending_observed(&self) -> bool {
             *self.pending_observed.lock().expect("pending observed")
         }
@@ -1643,6 +1683,10 @@ mod tests {
     impl AwsExecutor for IssueReplayExecutor {
         fn run(&self, command: &aws_ec2::FixedCommand) -> Result<aws_ec2::ExecOutput> {
             self.calls.lock().expect("calls").push(command.id.clone());
+            self.commands
+                .lock()
+                .expect("commands")
+                .push(command.clone());
             let stdout = match command.id.as_str() {
                 "verify-client-binding-issue-helper-metadata"
                 | "verify-client-binding-cleanup-helper-metadata" => "0 0 555 1\n".into(),
@@ -2406,6 +2450,36 @@ mod tests {
                     .position(|id| id == "inspect-client-binding-request")
                     .expect("request inspection")
         );
+        for (id, expected) in [
+            (
+                "verify-client-binding-issue-helper-digest",
+                format!(
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/bin/sha256sum' '{}'",
+                    fixture.issue_path
+                ),
+            ),
+            (
+                "verify-client-binding-cleanup-helper-digest",
+                format!(
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/bin/sha256sum' '{}'",
+                    fixture.cleanup_path
+                ),
+            ),
+            (
+                "hash-client-binding-request",
+                format!("'/usr/bin/sha256sum' '{REMOTE_BINDING_REQUEST}'"),
+            ),
+            (
+                "hash-client-binding-import",
+                format!("'/usr/bin/sha256sum' '{REMOTE_BINDING_IMPORT}'"),
+            ),
+        ] {
+            assert_eq!(
+                executor.command(id).argv.last().map(String::as_str),
+                Some(expected.as_str()),
+                "{id} must retain its fixed remote argv"
+            );
+        }
     }
 
     #[cfg(unix)]
