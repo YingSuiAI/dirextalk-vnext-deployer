@@ -152,6 +152,10 @@ enum Commands {
         execute: bool,
     },
     /// Recover only the admitted 0.1.1-to-0.1.4 false-runtime incident.
+    #[command(
+        name = "ec2-recover-runtime-011-to-014",
+        alias = "ec2-recover-runtime011-to014"
+    )]
     Ec2RecoverRuntime011To014 {
         #[arg(long)]
         manifest: PathBuf,
@@ -533,6 +537,8 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     #[test]
@@ -553,5 +559,37 @@ mod tests {
             Commands::DeploymentConnectorClaim { execute: false, .. }
         ));
         assert!(run(cli).is_err());
+    }
+
+    #[test]
+    fn runtime_recovery_cli_uses_documented_canonical_name_and_hidden_legacy_alias() {
+        let arguments = [
+            "--manifest",
+            "aws-ec2.json",
+            "--recovery-helper",
+            "install-vnext",
+        ];
+        for command in [
+            "ec2-recover-runtime-011-to-014",
+            "ec2-recover-runtime011-to014",
+        ] {
+            let cli = Cli::try_parse_from(
+                ["dirextalk-vnext-deployer", command]
+                    .into_iter()
+                    .chain(arguments),
+            )
+            .expect("runtime recovery command parses");
+            assert!(matches!(
+                cli.command,
+                Commands::Ec2RecoverRuntime011To014 { execute: false, .. }
+            ));
+        }
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("ec2-recover-runtime-011-to-014"));
+        assert!(!help.contains("ec2-recover-runtime011-to014"));
+        assert!(
+            include_str!("../COMMANDS.md").contains("ec2-recover-runtime-011-to-014 --manifest")
+        );
     }
 }
