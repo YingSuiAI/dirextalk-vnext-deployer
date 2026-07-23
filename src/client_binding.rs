@@ -1702,6 +1702,7 @@ mod tests {
             server_image: format!("dirextalk/vnet-server@sha256:{}", "a".repeat(64)),
             migrator_image: format!("dirextalk/vnet-server@sha256:{}", "b".repeat(64)),
             installer_sha256: hash(installer),
+            cross_version_compatibility: None,
             files,
         };
         let mut archive = tar::Builder::new(Vec::new());
@@ -1872,6 +1873,8 @@ mod tests {
             current_request_suffix: None,
             previous_bundle_suffix: None,
             previous_request_suffix: None,
+            candidate_bundle_suffix: None,
+            candidate_request_suffix: None,
             provision_request_suffix: None,
             phase: LifecyclePhase::Verified,
             pending_effect: None,
@@ -1960,6 +1963,7 @@ mod tests {
                 host_installer_sha256: digest.clone(),
                 host_provisioner_sha256: digest.clone(),
                 receipt_reader_sha256: digest,
+                cross_version_compatibility: None,
             },
             current: None,
             previous: None,
@@ -1985,6 +1989,8 @@ mod tests {
             current_request_suffix: None,
             previous_bundle_suffix: None,
             previous_request_suffix: None,
+            candidate_bundle_suffix: None,
+            candidate_request_suffix: None,
             provision_request_suffix: None,
             phase: LifecyclePhase::Verified,
             pending_effect: None,
