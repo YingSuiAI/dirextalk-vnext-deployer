@@ -715,9 +715,9 @@ struct LegacyEc2State<'a> {
     monthly_estimate_cents: u64,
     max_monthly_usd: u32,
     infrastructure: &'a InfrastructureRecord,
-    desired: &'a BundleRecord,
-    current: &'a Option<BundleRecord>,
-    previous: &'a Option<BundleRecord>,
+    desired: LegacyBundleRecord,
+    current: Option<LegacyBundleRecord>,
+    previous: Option<LegacyBundleRecord>,
     ami: &'a Option<AmiRecord>,
     key: &'a Option<KeyRecord>,
     vpc_id: &'a Option<String>,
@@ -741,6 +741,44 @@ struct LegacyEc2State<'a> {
     pending_effect: &'a Option<String>,
     retained_volume: bool,
     integrity_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct LegacyBundleRecord {
+    version: String,
+    source_commit: String,
+    bundle_sha256: String,
+    manifest_sha256: String,
+    compose_sha256: String,
+    server_image: String,
+    migrator_image: String,
+    postgres_image: String,
+    caddy_image: String,
+    probe_image: String,
+    installer_sha256: String,
+    host_installer_sha256: String,
+    host_provisioner_sha256: String,
+    receipt_reader_sha256: String,
+}
+impl From<&BundleRecord> for LegacyBundleRecord {
+    fn from(v: &BundleRecord) -> Self {
+        Self {
+            version: v.version.clone(),
+            source_commit: v.source_commit.clone(),
+            bundle_sha256: v.bundle_sha256.clone(),
+            manifest_sha256: v.manifest_sha256.clone(),
+            compose_sha256: v.compose_sha256.clone(),
+            server_image: v.server_image.clone(),
+            migrator_image: v.migrator_image.clone(),
+            postgres_image: v.postgres_image.clone(),
+            caddy_image: v.caddy_image.clone(),
+            probe_image: v.probe_image.clone(),
+            installer_sha256: v.installer_sha256.clone(),
+            host_installer_sha256: v.host_installer_sha256.clone(),
+            host_provisioner_sha256: v.host_provisioner_sha256.clone(),
+            receipt_reader_sha256: v.receipt_reader_sha256.clone(),
+        }
+    }
 }
 
 impl Ec2State {
@@ -797,9 +835,9 @@ impl Ec2State {
             monthly_estimate_cents: self.monthly_estimate_cents,
             max_monthly_usd: self.max_monthly_usd,
             infrastructure: &self.infrastructure,
-            desired: &self.desired,
-            current: &self.current,
-            previous: &self.previous,
+            desired: LegacyBundleRecord::from(&self.desired),
+            current: self.current.as_ref().map(LegacyBundleRecord::from),
+            previous: self.previous.as_ref().map(LegacyBundleRecord::from),
             ami: &self.ami,
             key: &self.key,
             vpc_id: &self.vpc_id,

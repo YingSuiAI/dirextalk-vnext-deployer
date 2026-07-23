@@ -2799,6 +2799,11 @@ pub fn update(
     let facts = manifest.bundle()?;
     let store = Store::lock(state_dir, &manifest.target)?;
     let mut state = load_state(&store, manifest)?;
+    if state.phase == LifecyclePhase::RolledBack {
+        return Err(contract(
+            "a rolled-back lifecycle cannot start a new forward update",
+        ));
+    }
     let candidate = BundleRecord::from_facts(&facts, manifest);
     let (prior_bundle, prior_receipt) = if state.phase == LifecyclePhase::UpdateVerifying {
         (

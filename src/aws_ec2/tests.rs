@@ -1093,6 +1093,24 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
 }
 
 #[test]
+fn rolled_back_state_rejects_new_forward_update_without_mutating_state() {
+    let (dir, old) = fixture("0.1.1", 'a');
+    let (state_dir, mut state, _, _) = update_ready_state(&dir, &old);
+    state.phase = LifecyclePhase::RolledBack;
+    state = state.seal().expect("seal");
+    Store::lock(&state_dir, "x6")
+        .expect("store")
+        .write(&state)
+        .expect("write");
+    let before = fs::read(state_dir.join("x6.json")).expect("before");
+    let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
+    let never = Never(AtomicUsize::new(0));
+    assert!(update(&candidate, &state_dir, true, &never).is_err());
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+    assert_eq!(fs::read(state_dir.join("x6.json")).expect("after"), before);
+}
+
+#[test]
 fn lifecycle_state_is_persisted_before_every_effect() {
     let (dir, manifest) = fixture("1.2.3", 'a');
     let state_dir = dir.path().join("effect-state");
