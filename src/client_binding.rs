@@ -1686,6 +1686,15 @@ mod tests {
             self.calls.lock().expect("calls").clone()
         }
 
+        fn helper_state(&self, helper: &str) -> RuntimeHelperState {
+            *self
+                .helper_state
+                .lock()
+                .expect("helper state")
+                .get(helper)
+                .expect("helper")
+        }
+
         fn helper_for(id: &str) -> &'static str {
             if id.contains("attester") {
                 "attester"
@@ -2656,6 +2665,14 @@ mod tests {
             assert!(
                 calls.iter().any(|command| command.id == expected),
                 "missing branch command {expected}"
+            );
+            assert_eq!(
+                executor.helper_state("recovery"),
+                RuntimeHelperState::Installed
+            );
+            assert_eq!(
+                executor.helper_state("attester"),
+                RuntimeHelperState::Installed
             );
             let final_state = aws_ec2::store::Store::lock(&state_dir, "x6")
                 .expect("store")
