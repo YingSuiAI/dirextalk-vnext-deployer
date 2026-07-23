@@ -420,7 +420,7 @@ struct Ec2IssueRequest<'a> {
     ttl_millis: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Ec2ImportArtifact {
     schema: String,
@@ -545,7 +545,7 @@ pub fn issue_ec2(
             return Err(error);
         }
     };
-    if let Err(error) = write_protected_output(output, &bytes, false) {
+    if let Err(error) = write_protected_output(output, &bytes, true) {
         zeroize_response(&mut response);
         let _ = cleanup_remote_binding(&state, &ec2_store, &cleanup, executor);
         return Err(error);
@@ -1215,24 +1215,7 @@ fn binding_bytes(response: &ClientBindingIssueResponse) -> Result<Zeroizing<Vec<
 
 fn write_protected_output(path: &Path, bytes: &[u8], allow_existing: bool) -> Result<()> {
     validate_output_path(path)?;
-    if path.exists() {
-        if !allow_existing {
-            return Err(ReleaseError::OperationConflict);
-        }
-        let mut existing = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|_| contract("client binding output file is unsafe"))?;
-        validate_output_file(&existing)?;
-        let mut prior = Zeroizing::new(Vec::new());
-        existing
-            .read_to_end(&mut prior)
-            .map_err(|_| contract("client binding output file is unavailable"))?;
-        if prior.as_slice() != bytes {
-            return Err(ReleaseError::OperationConflict);
-        }
+    if allow_existing && protected_output_matches_if_present(path, bytes)? {
         return Ok(());
     }
     let temp = path.with_file_name(format!(
@@ -1271,6 +1254,29 @@ fn write_protected_output(path: &Path, bytes: &[u8], allow_existing: bool) -> Re
     sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
         .map_err(|_| contract("client binding output directory sync failed"))?;
     Ok(())
+}
+
+fn protected_output_matches_if_present(path: &Path, expected: &[u8]) -> Result<bool> {
+    let mut existing = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(contract("client binding output file is unsafe")),
+    };
+    validate_output_file(&existing)?;
+    let mut prior = Zeroizing::new(Vec::new());
+    std::io::Read::by_ref(&mut existing)
+        .take(MAX_BINDING as u64 + 1)
+        .read_to_end(&mut prior)
+        .map_err(|_| contract("client binding output file is unavailable"))?;
+    validate_output_file(&existing)?;
+    if prior.len() > MAX_BINDING || prior.as_slice() != expected {
+        return Err(ReleaseError::OperationConflict);
+    }
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -1434,7 +1440,7 @@ fn contract(message: &str) -> ReleaseError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex};
+    use std::{collections::BTreeMap, io::Cursor, sync::Mutex};
 
     use super::*;
 
@@ -1487,6 +1493,430 @@ mod tests {
                 stdout,
                 stderr: String::new(),
             })
+        }
+    }
+
+    struct IssueEc2Fixture {
+        root: tempfile::TempDir,
+        manifest: AwsEc2Manifest,
+        state: Ec2State,
+        import: Zeroizing<Vec<u8>>,
+        issue_path: String,
+        issue_digest: String,
+        cleanup_path: String,
+        cleanup_digest: String,
+    }
+
+    struct IssueReplayExecutor {
+        import: Zeroizing<Vec<u8>>,
+        issue_path: String,
+        issue_digest: String,
+        cleanup_path: String,
+        cleanup_digest: String,
+        request_size: usize,
+        request_digest: String,
+        pending_path: Option<PathBuf>,
+        pending_observed: Mutex<bool>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl IssueReplayExecutor {
+        fn new(fixture: &IssueEc2Fixture, pending_path: Option<PathBuf>) -> Self {
+            let request = Ec2IssueRequest {
+                schema: "dirextalk.client-binding-issue",
+                schema_version: 1,
+                deployment_operation_id: &fixture.state.operation_id,
+                tenant_id: &fixture.state.tenant_id,
+                server_origin: "https://example.com",
+                identity_tls_root_ca_file: REMOTE_CA_FILE,
+                ttl_millis: CLIENT_BINDING_TTL_MILLIS,
+            };
+            let request_bytes = serde_json::to_vec(&request).expect("request bytes");
+            Self {
+                import: fixture.import.clone(),
+                issue_path: fixture.issue_path.clone(),
+                issue_digest: fixture.issue_digest.clone(),
+                cleanup_path: fixture.cleanup_path.clone(),
+                cleanup_digest: fixture.cleanup_digest.clone(),
+                request_size: request_bytes.len(),
+                request_digest: hex::encode(Sha256::digest(&request_bytes)),
+                pending_path,
+                pending_observed: Mutex::new(false),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+
+        fn pending_observed(&self) -> bool {
+            *self.pending_observed.lock().expect("pending observed")
+        }
+    }
+
+    impl AwsExecutor for IssueReplayExecutor {
+        fn run(&self, command: &aws_ec2::FixedCommand) -> Result<aws_ec2::ExecOutput> {
+            self.calls.lock().expect("calls").push(command.id.clone());
+            let stdout = match command.id.as_str() {
+                "verify-client-binding-issue-helper-metadata"
+                | "verify-client-binding-cleanup-helper-metadata" => "0 0 555 1\n".into(),
+                "verify-client-binding-issue-helper-digest" => {
+                    format!("{}  {}\n", self.issue_digest, self.issue_path)
+                }
+                "verify-client-binding-cleanup-helper-digest" => {
+                    format!("{}  {}\n", self.cleanup_digest, self.cleanup_path)
+                }
+                "verify-client-binding-request" => {
+                    format!("1000 1000 400 1 {}\n", self.request_size)
+                }
+                "hash-client-binding-request" => {
+                    format!("{}  {REMOTE_BINDING_REQUEST}\n", self.request_digest)
+                }
+                "inspect-client-binding-import" => {
+                    format!("1000 1000 400 1 {}\n", self.import.len())
+                }
+                "hash-client-binding-import" => format!(
+                    "{}  {REMOTE_BINDING_IMPORT}\n",
+                    hex::encode(Sha256::digest(&self.import))
+                ),
+                "pull-client-binding-import" => {
+                    let local = command
+                        .argv
+                        .last()
+                        .ok_or_else(|| contract("test SCP destination is missing"))?;
+                    fs::write(local, self.import.as_slice())
+                        .map_err(|_| contract("test SCP destination write failed"))?;
+                    String::new()
+                }
+                "cleanup-client-binding-export" => {
+                    if let Some(path) = &self.pending_path {
+                        let state: ClientBindingState =
+                            serde_json::from_slice(&fs::read(path).expect("pending state bytes"))
+                                .expect("pending state");
+                        assert_eq!(state.state, BindingState::PendingCleanup);
+                        *self.pending_observed.lock().expect("pending observed") = true;
+                    }
+                    String::new()
+                }
+                "verify-client-binding-issue-helper-regular"
+                | "verify-client-binding-issue-helper-not-symlink"
+                | "verify-client-binding-cleanup-helper-regular"
+                | "verify-client-binding-cleanup-helper-not-symlink"
+                | "inspect-client-binding-request"
+                | "reject-client-binding-request-symlink"
+                | "stage-client-binding-request"
+                | "protect-client-binding-request"
+                | "verify-client-binding-request-regular"
+                | "verify-client-binding-request-not-symlink"
+                | "run-client-binding-issue"
+                | "verify-client-binding-import-regular"
+                | "verify-client-binding-import-not-symlink" => String::new(),
+                other => return Err(contract(&format!("unexpected test command {other}"))),
+            };
+            Ok(aws_ec2::ExecOutput {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn canonical_bundle_json(value: &impl Serialize) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&serde_json::to_value(value).expect("bundle value"))
+            .expect("canonical bundle JSON");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn append_bundle_directory(builder: &mut tar::Builder<Vec<u8>>, path: &str) {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o555);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("{path}/"), Cursor::new([]))
+            .expect("bundle directory");
+    }
+
+    fn append_bundle_file(
+        builder: &mut tar::Builder<Vec<u8>>,
+        path: &str,
+        mode: u32,
+        bytes: &[u8],
+    ) {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(u64::try_from(bytes.len()).expect("bundle file size"));
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, Cursor::new(bytes))
+            .expect("bundle file");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn issue_ec2_fixture() -> IssueEc2Fixture {
+        use aws_ec2::bundle::{StackFile, StackManifest, hash};
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let compose = b"services: {}\n";
+        let installer = b"#!/bin/sh\nexit 0\n";
+        let issue_helper = b"#!/bin/sh\nexit 0\n";
+        let cleanup_helper = b"#!/bin/sh\nexit 0\n";
+        let files = vec![
+            StackFile {
+                path: "docker/production/docker-compose.yml".into(),
+                sha256: hash(compose),
+                mode: "0444".into(),
+            },
+            StackFile {
+                path: REMOTE_CLEANUP_RELATIVE.into(),
+                sha256: hash(cleanup_helper),
+                mode: "0555".into(),
+            },
+            StackFile {
+                path: REMOTE_HELPER_RELATIVE.into(),
+                sha256: hash(issue_helper),
+                mode: "0555".into(),
+            },
+            StackFile {
+                path: "scripts/production-stack/install.sh".into(),
+                sha256: hash(installer),
+                mode: "0555".into(),
+            },
+        ];
+        let stack_manifest = StackManifest {
+            schema: "dirextalk.vnext-stack-bundle".into(),
+            schema_version: 1,
+            version: "1.0.0".into(),
+            source_commit: "d".repeat(40),
+            target: "linux-amd64".into(),
+            server_image: format!("dirextalk/vnet-server@sha256:{}", "a".repeat(64)),
+            migrator_image: format!("dirextalk/vnet-server@sha256:{}", "b".repeat(64)),
+            installer_sha256: hash(installer),
+            files,
+        };
+        let mut archive = tar::Builder::new(Vec::new());
+        for directory in [
+            "dirextalk-vnext-stack",
+            "dirextalk-vnext-stack/docker",
+            "dirextalk-vnext-stack/docker/production",
+            "dirextalk-vnext-stack/scripts",
+            "dirextalk-vnext-stack/scripts/production-stack",
+            "dirextalk-vnext-stack/scripts/production-stack/host",
+        ] {
+            append_bundle_directory(&mut archive, directory);
+        }
+        append_bundle_file(
+            &mut archive,
+            "dirextalk-vnext-stack/manifest.json",
+            0o444,
+            &canonical_bundle_json(&stack_manifest),
+        );
+        for (path, mode, bytes) in [
+            (
+                "dirextalk-vnext-stack/docker/production/docker-compose.yml",
+                0o444,
+                compose.as_slice(),
+            ),
+            (
+                "dirextalk-vnext-stack/scripts/production-stack/host/client-binding-export-cleanup",
+                0o555,
+                cleanup_helper.as_slice(),
+            ),
+            (
+                "dirextalk-vnext-stack/scripts/production-stack/host/client-binding-issue",
+                0o555,
+                issue_helper.as_slice(),
+            ),
+            (
+                "dirextalk-vnext-stack/scripts/production-stack/install.sh",
+                0o555,
+                installer.as_slice(),
+            ),
+        ] {
+            append_bundle_file(&mut archive, path, mode, bytes);
+        }
+        let bundle = archive.into_inner().expect("bundle");
+        let bundle_path = root.path().join("dirextalk-vnext.bundle");
+        let host_installer_path = root.path().join("install-vnext");
+        let host_provisioner_path = root.path().join("provision-vnext");
+        let receipt_reader_path = root.path().join("read-vnext-receipt");
+        let host_installer = b"#!/bin/sh\nexit 0\n";
+        let host_provisioner = b"#!/bin/sh\nexit 0\n";
+        let receipt_reader = b"#!/bin/sh\nexit 0\n";
+        fs::write(&bundle_path, &bundle).expect("bundle write");
+        fs::write(&host_installer_path, host_installer).expect("host installer");
+        fs::write(&host_provisioner_path, host_provisioner).expect("host provisioner");
+        fs::write(&receipt_reader_path, receipt_reader).expect("receipt reader");
+        let manifest = AwsEc2Manifest {
+            schema_version: 1,
+            target: "x6".into(),
+            provider: aws_ec2::PROVIDER.into(),
+            region: aws_ec2::REGION.into(),
+            domain: "example.com".into(),
+            instance_type: "t3.small".into(),
+            disk_gib: 30,
+            operator_ssh_cidr: "192.0.2.1/32".into(),
+            stack_bundle_sha256: hash(&bundle),
+            stack_bundle_path: bundle_path,
+            host_installer_path,
+            host_installer_sha256: hash(host_installer),
+            host_provisioner_path,
+            host_provisioner_sha256: hash(host_provisioner),
+            receipt_reader_path,
+            receipt_reader_sha256: hash(receipt_reader),
+            release_version: "1.0.0".into(),
+            source_commit: "d".repeat(40),
+            server_image: stack_manifest.server_image,
+            migrator_image: stack_manifest.migrator_image,
+            postgres_image: format!("postgres@sha256:{}", "c".repeat(64)),
+            caddy_image: format!("caddy@sha256:{}", "d".repeat(64)),
+            probe_image: format!("curlimages/curl@sha256:{}", "e".repeat(64)),
+            ubuntu_ami_owner: aws_ec2::UBUNTU_OWNER.into(),
+            ubuntu_ami_pattern: aws_ec2::UBUNTU_PATTERN.into(),
+            key_name: "x6-key".into(),
+        };
+        let facts = manifest.bundle().expect("bundle facts");
+        let operation_id = "018f856e-e0bd-71d2-9428-58d50cf77eaf".to_owned();
+        let tenant_id = operation_id.clone();
+        let mut ownership_tags = BTreeMap::new();
+        ownership_tags.insert("DirextalkManaged".into(), "true".into());
+        ownership_tags.insert("DirextalkTarget".into(), manifest.target.clone());
+        ownership_tags.insert("DirextalkOperation".into(), operation_id.clone());
+        ownership_tags.insert(
+            "DirextalkClientTokenSha256".into(),
+            hash(operation_id.as_bytes()),
+        );
+        ownership_tags.insert("DirextalkDomain".into(), manifest.domain.clone());
+        let desired = aws_ec2::BundleRecord::from_facts(&facts, &manifest);
+        let state = Ec2State {
+            schema: "dirextalk.aws-ec2-lifecycle".into(),
+            schema_version: 1,
+            operation_id: operation_id.clone(),
+            client_token: operation_id.clone(),
+            client_token_sha256: hash(operation_id.as_bytes()),
+            target: manifest.target.clone(),
+            account_id: None,
+            region: manifest.region.clone(),
+            domain: manifest.domain.clone(),
+            tenant_id: tenant_id.clone(),
+            indexer_id: "018f856e-e0bd-71d2-9428-58d50cf77eb0".into(),
+            ownership_tags,
+            monthly_estimate_cents: 1,
+            max_monthly_usd: 1,
+            infrastructure: aws_ec2::InfrastructureRecord::from_manifest(&manifest),
+            desired: desired.clone(),
+            current: Some(desired),
+            previous: None,
+            ami: None,
+            key: None,
+            vpc_id: None,
+            security_group_id: None,
+            instance_id: None,
+            private_ipv4: None,
+            volume_id: None,
+            eip: Some(aws_ec2::EipRecord {
+                allocation_id: "eipalloc-test".into(),
+                association_id: "eipassoc-test".into(),
+                public_ip: "192.0.2.10".into(),
+            }),
+            dns: None,
+            host_key: None,
+            current_receipt: Some(
+                serde_json::from_value(serde_json::json!({
+                    "schema":"dirextalk.vnext-installed-release",
+                    "schema_version":1,
+                    "state":"installed",
+                    "target":"x6",
+                    "domain":"example.com",
+                    "version":"1.0.0",
+                    "source_commit":"d".repeat(40),
+                    "bundle_sha256":facts.bundle_sha256,
+                    "manifest_sha256":facts.manifest_sha256,
+                    "server_image":facts.manifest.server_image,
+                    "migrator_image":facts.manifest.migrator_image,
+                    "installed_at_ms":1,
+                    "receipt_sha256":"f".repeat(64)
+                }))
+                .expect("installed receipt"),
+            ),
+            previous_receipt: None,
+            rollback_receipt: None,
+            host_ready_receipt: Some(
+                serde_json::from_value(serde_json::json!({
+                    "schema":"dirextalk.vnext-host-provision-ready",
+                    "schema_version":1,
+                    "state":"ready",
+                    "request_sha256":"1".repeat(64),
+                    "target":"x6",
+                    "domain":"example.com",
+                    "tenant_id":tenant_id,
+                    "indexer_id":"018f856e-e0bd-71d2-9428-58d50cf77eb0",
+                    "release_version":"1.0.0",
+                    "bundle_sha256":facts.bundle_sha256,
+                    "compose_sha256":facts.compose_sha256,
+                    "receipt_sha256":"2".repeat(64)
+                }))
+                .expect("host ready receipt"),
+            ),
+            current_bundle_suffix: None,
+            current_request_suffix: None,
+            previous_bundle_suffix: None,
+            previous_request_suffix: None,
+            provision_request_suffix: None,
+            phase: LifecyclePhase::Verified,
+            pending_effect: None,
+            retained_volume: false,
+            integrity_sha256: String::new(),
+        }
+        .seal()
+        .expect("sealed state");
+        state.verify().expect("valid state");
+        let identity_tls_root_ca_pem =
+            "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----".to_owned();
+        let import = Zeroizing::new(
+            serde_json::to_vec(&Ec2ImportArtifact {
+                schema: "dirextalk.client-binding".into(),
+                schema_version: 1,
+                binding_id: "018f856e-e0bd-71d2-9428-58d50cf77eb1".into(),
+                deployment_operation_id: operation_id,
+                tenant_id: state.tenant_id.clone(),
+                server_origin: "https://example.com".into(),
+                identity_tls_root_ca_sha256: hex::encode(Sha256::digest(
+                    identity_tls_root_ca_pem.as_bytes(),
+                )),
+                identity_tls_root_ca_pem,
+                expires_at_unix_ms: now_ms().expect("clock") + 5 * 60 * 1_000,
+                authorization: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            })
+            .expect("binding import"),
+        );
+        let issue_digest = hash(issue_helper);
+        let cleanup_digest = hash(cleanup_helper);
+        IssueEc2Fixture {
+            issue_path: format!(
+                "{REMOTE_RELEASE_ROOT}/{}/{}",
+                facts.bundle_sha256, REMOTE_HELPER_RELATIVE
+            ),
+            cleanup_path: format!(
+                "{REMOTE_RELEASE_ROOT}/{}/{}",
+                facts.bundle_sha256, REMOTE_CLEANUP_RELATIVE
+            ),
+            root,
+            manifest,
+            state,
+            import,
+            issue_digest,
+            cleanup_digest,
         }
     }
 
@@ -1749,6 +2179,110 @@ mod tests {
         assert_eq!(metadata.mode() & 0o777, 0o600);
         assert_eq!(metadata.nlink(), 1);
         assert!(store.read(operation).expect("state read").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_ec2_reuses_exact_durable_output_when_state_is_absent() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = issue_ec2_fixture();
+        let state_dir = fixture.root.path().join("ec2-state");
+        {
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
+            store.write(&fixture.state).expect("EC2 state");
+        }
+        let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
+        let output = fixture.root.path().join("binding.import.json");
+        write_protected_output(&output, &fixture.import, false).expect("crash-window output");
+        let before = fs::symlink_metadata(&output).expect("output metadata");
+        let executor = IssueReplayExecutor::new(
+            &fixture,
+            Some(binding_store.state_path(&fixture.state.operation_id)),
+        );
+
+        let projection = issue_ec2(
+            &fixture.manifest,
+            &state_dir,
+            &output,
+            &binding_store,
+            &executor,
+        )
+        .expect("exact crash replay");
+        assert_eq!(projection.state, "issued");
+        assert!(executor.pending_observed());
+        assert!(
+            executor
+                .calls()
+                .iter()
+                .any(|id| id == "run-client-binding-issue")
+        );
+        assert!(
+            executor
+                .calls()
+                .iter()
+                .any(|id| id == "cleanup-client-binding-export")
+        );
+        let after = fs::symlink_metadata(&output).expect("output metadata");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(
+            read_existing_output(&output).expect("protected output"),
+            fixture.import
+        );
+        assert_eq!(
+            binding_store
+                .read(&fixture.state.operation_id)
+                .expect("binding state")
+                .expect("issued binding")
+                .state,
+            BindingState::Issued
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_ec2_rejects_divergent_durable_output_and_cleans_remote_export() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = issue_ec2_fixture();
+        let state_dir = fixture.root.path().join("ec2-state");
+        {
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
+            store.write(&fixture.state).expect("EC2 state");
+        }
+        let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding-state"));
+        let output = fixture.root.path().join("binding.import.json");
+        let divergent = Zeroizing::new(b"divergent-protected-binding".to_vec());
+        write_protected_output(&output, &divergent, false).expect("divergent output");
+        let before = fs::symlink_metadata(&output).expect("output metadata");
+        let executor = IssueReplayExecutor::new(&fixture, None);
+
+        assert!(matches!(
+            issue_ec2(
+                &fixture.manifest,
+                &state_dir,
+                &output,
+                &binding_store,
+                &executor,
+            ),
+            Err(ReleaseError::OperationConflict)
+        ));
+        let calls = executor.calls();
+        assert!(calls.iter().any(|id| id == "run-client-binding-issue"));
+        assert!(calls.iter().any(|id| id == "cleanup-client-binding-export"));
+        assert!(!executor.pending_observed());
+        assert!(
+            binding_store
+                .read(&fixture.state.operation_id)
+                .expect("binding state")
+                .is_none()
+        );
+        let after = fs::symlink_metadata(&output).expect("output metadata");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(
+            read_existing_output(&output).expect("protected output"),
+            divergent
+        );
     }
 
     #[cfg(unix)]
