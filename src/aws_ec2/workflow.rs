@@ -12,7 +12,9 @@ use base64::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::bundle::{BundleFacts, InstallRequest, InstalledReceipt, hash, load_bundle};
+use super::bundle::{
+    BundleFacts, InstallRequest, InstalledReceipt, canonical_json, hash, load_bundle,
+};
 use super::provision::{HostReadyReceipt, ProvisionRequest};
 use super::store::Store;
 use super::{
@@ -2876,7 +2878,13 @@ pub fn update(
     {
         return Ok(state);
     }
-    authenticate_legacy_retained_compatibility(&store, &state, manifest, &mut prior_bundle)?;
+    authenticate_legacy_retained_compatibility(
+        &store,
+        &state,
+        manifest,
+        &prior_receipt,
+        &mut prior_bundle,
+    )?;
     ensure_cross_version_contract(&prior_bundle, &prior_receipt, &candidate)?;
     match state.phase {
         LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack => {}
@@ -2993,6 +3001,7 @@ fn authenticate_legacy_retained_compatibility(
     store: &Store,
     state: &Ec2State,
     manifest: &AwsEc2Manifest,
+    prior_receipt: &InstalledReceipt,
     prior: &mut BundleRecord,
 ) -> Result<()> {
     if prior.cross_version_compatibility.is_some() || prior.version != "0.1.1" {
@@ -3025,7 +3034,46 @@ fn authenticate_legacy_retained_compatibility(
     {
         return Err(ReleaseError::OperationConflict);
     }
+    authenticate_retained_install_evidence(store, state, prior, prior_receipt)?;
     prior.cross_version_compatibility = facts.cross_version_compatibility;
+    Ok(())
+}
+
+fn authenticate_retained_install_evidence(
+    store: &Store,
+    state: &Ec2State,
+    prior: &BundleRecord,
+    prior_receipt: &InstalledReceipt,
+) -> Result<()> {
+    let suffix = if state.phase == LifecyclePhase::UpdateVerifying {
+        state.previous_request_suffix.as_deref()
+    } else {
+        state.current_request_suffix.as_deref()
+    }
+    .ok_or_else(|| contract("retained install request fact is absent"))?;
+    let bytes = store.read_artifact(suffix, 64 * 1024)?;
+    let request: InstallRequest = serde_json::from_slice(&bytes)?;
+    if request.canonical_bytes()? != bytes
+        || request.target != "linux-amd64"
+        || request.domain != state.domain
+        || request.version != prior.version
+        || request.source_commit != prior.source_commit
+        || request.bundle_sha256 != prior.bundle_sha256
+        || request.manifest_sha256 != prior.manifest_sha256
+        || request.server_image != prior.server_image
+        || request.migrator_image != prior.migrator_image
+        || request.previous_receipt_sha256.is_some()
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let receipt = InstalledReceipt::parse_and_verify(
+        &canonical_json(prior_receipt)?,
+        &request,
+        ReceiptState::Installed,
+    )?;
+    if &receipt != prior_receipt {
+        return Err(ReleaseError::OperationConflict);
+    }
     Ok(())
 }
 

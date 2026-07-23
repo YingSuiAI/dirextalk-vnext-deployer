@@ -820,6 +820,69 @@ fn legacy_retained_marker_authentication_rejects_missing_changed_or_mismatched_a
         )
         .is_err()
     );
+
+    let (request_dir, request_old) = fixture("0.1.1", 'd');
+    let (request_state_dir, mut request_state, _, _) =
+        update_ready_state(&request_dir, &request_old);
+    request_state
+        .current
+        .as_mut()
+        .expect("retained bundle")
+        .cross_version_compatibility = None;
+    request_state = request_state.seal().expect("legacy seal");
+    let request_store = Store::lock(&request_state_dir, "x6").expect("store");
+    request_store
+        .write_artifact("current.request", b"tampered", 0o600)
+        .expect("tampered request");
+    request_store.write(&request_state).expect("legacy state");
+    drop(request_store);
+    let before_request = fs::read(request_state_dir.join("x6.json")).expect("state bytes");
+    assert!(
+        update(
+            &candidate,
+            &request_state_dir,
+            false,
+            &Never(AtomicUsize::new(0))
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read(request_state_dir.join("x6.json")).expect("state bytes"),
+        before_request
+    );
+
+    let (receipt_dir, receipt_old) = fixture("0.1.1", 'e');
+    let (receipt_state_dir, mut receipt_state, _, _) =
+        update_ready_state(&receipt_dir, &receipt_old);
+    receipt_state
+        .current
+        .as_mut()
+        .expect("retained bundle")
+        .cross_version_compatibility = None;
+    receipt_state
+        .current_receipt
+        .as_mut()
+        .expect("retained receipt")
+        .bundle_sha256 = "f".repeat(64);
+    receipt_state = receipt_state.seal().expect("legacy seal");
+    Store::lock(&receipt_state_dir, "x6")
+        .expect("store")
+        .write(&receipt_state)
+        .expect("legacy state");
+    let before_receipt = fs::read(receipt_state_dir.join("x6.json")).expect("state bytes");
+    assert!(
+        update(
+            &candidate,
+            &receipt_state_dir,
+            false,
+            &Never(AtomicUsize::new(0))
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read(receipt_state_dir.join("x6.json")).expect("state bytes"),
+        before_receipt
+    );
 }
 
 impl AwsExecutor for ExistingReceipt {
