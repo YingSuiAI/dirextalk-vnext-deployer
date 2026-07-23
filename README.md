@@ -15,6 +15,12 @@ Matrix-independent Dirextalk vNext stack. It starts with the release boundary:
 It is a new implementation. It does not execute or embed the legacy
 `dirextalk-deployer` shell scripts.
 
+Verification note: focused EC2 replay, rollback, and legacy-seal tests pass.
+The full suite has one external concurrent-workspace failure only:
+`real_server_bundle_5bf0090_parses_and_plans` reports `SourceMismatch` for the
+live `dirextalk-vnext-server/target/production-release/dirextalk-vnext.bundle`
+artifact; no deployer fixture or code path is involved.
+
 ## Safety model
 
 `validate`, `plan`, and `build` without `--execute` cannot publish. `assemble`

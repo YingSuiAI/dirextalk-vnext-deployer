@@ -416,31 +416,220 @@ struct ExistingReceipt {
     calls: Mutex<Vec<String>>,
 }
 
-struct UpdateReplayExecutor {
-    receipt: String,
-    ready: String,
-    calls: Mutex<Vec<String>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteInput {
+    Absent,
+    UbuntuStaged,
+    UbuntuProtected,
+    RootProtected,
 }
+
+struct UpdateReplayExecutor {
+    candidate_receipt: String,
+    rollback_receipt: Option<String>,
+    ready: String,
+    state_path: PathBuf,
+    bundle_size: usize,
+    request_size: usize,
+    bundle_sha256: String,
+    request_sha256: String,
+    old_bundle_size: usize,
+    old_request_size: usize,
+    old_bundle_sha256: String,
+    old_request_sha256: String,
+    bundle: Mutex<RemoteInput>,
+    request: Mutex<RemoteInput>,
+    remote_receipt: Mutex<String>,
+    calls: Mutex<Vec<String>>,
+    persisted: Mutex<Vec<(LifecyclePhase, Option<String>)>>,
+}
+
+impl UpdateReplayExecutor {
+    fn inspect_input(id: &str, path: &str, size: usize, input: RemoteInput) -> String {
+        let (owner, group, mode) = match input {
+            RemoteInput::Absent => return String::new(),
+            RemoteInput::UbuntuStaged => ("ubuntu", "ubuntu", "600"),
+            RemoteInput::UbuntuProtected => ("ubuntu", "ubuntu", "400"),
+            RemoteInput::RootProtected => ("root", "root", "400"),
+        };
+        let _ = id;
+        format!("f {owner} {group} {mode} 1 {size} {path}\n")
+    }
+
+    fn input_for(&self, id: &str) -> Option<(&Mutex<RemoteInput>, &str, usize)> {
+        let rollback = fs::read(&self.state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Ec2State>(&bytes).ok())
+            .is_some_and(|state| matches!(state.phase, LifecyclePhase::RollbackInstalling));
+        if id.contains("stack-bundle") {
+            Some((
+                &self.bundle,
+                REMOTE_BUNDLE,
+                if rollback {
+                    self.old_bundle_size
+                } else {
+                    self.bundle_size
+                },
+            ))
+        } else if id.contains("install-request") {
+            Some((
+                &self.request,
+                REMOTE_REQUEST,
+                if rollback {
+                    self.old_request_size
+                } else {
+                    self.request_size
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn expected_hash(&self, id: &str) -> Option<(&str, &str)> {
+        let rollback = fs::read(&self.state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Ec2State>(&bytes).ok())
+            .is_some_and(|state| matches!(state.phase, LifecyclePhase::RollbackInstalling));
+        if id.contains("stack-bundle") {
+            Some((
+                if rollback {
+                    &self.old_bundle_sha256
+                } else {
+                    &self.bundle_sha256
+                },
+                REMOTE_BUNDLE,
+            ))
+        } else if id.contains("install-request") {
+            Some((
+                if rollback {
+                    &self.old_request_sha256
+                } else {
+                    &self.request_sha256
+                },
+                REMOTE_REQUEST,
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn assert_persisted_tuple(&self, command: &FixedCommand) {
+        if !command.mutation {
+            return;
+        }
+        let state: Ec2State = serde_json::from_slice(
+            &fs::read(&self.state_path).expect("state persisted before effect"),
+        )
+        .expect("persisted state JSON");
+        state.verify().expect("persisted state integrity");
+        assert!(matches!(
+            state.phase,
+            LifecyclePhase::UpdateInstalling | LifecyclePhase::RollbackInstalling
+        ));
+        assert_eq!(state.pending_effect.as_deref(), Some(command.id.as_str()));
+        assert_eq!(state.desired.version, "0.1.4");
+        assert_eq!(
+            state.previous.as_ref().expect("retained tuple").version,
+            "0.1.1"
+        );
+        assert_eq!(
+            state
+                .previous_receipt
+                .as_ref()
+                .expect("retained receipt")
+                .version,
+            "0.1.1"
+        );
+        self.persisted
+            .lock()
+            .expect("persisted calls")
+            .push((state.phase, state.pending_effect.clone()));
+    }
+}
+
 impl AwsExecutor for UpdateReplayExecutor {
     fn run(&self, command: &FixedCommand) -> Result<ExecOutput> {
         self.calls.lock().expect("calls").push(command.id.clone());
+        self.assert_persisted_tuple(command);
         let stdout = match command.id.as_str() {
             "check-authenticated-update-capacity" => "Avail IAvail\n134217728 128\n".into(),
-            "inspect-current-installed-receipt" => format!(
-                "f root root 600 1 {} {}\n",
-                self.receipt.len(),
-                REMOTE_CURRENT_RECEIPT
-            ),
-            "read-existing-installed-receipt" | "verify-authenticated-installed-receipt" => {
-                self.receipt.clone()
+            "inspect-current-installed-receipt" => {
+                let receipt = self.remote_receipt.lock().expect("receipt");
+                format!(
+                    "f root root 600 1 {} {}\n",
+                    receipt.len(),
+                    REMOTE_CURRENT_RECEIPT
+                )
             }
-            "verify-caller-account" => "{\"Account\":\"123456789012\"}".into(),
+            "read-existing-installed-receipt"
+            | "verify-authenticated-installed-receipt"
+            | "read-authenticated-installed-receipt" => {
+                self.remote_receipt.lock().expect("receipt").clone()
+            }
+            "verify-caller-account" => {
+                let state: Ec2State =
+                    serde_json::from_slice(&fs::read(&self.state_path).expect("state"))?;
+                format!("{{\"Account\":\"{}\"}}", state.account_id.expect("account"))
+            }
             "verify-dns-to-owned-eip" => "203.0.113.8 STREAM x\n".into(),
             "verify-system-tls-https-health" | "verify-host-ready-receipt-regular-file" => {
                 String::new()
             }
             "verify-host-ready-receipt-metadata" => format!("0 0 600 1 {}\n", self.ready.len()),
             "read-sanitized-host-ready-receipt" => self.ready.clone(),
+            "clear-retained-install-inputs-before-replay" => {
+                *self.bundle.lock().expect("bundle") = RemoteInput::Absent;
+                *self.request.lock().expect("request") = RemoteInput::Absent;
+                String::new()
+            }
+            "run-fixed-stack-installer" => {
+                let state: Ec2State =
+                    serde_json::from_slice(&fs::read(&self.state_path).expect("state"))?;
+                *self.remote_receipt.lock().expect("receipt") =
+                    if matches!(state.phase, LifecyclePhase::RollbackInstalling) {
+                        self.rollback_receipt
+                            .clone()
+                            .ok_or_else(|| contract("rollback receipt not configured"))?
+                    } else {
+                        self.candidate_receipt.clone()
+                    };
+                String::new()
+            }
+            id if id.starts_with("stage-exact-") => {
+                if let Some((input, _, _)) = self.input_for(id) {
+                    *input.lock().expect("input") = RemoteInput::UbuntuStaged;
+                    String::new()
+                } else {
+                    return Err(contract("unexpected staging command"));
+                }
+            }
+            id if id.starts_with("protect-staged-") => {
+                if let Some((input, _, _)) = self.input_for(id) {
+                    *input.lock().expect("input") = RemoteInput::UbuntuProtected;
+                    String::new()
+                } else {
+                    return Err(contract("unexpected protect command"));
+                }
+            }
+            id if id.starts_with("own-protected-") => {
+                if let Some((input, _, _)) = self.input_for(id) {
+                    *input.lock().expect("input") = RemoteInput::RootProtected;
+                    String::new()
+                } else {
+                    return Err(contract("unexpected ownership command"));
+                }
+            }
+            id if id.starts_with("inspect-") => {
+                let Some((input, path, size)) = self.input_for(id) else {
+                    return Err(contract("unexpected inspect command"));
+                };
+                Self::inspect_input(id, path, size, *input.lock().expect("input"))
+            }
+            id if id.starts_with("verify-") && self.expected_hash(id).is_some() => {
+                let (digest, path) = self.expected_hash(id).expect("hash");
+                format!("{digest}  {path}\n")
+            }
             _ => return Err(contract("unexpected update replay command")),
         };
         Ok(ExecOutput {
@@ -602,16 +791,19 @@ fn pre_cross_version_sealed_state_is_exactly_authenticated_and_migrated_under_lo
 
     let (dir, manifest) = fixture("1.2.3", 'a');
     let state_dir = dir.path().join("legacy-state");
-    let state = apply(
-        &manifest,
-        &state_dir,
-        100,
-        false,
-        &Never(AtomicUsize::new(0)),
-    )
-    .expect("state");
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-5a6c2e9-x6.json");
+    let legacy_file = fs::read(&fixture_path).expect("literal legacy fixture");
+    let legacy = legacy_file[..legacy_file.len() - 1].to_vec();
+    let legacy_state: Ec2State = serde_json::from_slice(&legacy).expect("legacy state JSON");
+    assert_eq!(
+        legacy_state.integrity_sha256,
+        "e7f193205337e5dcb951909555696d4c696c3f7572f606413bd74bc31410b24e"
+    );
+    legacy_state
+        .verify_legacy_bytes(&legacy)
+        .expect("exact old seal");
     let store = Store::lock(&state_dir, "x6").expect("store");
-    let legacy = state.legacy_sealed_bytes_for_test().expect("legacy bytes");
     fs::write(store.state_path(), &legacy).expect("legacy state");
     fs::set_permissions(store.state_path(), fs::Permissions::from_mode(0o600)).expect("mode");
     drop(store);
@@ -1025,7 +1217,7 @@ fn update_capacity_parser_enforces_exact_bytes_inodes_and_rejects_invalid_values
 fn executable_cross_version_update_replays_update_installing_and_verifying_without_installer_effect()
  {
     let (dir, old) = fixture("0.1.1", 'a');
-    let (state_dir, mut state, _old_request, provision) = update_ready_state(&dir, &old);
+    let (state_dir, mut state, old_request, provision) = update_ready_state(&dir, &old);
     let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
     let facts = candidate.bundle().expect("candidate facts");
     let request = InstallRequest::new(
@@ -1040,13 +1232,34 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
                 .clone(),
         ),
     );
-    let receipt = String::from_utf8(canonical(&receipt_for(&request, ReceiptState::Installed)))
-        .expect("receipt");
+    let retained_receipt = String::from_utf8(canonical(
+        state.current_receipt.as_ref().expect("retained receipt"),
+    ))
+    .expect("retained receipt");
+    let candidate_receipt =
+        String::from_utf8(canonical(&receipt_for(&request, ReceiptState::Installed)))
+            .expect("candidate receipt");
     let ready = String::from_utf8(canonical(&ready_for(&provision))).expect("ready");
+    let bundle_bytes = fs::read(&candidate.stack_bundle_path).expect("candidate bundle");
+    let request_bytes = request.canonical_bytes().expect("candidate request");
     let executor = UpdateReplayExecutor {
-        receipt,
+        candidate_receipt,
+        rollback_receipt: None,
         ready,
+        state_path: state_dir.join("x6.json"),
+        bundle_size: bundle_bytes.len(),
+        request_size: request_bytes.len(),
+        bundle_sha256: hash(&bundle_bytes),
+        request_sha256: hash(&request_bytes),
+        old_bundle_size: bundle_bytes.len(),
+        old_request_size: request_bytes.len(),
+        old_bundle_sha256: hash(&bundle_bytes),
+        old_request_sha256: hash(&request_bytes),
+        bundle: Mutex::new(RemoteInput::RootProtected),
+        request: Mutex::new(RemoteInput::RootProtected),
+        remote_receipt: Mutex::new(retained_receipt.clone()),
         calls: Mutex::new(Vec::new()),
+        persisted: Mutex::new(Vec::new()),
     };
     let updated = update(&candidate, &state_dir, true, &executor).expect("successful update");
     assert_eq!(updated.phase, LifecyclePhase::Verified);
@@ -1055,25 +1268,67 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
         updated.previous.as_ref().expect("previous").version,
         "0.1.1"
     );
-    assert!(
-        !executor
-            .calls
-            .lock()
-            .expect("calls")
-            .iter()
-            .any(|id| id.contains("stage-") || id == "run-fixed-stack-installer")
+    let calls = executor.calls.lock().expect("calls").clone();
+    let effects: Vec<&str> = calls
+        .iter()
+        .filter(|id| {
+            matches!(
+                id.as_str(),
+                "clear-retained-install-inputs-before-replay"
+                    | "stage-exact-stack-bundle"
+                    | "protect-staged-stack-bundle"
+                    | "own-protected-stack-bundle"
+                    | "stage-exact-install-request"
+                    | "protect-staged-install-request"
+                    | "own-protected-install-request"
+                    | "run-fixed-stack-installer"
+            )
+        })
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        effects,
+        vec![
+            "clear-retained-install-inputs-before-replay",
+            "stage-exact-stack-bundle",
+            "protect-staged-stack-bundle",
+            "own-protected-stack-bundle",
+            "stage-exact-install-request",
+            "protect-staged-install-request",
+            "own-protected-install-request",
+            "run-fixed-stack-installer",
+        ]
     );
+    assert_eq!(executor.persisted.lock().expect("persisted").len(), 8);
     // Persisted restart from either durable boundary reuses the authenticated candidate receipt.
     for phase in [
         LifecyclePhase::UpdateInstalling,
         LifecyclePhase::UpdateVerifying,
     ] {
-        state.phase = phase;
+        state.phase = phase.clone();
         state.desired = BundleRecord::from_facts(&facts, &candidate);
-        state.previous = state.current.clone();
-        state.previous_receipt = state.current_receipt.clone();
-        state.previous_bundle_suffix = state.current_bundle_suffix.clone();
-        state.previous_request_suffix = state.current_request_suffix.clone();
+        state.previous = Some(BundleRecord::from_facts(
+            &old.bundle().expect("old facts"),
+            &old,
+        ));
+        state.previous_receipt = Some(receipt_for(&old_request, ReceiptState::Installed));
+        state.previous_bundle_suffix = Some("current.bundle".into());
+        state.previous_request_suffix = Some("current.request".into());
+        if phase == LifecyclePhase::UpdateInstalling {
+            state.current = state.previous.clone();
+            state.current_receipt = state.previous_receipt.clone();
+            state.current_bundle_suffix = Some("current.bundle".into());
+            state.current_request_suffix = Some("current.request".into());
+            *executor.remote_receipt.lock().expect("receipt") = retained_receipt.clone();
+            *executor.bundle.lock().expect("bundle") = RemoteInput::RootProtected;
+            *executor.request.lock().expect("request") = RemoteInput::RootProtected;
+        } else {
+            state.current = Some(BundleRecord::from_facts(&facts, &candidate));
+            state.current_receipt = Some(receipt_for(&request, ReceiptState::Installed));
+            state.current_bundle_suffix = Some("update-candidate.bundle".into());
+            state.current_request_suffix = Some("update-candidate.request".into());
+            *executor.remote_receipt.lock().expect("receipt") = executor.candidate_receipt.clone();
+        }
         state.candidate_bundle_suffix = Some("update-candidate.bundle".into());
         state.candidate_request_suffix = Some("update-candidate.request".into());
         state = state.seal().expect("seal");
@@ -1087,9 +1342,233 @@ fn executable_cross_version_update_replays_update_installing_and_verifying_witho
             .expect("artifact");
         store.write(&state).expect("state");
         drop(store);
+        let persisted: Ec2State = Store::lock(&state_dir, "x6")
+            .expect("store")
+            .read()
+            .expect("read")
+            .expect("persisted restart state");
+        persisted.verify().expect("restart state integrity");
+        assert_eq!(persisted.phase, phase);
+        assert_eq!(persisted.desired.version, "0.1.4");
+        assert_eq!(
+            persisted.previous.as_ref().expect("retained tuple").version,
+            "0.1.1"
+        );
+        if phase == LifecyclePhase::UpdateInstalling {
+            assert_eq!(
+                persisted
+                    .current
+                    .as_ref()
+                    .expect("installing current")
+                    .version,
+                "0.1.1"
+            );
+            assert_eq!(
+                persisted
+                    .current_receipt
+                    .as_ref()
+                    .expect("installing receipt")
+                    .version,
+                "0.1.1"
+            );
+        } else {
+            assert_eq!(
+                persisted
+                    .current
+                    .as_ref()
+                    .expect("verifying current")
+                    .version,
+                "0.1.4"
+            );
+            assert_eq!(
+                persisted
+                    .current_receipt
+                    .as_ref()
+                    .expect("verifying receipt")
+                    .version,
+                "0.1.4"
+            );
+        }
+        let calls_before_restart = executor.calls.lock().expect("calls").len();
         let replay = update(&candidate, &state_dir, true, &executor).expect("replay");
         assert_eq!(replay.phase, LifecyclePhase::Verified);
+        let restart_effects = executor
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .skip(calls_before_restart)
+            .filter(|id| {
+                matches!(
+                    id.as_str(),
+                    "clear-retained-install-inputs-before-replay"
+                        | "stage-exact-stack-bundle"
+                        | "protect-staged-stack-bundle"
+                        | "own-protected-stack-bundle"
+                        | "stage-exact-install-request"
+                        | "protect-staged-install-request"
+                        | "own-protected-install-request"
+                        | "run-fixed-stack-installer"
+                )
+            })
+            .count();
+        assert_eq!(
+            restart_effects,
+            if phase == LifecyclePhase::UpdateInstalling {
+                8
+            } else {
+                0
+            }
+        );
     }
+}
+
+#[test]
+fn code_only_rollback_replays_rolled_back_receipt_and_rejects_third_identity() {
+    let (dir, old) = fixture("0.1.1", 'a');
+    let (state_dir, mut state, _old_request, provision) = update_ready_state(&dir, &old);
+    let (_candidate_dir, candidate) = fixture("0.1.4", 'b');
+    let candidate_facts = candidate.bundle().expect("candidate facts");
+    let candidate_request = InstallRequest::new(
+        &candidate.domain,
+        &candidate_facts,
+        Some(
+            state
+                .current_receipt
+                .as_ref()
+                .expect("retained receipt")
+                .receipt_sha256
+                .clone(),
+        ),
+    );
+    let retained_receipt = state.current_receipt.clone().expect("retained receipt");
+    let old_facts = old.bundle().expect("old facts");
+    let old_bundle = fs::read(&old.stack_bundle_path).expect("old bundle");
+    let candidate_bundle = fs::read(&candidate.stack_bundle_path).expect("candidate bundle");
+    let candidate_receipt = receipt_for(&candidate_request, ReceiptState::Installed);
+    let rollback_request = InstallRequest {
+        schema: "dirextalk.vnext-install-request".into(),
+        schema_version: 1,
+        target: state.target.clone(),
+        domain: state.domain.clone(),
+        version: old_facts.manifest.version.clone(),
+        source_commit: old_facts.manifest.source_commit.clone(),
+        bundle_sha256: old_facts.bundle_sha256.clone(),
+        manifest_sha256: old_facts.manifest_sha256.clone(),
+        server_image: old_facts.manifest.server_image.clone(),
+        migrator_image: old_facts.manifest.migrator_image.clone(),
+        previous_receipt_sha256: Some(candidate_receipt.receipt_sha256.clone()),
+    };
+    let rollback_receipt = receipt_for(&rollback_request, ReceiptState::RolledBack);
+    state.current = Some(BundleRecord::from_facts(&candidate_facts, &candidate));
+    state.current_receipt = Some(candidate_receipt.clone());
+    state.previous = Some(BundleRecord::from_facts(&old_facts, &old));
+    state.previous_receipt = Some(retained_receipt);
+    state.desired = BundleRecord::from_facts(&candidate_facts, &candidate);
+    state.current_bundle_suffix = Some("update-candidate.bundle".into());
+    state.current_request_suffix = Some("update-candidate.request".into());
+    state.previous_bundle_suffix = Some("current.bundle".into());
+    state.previous_request_suffix = Some("current.request".into());
+    state.candidate_bundle_suffix = Some("update-candidate.bundle".into());
+    state.candidate_request_suffix = Some("update-candidate.request".into());
+    state.phase = LifecyclePhase::UpdateVerifying;
+    state = state.seal().expect("seal");
+    let store = Store::lock(&state_dir, "x6").expect("store");
+    store
+        .write_artifact("current.bundle", &old_bundle, 0o600)
+        .expect("old bundle");
+    store
+        .write_artifact("update-candidate.bundle", &candidate_bundle, 0o600)
+        .expect("candidate bundle");
+    store
+        .write_artifact(
+            "update-candidate.request",
+            &candidate_request
+                .canonical_bytes()
+                .expect("candidate request"),
+            0o600,
+        )
+        .expect("candidate request");
+    store.write(&state).expect("rollback state");
+    drop(store);
+    let ready = String::from_utf8(canonical(&ready_for(&provision))).expect("ready");
+    let candidate_receipt_text =
+        String::from_utf8(canonical(&candidate_receipt)).expect("candidate");
+    let executor = UpdateReplayExecutor {
+        candidate_receipt: candidate_receipt_text.clone(),
+        rollback_receipt: Some(String::from_utf8(canonical(&rollback_receipt)).expect("rollback")),
+        ready,
+        state_path: state_dir.join("x6.json"),
+        bundle_size: candidate_bundle.len(),
+        request_size: candidate_request
+            .canonical_bytes()
+            .expect("candidate request")
+            .len(),
+        bundle_sha256: hash(&candidate_bundle),
+        request_sha256: hash(
+            &candidate_request
+                .canonical_bytes()
+                .expect("candidate request"),
+        ),
+        old_bundle_size: old_bundle.len(),
+        old_request_size: rollback_request
+            .canonical_bytes()
+            .expect("rollback request")
+            .len(),
+        old_bundle_sha256: hash(&old_bundle),
+        old_request_sha256: hash(
+            &rollback_request
+                .canonical_bytes()
+                .expect("rollback request"),
+        ),
+        bundle: Mutex::new(RemoteInput::RootProtected),
+        request: Mutex::new(RemoteInput::RootProtected),
+        remote_receipt: Mutex::new(candidate_receipt_text),
+        calls: Mutex::new(Vec::new()),
+        persisted: Mutex::new(Vec::new()),
+    };
+    let rolled_back =
+        rollback_update(&candidate, &state_dir, true, &executor).unwrap_or_else(|error| {
+            panic!(
+                "rollback: {error:?}; calls={:?}",
+                executor.calls.lock().expect("calls")
+            )
+        });
+    assert_eq!(rolled_back.phase, LifecyclePhase::RolledBack);
+    assert_eq!(
+        rolled_back
+            .rollback_receipt
+            .as_ref()
+            .expect("rollback receipt")
+            .receipt_sha256,
+        rollback_receipt.receipt_sha256
+    );
+    let effects: Vec<String> = executor
+        .calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .filter(|id| {
+            id.contains("stage-exact-")
+                || id.contains("protect-staged-")
+                || id.contains("own-protected-")
+                || id.contains("clear-retained")
+                || id.as_str() == "run-fixed-stack-installer"
+        })
+        .cloned()
+        .collect();
+    assert_eq!(effects.len(), 8);
+    let mut third = candidate_request.clone();
+    third.target = "other".into();
+    assert!(
+        workflow::classify_existing_install_receipt(
+            &canonical(&receipt_for(&third, ReceiptState::RolledBack)),
+            &rollback_request,
+            ReceiptState::RolledBack,
+            Some((&candidate_request, ReceiptState::Installed))
+        )
+        .is_err()
+    );
 }
 
 #[test]

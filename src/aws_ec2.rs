@@ -864,12 +864,6 @@ impl Ec2State {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn legacy_sealed_bytes_for_test(&self) -> Result<Vec<u8>> {
-        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&self.legacy_shape(""))?));
-        serde_json::to_vec_pretty(&self.legacy_shape(&digest)).map_err(Into::into)
-    }
-
     fn verify_semantics(&self) -> Result<()> {
         let operation = uuid::Uuid::parse_str(&self.operation_id)
             .map_err(|_| ReleaseError::StateUnsafe(PathBuf::from("EC2 state")))?;
