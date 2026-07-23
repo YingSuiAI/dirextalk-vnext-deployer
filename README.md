@@ -127,7 +127,9 @@ reuses the sealed EC2 lifecycle state, operation lock, pinned SSH key and
 known-hosts file, and writes one short-lived client-binding JSON artifact as a
 no-follow operator-local `0600` file. Authorization and PEM contents are never
 printed or retained in durable state; replay is exact and conflicts fail
-closed.
+closed. The staged Ubuntu-owned request is transport-only; the authenticated
+bundle helper atomically moves and validates it before the root-owned issuer
+container consumes its protected copy.
 
 ## Current boundary
 

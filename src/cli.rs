@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 
 #[cfg(unix)]
-use crate::client_binding::{ClientBindingStore, ProductionClientBindingExecutor};
+use crate::client_binding::ClientBindingStore;
 use crate::{
     archive::assemble,
     aws_ec2::{self, AwsEc2Manifest, ProductionAwsExecutor, ProductionRegistryExecutor},
@@ -136,22 +136,6 @@ enum Commands {
         target: String,
         #[arg(long)]
         predecessor_operation_id: Option<String>,
-        #[arg(long)]
-        execute: bool,
-    },
-    /// Issue one short-lived client binding after a terminal deployment.
-    #[cfg(unix)]
-    DeploymentClientBindingIssue {
-        #[arg(long)]
-        operation_id: String,
-        #[arg(long)]
-        target: String,
-        #[arg(long)]
-        tenant_id: String,
-        #[arg(long)]
-        server_origin: String,
-        #[arg(long)]
-        output: PathBuf,
         #[arg(long)]
         execute: bool,
     },
@@ -388,34 +372,6 @@ pub fn run(cli: Cli) -> Result<()> {
                 target,
                 predecessor_operation_id,
             })?)?;
-        }
-        #[cfg(unix)]
-        Commands::DeploymentClientBindingIssue {
-            operation_id,
-            target,
-            tenant_id,
-            server_origin,
-            output,
-            execute,
-        } => {
-            if !execute {
-                return Err(crate::error::ReleaseError::Deployment(
-                    "deployment-client-binding-issue requires --execute".into(),
-                ));
-            }
-            let deployment_store = DeploymentStateStore::fixed()?;
-            let binding_store = ClientBindingStore::fixed()?;
-            let result = crate::client_binding::issue(
-                &operation_id,
-                &target,
-                &tenant_id,
-                &server_origin,
-                &output,
-                &deployment_store,
-                &binding_store,
-                &ProductionClientBindingExecutor,
-            )?;
-            print_json(&result)?;
         }
         #[cfg(unix)]
         Commands::Ec2ClientBindingIssue {

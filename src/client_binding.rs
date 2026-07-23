@@ -8,17 +8,19 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fs2::FileExt;
 use rustix::fs::{Mode, OFlags, open};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     aws_ec2::{self, AwsEc2Manifest, AwsExecutor, Ec2State, LifecyclePhase},
@@ -33,6 +35,7 @@ const STATE_DIR: &str = "/var/lib/dirextalk-vnext-deployer";
 const MAX_BINDING: usize = 24 * 1024;
 const MAX_CA: usize = 12 * 1024;
 const MAX_LIFETIME_MS: u64 = 15 * 60 * 1_000;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ClientBindingIssueRequest {
@@ -43,7 +46,7 @@ pub struct ClientBindingIssueRequest {
     pub artifact_digest: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientBindingIssueResponse {
     pub schema: String,
@@ -57,6 +60,19 @@ pub struct ClientBindingIssueResponse {
     pub expires_at_unix_ms: u64,
     pub authorization: String,
     pub issuance_receipt_digest: String,
+}
+
+impl Zeroize for ClientBindingIssueResponse {
+    fn zeroize(&mut self) {
+        self.authorization.zeroize();
+        self.identity_tls_root_ca_pem.zeroize();
+    }
+}
+
+impl Drop for ClientBindingIssueResponse {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -113,6 +129,7 @@ struct ClientBindingState {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum BindingState {
+    PendingCleanup,
     Issued,
     Expired,
     Revoked,
@@ -139,6 +156,7 @@ impl From<&ClientBindingState> for ClientBindingProjection {
             binding_id: value.binding_id.clone(),
             expires_at_unix_ms: value.expires_at_unix_ms,
             state: match value.state {
+                BindingState::PendingCleanup => "pending_cleanup",
                 BindingState::Issued => "issued",
                 BindingState::Expired => "expired",
                 BindingState::Revoked => "revoked",
@@ -175,11 +193,21 @@ impl ClientBindingStore {
     }
 
     fn ensure_root(&self) -> Result<()> {
-        fs::create_dir_all(&self.root).map_err(io_error(&self.root))?;
-        let metadata = fs::metadata(&self.root).map_err(io_error(&self.root))?;
-        if !metadata.is_dir() {
+        let link_metadata = match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&self.root).map_err(io_error(&self.root))?;
+                fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))
+                    .map_err(io_error(&self.root))?;
+                sync_dir(self.root.parent().unwrap_or_else(|| Path::new(".")))?;
+                fs::symlink_metadata(&self.root).map_err(io_error(&self.root))?
+            }
+            Err(error) => return Err(io_error(&self.root)(error)),
+        };
+        if !link_metadata.is_dir() {
             return Err(ReleaseError::StateUnsafe(self.root.clone()));
         }
+        let metadata = link_metadata;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -202,8 +230,11 @@ impl ClientBindingStore {
             .truncate(false)
             .read(true)
             .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(io_error(&path))?;
+        validate_state_file(&path, &file)?;
         file.lock_exclusive()
             .map_err(|_| ReleaseError::OperationLocked)?;
         Ok(file)
@@ -236,19 +267,40 @@ impl ClientBindingStore {
         self.ensure_root()?;
         let path = self.state_path(&state.operation_id);
         let bytes = serde_json::to_vec(state)?;
-        let temp = self
-            .root
-            .join(format!(".client-binding-{}.tmp", std::process::id()));
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp)
-            .map_err(io_error(&temp))?;
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (!metadata.is_file() || metadata.nlink() != 1)
+        {
+            return Err(ReleaseError::StateUnsafe(path));
+        }
+        let mut created = None;
+        for _ in 0..64 {
+            let temp = self.root.join(format!(
+                ".client-binding-{}.{}.tmp",
+                std::process::id(),
+                TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&temp)
+            {
+                Ok(file) => {
+                    created = Some((temp, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io_error(&temp)(error)),
+            }
+        }
+        let (temp, mut file) =
+            created.ok_or_else(|| contract("client binding state temporary path unavailable"))?;
         file.write_all(&bytes).map_err(io_error(&temp))?;
         file.sync_all().map_err(io_error(&temp))?;
+        validate_state_file(&temp, &file)?;
         fs::rename(&temp, &path).map_err(io_error(&path))?;
+        sync_dir(&self.root)?;
         Ok(())
     }
 }
@@ -302,7 +354,10 @@ pub fn issue(
         return Err(ReleaseError::OperationConflict);
     }
     let mut response = executor.issue(&request)?;
-    validate_response(&response, &request)?;
+    if let Err(error) = validate_response(&response, &request) {
+        zeroize_response(&mut response);
+        return Err(error);
+    }
     if let Some(existing) = &prior_state
         && (existing.binding_id != response.binding_id
             || existing.expires_at_unix_ms != response.expires_at_unix_ms
@@ -311,8 +366,17 @@ pub fn issue(
         zeroize_response(&mut response);
         return Err(ReleaseError::OperationConflict);
     }
-    let bytes = binding_bytes(&response)?;
-    write_protected_output(output, &bytes)?;
+    let bytes = match binding_bytes(&response) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            zeroize_response(&mut response);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_protected_output(output, &bytes) {
+        zeroize_response(&mut response);
+        return Err(error);
+    }
     let state = ClientBindingState {
         schema_version: 1,
         operation_id: operation_id.into(),
@@ -325,8 +389,10 @@ pub fn issue(
         state: BindingState::Issued,
         server_receipt_digest: response.issuance_receipt_digest.clone(),
     };
-    validate_state(&state)?;
-    binding_store.write(&state)?;
+    if let Err(error) = validate_state(&state).and_then(|()| binding_store.write(&state)) {
+        zeroize_response(&mut response);
+        return Err(error);
+    }
     zeroize_response(&mut response);
     Ok(ClientBindingProjection::from(&state))
 }
@@ -351,7 +417,7 @@ struct Ec2IssueRequest<'a> {
     ttl_millis: u64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ec2ImportArtifact {
     schema: String,
@@ -377,6 +443,7 @@ struct Ec2ImportArtifact {
 /// fixed transport evidence does not match, or protected output/state cannot be
 /// safely persisted.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub fn issue_ec2(
     manifest: &AwsEc2Manifest,
     state_dir: &Path,
@@ -393,6 +460,32 @@ pub fn issue_ec2(
     state.verify()?;
     validate_ec2_terminal(&state, manifest, &facts)?;
     let _binding_lock = binding_store.lock(&state.operation_id)?;
+    let release = format!(
+        "{REMOTE_RELEASE_ROOT}/{}/{}",
+        facts.bundle_sha256, REMOTE_HELPER_RELATIVE
+    );
+    let cleanup = format!(
+        "{REMOTE_RELEASE_ROOT}/{}/{}",
+        facts.bundle_sha256, REMOTE_CLEANUP_RELATIVE
+    );
+    let issue_digest = bundle_helper_digest(&facts, REMOTE_HELPER_RELATIVE)?;
+    let cleanup_digest = bundle_helper_digest(&facts, REMOTE_CLEANUP_RELATIVE)?;
+    verify_remote_helper(
+        &state,
+        &ec2_store,
+        &release,
+        issue_digest,
+        "verify-client-binding-issue-helper",
+        executor,
+    )?;
+    verify_remote_helper(
+        &state,
+        &ec2_store,
+        &cleanup,
+        cleanup_digest,
+        "verify-client-binding-cleanup-helper",
+        executor,
+    )?;
     if let Some(existing) = binding_store.read(&state.operation_id)? {
         validate_state(&existing)?;
         if existing.target != state.target
@@ -410,6 +503,13 @@ pub fn issue_ec2(
         let bytes = read_existing_output(output)?;
         if hex::encode(Sha256::digest(&bytes)) != existing.artifact_digest {
             return Err(ReleaseError::OperationConflict);
+        }
+        if existing.state == BindingState::PendingCleanup {
+            cleanup_remote_binding(&state, &ec2_store, &cleanup, executor)?;
+            let mut completed = existing;
+            completed.state = BindingState::Issued;
+            binding_store.write(&completed)?;
+            return Ok(ClientBindingProjection::from(&completed));
         }
         return Ok(ClientBindingProjection::from(&existing));
     }
@@ -441,20 +541,28 @@ pub fn issue_ec2(
         executor,
     )?;
 
-    let release = format!(
-        "{REMOTE_RELEASE_ROOT}/{}/{}",
-        facts.bundle_sha256, REMOTE_HELPER_RELATIVE
-    );
-    let cleanup = format!(
-        "{REMOTE_RELEASE_ROOT}/{}/{}",
-        facts.bundle_sha256, REMOTE_CLEANUP_RELATIVE
-    );
     let operation = issue_remote_binding(&state, &ec2_store, &release, &cleanup, output, executor);
-    ec2_store.remove_artifact("client-binding.request")?;
-    let response = operation?;
-    let bytes = binding_bytes(&response)?;
-    write_protected_output(output, &bytes)?;
-    let state = ClientBindingState {
+    let remove_result = ec2_store.remove_artifact("client-binding.request");
+    let mut response = operation?;
+    if let Err(error) = remove_result {
+        zeroize_response(&mut response);
+        let _ = cleanup_remote_binding(&state, &ec2_store, &cleanup, executor);
+        return Err(error);
+    }
+    let bytes = match binding_bytes(&response) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            zeroize_response(&mut response);
+            let _ = cleanup_remote_binding(&state, &ec2_store, &cleanup, executor);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_protected_output(output, &bytes) {
+        zeroize_response(&mut response);
+        let _ = cleanup_remote_binding(&state, &ec2_store, &cleanup, executor);
+        return Err(error);
+    }
+    let pending = ClientBindingState {
         schema_version: 1,
         operation_id: state.operation_id.clone(),
         target: state.target.clone(),
@@ -463,12 +571,20 @@ pub fn issue_ec2(
         artifact_digest: hex::encode(Sha256::digest(&bytes)),
         binding_id: response.binding_id.clone(),
         expires_at_unix_ms: response.expires_at_unix_ms,
-        state: BindingState::Issued,
+        state: BindingState::PendingCleanup,
         server_receipt_digest: response.issuance_receipt_digest.clone(),
     };
-    validate_state(&state)?;
-    binding_store.write(&state)?;
-    Ok(ClientBindingProjection::from(&state))
+    if let Err(error) = validate_state(&pending).and_then(|()| binding_store.write(&pending)) {
+        zeroize_response(&mut response);
+        let _ = cleanup_remote_binding(&state, &ec2_store, &cleanup, executor);
+        return Err(error);
+    }
+    zeroize_response(&mut response);
+    cleanup_remote_binding(&state, &ec2_store, &cleanup, executor)?;
+    let mut completed = pending;
+    completed.state = BindingState::Issued;
+    binding_store.write(&completed)?;
+    Ok(ClientBindingProjection::from(&completed))
 }
 
 fn validate_ec2_terminal(
@@ -488,6 +604,83 @@ fn validate_ec2_terminal(
         ));
     }
     Ok(())
+}
+
+fn bundle_helper_digest<'a>(
+    facts: &'a aws_ec2::bundle::BundleFacts,
+    relative: &str,
+) -> Result<&'a str> {
+    facts
+        .manifest
+        .files
+        .iter()
+        .find(|file| file.path == relative)
+        .map(|file| file.sha256.as_str())
+        .ok_or_else(|| contract("client binding helper is absent from authenticated bundle"))
+}
+
+fn verify_remote_helper(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    path: &str,
+    expected_digest: &str,
+    id: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    executor.run(&aws_ec2::workflow::ssh_command(
+        &format!("{id}-regular"),
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/test",
+            "-f",
+            path,
+        ],
+        false,
+        30,
+    )?)?;
+    executor.run(&aws_ec2::workflow::ssh_command(
+        &format!("{id}-not-symlink"),
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/test",
+            "!",
+            "-L",
+            path,
+        ],
+        false,
+        30,
+    )?)?;
+    let metadata = executor.run(&aws_ec2::workflow::ssh_command(
+        &format!("{id}-metadata"),
+        state,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/stat",
+            "--format=%u %g %a %h",
+            path,
+        ],
+        false,
+        30,
+    )?)?;
+    if metadata.stdout.split_ascii_whitespace().collect::<Vec<_>>() != ["0", "0", "555", "1"] {
+        return Err(ReleaseError::OperationConflict);
+    }
+    verify_remote_hash(
+        state,
+        store,
+        executor,
+        &format!("{id}-digest"),
+        path,
+        expected_digest,
+    )
 }
 
 fn reconcile_remote_request(
@@ -630,20 +823,45 @@ fn issue_remote_binding(
         900,
     )
     .and_then(|command| executor.run(&command));
-    let result = run.and_then(|_| pull_import(state, store, output, executor));
-    let cleaned = aws_ec2::workflow::ssh_command(
+    if let Err(error) = run.and_then(require_silent_output) {
+        let _ = cleanup_remote_binding(state, store, cleanup, executor);
+        return Err(error);
+    }
+    match pull_import(state, store, output, executor) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let _ = cleanup_remote_binding(state, store, cleanup, executor);
+            Err(error)
+        }
+    }
+}
+
+fn cleanup_remote_binding(
+    state: &Ec2State,
+    store: &aws_ec2::store::Store,
+    cleanup: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let command = aws_ec2::workflow::ssh_command(
         "cleanup-client-binding-export",
         state,
         store,
         ["/usr/bin/sudo", "--non-interactive", cleanup],
         true,
         120,
-    )
-    .and_then(|command| executor.run(&command));
-    match (result, cleaned) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(_)) => Err(contract("client binding cleanup failed")),
-        (Ok(response), Ok(_)) => Ok(response),
+    )?;
+    let output = executor.run(&command)?;
+    require_silent_output(output)
+}
+
+fn require_silent_output(mut output: aws_ec2::ExecOutput) -> Result<()> {
+    let silent = output.status == 0 && output.stdout.is_empty() && output.stderr.is_empty();
+    output.stdout.zeroize();
+    output.stderr.zeroize();
+    if silent {
+        Ok(())
+    } else {
+        Err(contract("client binding helper produced unexpected output"))
     }
 }
 
@@ -722,6 +940,20 @@ fn pull_import(
         ".{}.client-binding.tmp",
         output.file_name().unwrap().to_string_lossy()
     ));
+    if let Ok(metadata) = fs::symlink_metadata(&temp) {
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(ReleaseError::StateUnsafe(temp));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temp)
+            .map_err(io_error(&temp))?;
+        validate_output_file(&file)?;
+        drop(file);
+        fs::remove_file(&temp).map_err(io_error(&temp))?;
+        sync_dir(parent)?;
+    }
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -738,7 +970,7 @@ fn pull_import(
             REMOTE_BINDING_IMPORT,
             &temp,
         )?)?;
-        let bytes = fs::read(&temp).map_err(io_error(&temp))?;
+        let bytes = Zeroizing::new(fs::read(&temp).map_err(io_error(&temp))?);
         validate_output_file(&File::open(&temp).map_err(io_error(&temp))?)?;
         if bytes.len() != remote_size
             || hex::encode(Sha256::digest(&bytes)) != expected_digest
@@ -769,21 +1001,25 @@ fn pull_import(
             server_origin: response.server_origin.clone(),
             artifact_digest: state.desired.bundle_sha256.clone(),
         };
-        validate_response(&response, &request)?;
+        if let Err(error) = validate_response(&response, &request) {
+            let mut response = response;
+            zeroize_response(&mut response);
+            return Err(error);
+        }
         Ok(response)
     })();
     let _ = fs::remove_file(&temp);
     result
 }
 
-fn read_existing_output(path: &Path) -> Result<Vec<u8>> {
+fn read_existing_output(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|_| ReleaseError::OperationConflict)?;
     validate_output_file(&file)?;
-    let mut bytes = Vec::new();
+    let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_BINDING as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| ReleaseError::OperationConflict)?;
@@ -859,11 +1095,13 @@ fn validate_response(
             "client binding expiry is outside the allowed lifetime",
         ));
     }
-    let mut authorization = URL_SAFE_NO_PAD
-        .decode(response.authorization.as_bytes())
-        .map_err(|_| contract("client binding authorization is invalid"))?;
+    let mut authorization = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(response.authorization.as_bytes())
+            .map_err(|_| contract("client binding authorization is invalid"))?,
+    );
     let authorization_valid = authorization.len() == 32 && response.authorization.len() == 43;
-    authorization.fill(0);
+    authorization.zeroize();
     if !authorization_valid {
         return Err(contract("client binding authorization is invalid"));
     }
@@ -897,7 +1135,7 @@ fn validate_response(
     validate_sha256(&response.issuance_receipt_digest, "issuance_receipt_digest")
 }
 
-fn binding_bytes(response: &ClientBindingIssueResponse) -> Result<Vec<u8>> {
+fn binding_bytes(response: &ClientBindingIssueResponse) -> Result<Zeroizing<Vec<u8>>> {
     let artifact = ClientBindingArtifact {
         schema: &response.schema,
         schema_version: response.schema_version,
@@ -910,7 +1148,7 @@ fn binding_bytes(response: &ClientBindingIssueResponse) -> Result<Vec<u8>> {
         expires_at_unix_ms: response.expires_at_unix_ms,
         authorization: &response.authorization,
     };
-    let bytes = serde_json::to_vec(&artifact)?;
+    let bytes = Zeroizing::new(serde_json::to_vec(&artifact)?);
     if bytes.len() > MAX_BINDING {
         return Err(contract("client binding output exceeds size limit"));
     }
@@ -919,10 +1157,6 @@ fn binding_bytes(response: &ClientBindingIssueResponse) -> Result<Vec<u8>> {
 
 fn write_protected_output(path: &Path, bytes: &[u8]) -> Result<()> {
     validate_output_path(path)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     if path.exists() {
         let mut existing = OpenOptions::new()
             .read(true)
@@ -940,14 +1174,39 @@ fn write_protected_output(path: &Path, bytes: &[u8]) -> Result<()> {
         }
         return Ok(());
     }
-    let mut file = options
-        .open(path)
+    let temp = path.with_file_name(format!(
+        ".{}.client-binding.tmp",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    if let Ok(metadata) = fs::symlink_metadata(&temp) {
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(ReleaseError::StateUnsafe(temp));
+        }
+        fs::remove_file(&temp).map_err(io_error(&temp))?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
         .map_err(|_| contract("client binding output file is unsafe"))?;
-    validate_output_file(&file)?;
-    file.write_all(bytes)
-        .map_err(|_| contract("client binding output file is unavailable"))?;
-    file.sync_all()
-        .map_err(|_| contract("client binding output file is unavailable"))?;
+    if file.write_all(bytes).is_err() || file.sync_all().is_err() {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(contract("client binding output file is unavailable"));
+    }
+    if validate_output_file(&file).is_err() {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(contract("client binding output file is unsafe"));
+    }
+    drop(file);
+    if fs::rename(&temp, path).is_err() {
+        let _ = fs::remove_file(&temp);
+        return Err(contract("client binding output file is unsafe"));
+    }
+    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
     Ok(())
 }
 
@@ -987,6 +1246,12 @@ fn validate_state_file(path: &Path, file: &File) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn sync_dir(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(io_error(path))
 }
 
 fn validate_state(state: &ClientBindingState) -> Result<()> {
@@ -1072,8 +1337,7 @@ fn now_ms() -> Result<u64> {
 }
 
 fn zeroize_response(response: &mut ClientBindingIssueResponse) {
-    let mut secret = std::mem::take(&mut response.authorization).into_bytes();
-    secret.fill(0);
+    response.zeroize();
 }
 
 fn contract(message: &str) -> ReleaseError {
@@ -1149,5 +1413,72 @@ mod tests {
             executor.issue(&request),
             Err(ReleaseError::Deployment(message)) if message.contains("EC2 transport")
         ));
+    }
+
+    #[test]
+    fn helper_output_must_be_silent_and_is_consumed() {
+        assert!(
+            require_silent_output(aws_ec2::ExecOutput {
+                status: 0,
+                stdout: "unexpected".into(),
+                stderr: String::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            require_silent_output(aws_ec2::ExecOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: "unexpected".into(),
+            })
+            .is_err()
+        );
+        assert!(require_silent_output(aws_ec2::ExecOutput::default()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_output_is_atomic_mode_0600_and_rejects_symlinks() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().expect("temporary directory");
+        let output = root.path().join("binding.json");
+        let bytes = Zeroizing::new(br#"{"schema":"dirextalk.client-binding"}"#.to_vec());
+        write_protected_output(&output, &bytes).expect("protected output");
+        let metadata = fs::symlink_metadata(&output).expect("output metadata");
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        let symlink = root.path().join("symlink.json");
+        std::os::unix::fs::symlink(&output, &symlink).expect("symlink");
+        assert!(write_protected_output(&symlink, &bytes).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_store_state_is_no_follow_0600_and_directory_synced() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().expect("temporary directory");
+        let store = ClientBindingStore::for_test(root.path().join("state"));
+        let operation = "018f856e-e0bd-71d2-9428-58d50cf77eaf";
+        let state = ClientBindingState {
+            schema_version: 1,
+            operation_id: operation.into(),
+            target: "x6".into(),
+            tenant_id: operation.into(),
+            server_origin: "https://example.com".into(),
+            artifact_digest: "0".repeat(64),
+            binding_id: operation.into(),
+            expires_at_unix_ms: u64::MAX,
+            state: BindingState::PendingCleanup,
+            server_receipt_digest: "1".repeat(64),
+        };
+        store.write(&state).expect("state write");
+        let path = root
+            .path()
+            .join("state")
+            .join(format!("client-binding-{operation}.json"));
+        let metadata = fs::symlink_metadata(&path).expect("state metadata");
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(store.read(operation).expect("state read").is_some());
     }
 }

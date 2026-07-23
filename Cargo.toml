@@ -29,6 +29,7 @@ tar = "0.4.46"
 thiserror = "2.0.18"
 uuid = { version = "1.22.0", features = ["v7"] }
 zip = { version = "8.3.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zeroize = "1.8.1"
 
 [target.'cfg(unix)'.dependencies]
 fs2 = "0.4.3"

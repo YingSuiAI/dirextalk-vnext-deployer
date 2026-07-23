@@ -300,7 +300,7 @@ fn run_process(program: &str, argv: &[&str], timeout: Duration) -> Result<ExecOu
     Ok(ExecOutput {
         status: status.code().unwrap_or(1),
         stdout,
-        stderr: String::new(),
+        stderr,
     })
 }
 
