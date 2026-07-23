@@ -35,6 +35,11 @@ const PRIVATE_KEY_SUFFIX: &str = "id_ed25519";
 const PUBLIC_KEY_SUFFIX: &str = "id_ed25519.pub";
 const KNOWN_HOSTS_SUFFIX: &str = "known_hosts";
 const PROVISION_REQUEST_SUFFIX: &str = "current.provision";
+const UPDATE_BUNDLE_SUFFIX: &str = "update-candidate.bundle";
+const UPDATE_REQUEST_SUFFIX: &str = "update-candidate.request";
+const ROLLBACK_REQUEST_SUFFIX: &str = "rollback.request";
+const UPDATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
+const UPDATE_CAPACITY_INODES: u64 = 128;
 
 pub fn apply(
     manifest: &AwsEc2Manifest,
@@ -191,6 +196,8 @@ fn new_state(
         current_request_suffix: None,
         previous_bundle_suffix: None,
         previous_request_suffix: None,
+        candidate_bundle_suffix: None,
+        candidate_request_suffix: None,
         provision_request_suffix: None,
         phase: LifecyclePhase::Planned,
         pending_effect: None,
@@ -2732,53 +2739,321 @@ pub fn verify(
 pub fn update(
     manifest: &AwsEc2Manifest,
     state_dir: &Path,
-    _execute: bool,
-    _executor: &dyn AwsExecutor,
+    execute: bool,
+    executor: &dyn AwsExecutor,
 ) -> Result<Ec2State> {
     manifest.validate()?;
     let facts = manifest.bundle()?;
     let store = Store::lock(state_dir, &manifest.target)?;
-    let state = load_state(&store, manifest)?;
-    if !matches!(
+    let mut state = load_state(&store, manifest)?;
+    let candidate = BundleRecord::from_facts(&facts, manifest);
+    let (prior_bundle, prior_receipt) = if state.phase == LifecyclePhase::UpdateVerifying {
+        (
+            state
+                .previous
+                .clone()
+                .ok_or_else(|| contract("retained immutable bundle is absent"))?,
+            state
+                .previous_receipt
+                .clone()
+                .ok_or_else(|| contract("retained installed receipt is absent"))?,
+        )
+    } else {
+        (
+            state
+                .current
+                .clone()
+                .ok_or_else(|| contract("current immutable bundle is absent"))?,
+            state
+                .current_receipt
+                .clone()
+                .ok_or_else(|| contract("current installed receipt is absent"))?,
+        )
+    };
+    if candidate == prior_bundle
+        && matches!(
+            state.phase,
+            LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack
+        )
+    {
+        return Ok(state);
+    }
+    ensure_cross_version_contract(&prior_bundle, &prior_receipt, &candidate)?;
+    match state.phase {
+        LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack => {}
+        LifecyclePhase::UpdateStaged
+        | LifecyclePhase::UpdateInstalling
+        | LifecyclePhase::UpdateVerifying => {
+            if state.desired != candidate {
+                return Err(ReleaseError::OperationConflict);
+            }
+        }
+        _ => {
+            return Err(contract(
+                "update recovery is fail-closed for this lifecycle phase",
+            ));
+        }
+    }
+    if !execute {
+        return Ok(state);
+    }
+
+    if matches!(
         state.phase,
         LifecyclePhase::Installed | LifecyclePhase::Verified | LifecyclePhase::RolledBack
     ) {
-        return Err(contract(
-            "update recovery is fail-closed for a non-converged lifecycle",
-        ));
+        store.copy_artifact(
+            UPDATE_BUNDLE_SUFFIX,
+            &manifest.stack_bundle_path,
+            &facts.bundle_sha256,
+        )?;
+        let request = InstallRequest::new(
+            &state.domain,
+            &facts,
+            Some(prior_receipt.receipt_sha256.clone()),
+        );
+        store.write_artifact(UPDATE_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
+        state.previous = Some(prior_bundle);
+        state.previous_receipt = Some(prior_receipt);
+        state
+            .previous_bundle_suffix
+            .clone_from(&state.current_bundle_suffix);
+        state
+            .previous_request_suffix
+            .clone_from(&state.current_request_suffix);
+        state.desired = candidate.clone();
+        state.candidate_bundle_suffix = Some(UPDATE_BUNDLE_SUFFIX.into());
+        state.candidate_request_suffix = Some(UPDATE_REQUEST_SUFFIX.into());
+        state.phase = LifecyclePhase::UpdateStaged;
+        state.pending_effect = None;
+        persist(&store, &mut state)?;
     }
-    let prior_bundle = state
-        .current
+    ensure_update_capacity(&store, &state, executor)?;
+    let bundle_suffix = state
+        .candidate_bundle_suffix
         .clone()
-        .ok_or_else(|| contract("current immutable bundle is absent"))?;
-    let prior_receipt = state
-        .current_receipt
+        .ok_or_else(|| contract("candidate bundle fact is absent"))?;
+    let request_suffix = state
+        .candidate_request_suffix
         .clone()
-        .ok_or_else(|| contract("current installed receipt is absent"))?;
-    if facts.manifest.version != prior_receipt.version {
-        return Err(contract(
-            "cross-version update is unsupported until migration compatibility evidence is available",
-        ));
+        .ok_or_else(|| contract("candidate request fact is absent"))?;
+    let request: InstallRequest =
+        serde_json::from_slice(&store.read_artifact(&request_suffix, 64 * 1024)?)?;
+    if request.bundle_sha256 != state.desired.bundle_sha256
+        || request.previous_receipt_sha256
+            != state
+                .previous_receipt
+                .as_ref()
+                .map(|r| r.receipt_sha256.clone())
+    {
+        return Err(ReleaseError::OperationConflict);
     }
-    let candidate = BundleRecord::from_facts(&facts, manifest);
-    if candidate == prior_bundle {
-        return Ok(state);
-    }
-    if candidate.compose_sha256 != prior_bundle.compose_sha256
-        || candidate.postgres_image != prior_bundle.postgres_image
-        || candidate.caddy_image != prior_bundle.caddy_image
-        || candidate.probe_image != prior_bundle.probe_image
-        || candidate.host_installer_sha256 != prior_bundle.host_installer_sha256
-        || candidate.host_provisioner_sha256 != prior_bundle.host_provisioner_sha256
-        || candidate.receipt_reader_sha256 != prior_bundle.receipt_reader_sha256
+    state.phase = LifecyclePhase::UpdateInstalling;
+    persist(&store, &mut state)?;
+    let receipt = stage_install_read_receipt(
+        &store,
+        &mut state,
+        &bundle_suffix,
+        &request_suffix,
+        &request,
+        ReceiptState::Installed,
+        executor,
+    )?;
+    state.current = Some(candidate);
+    state.current_receipt = Some(receipt);
+    state.current_bundle_suffix = Some(bundle_suffix);
+    state.current_request_suffix = Some(request_suffix);
+    state.phase = LifecyclePhase::UpdateVerifying;
+    persist(&store, &mut state)?;
+    verify_live_locked(&store, &mut state, manifest, executor)?;
+    state.phase = LifecyclePhase::Verified;
+    state.pending_effect = None;
+    persist(&store, &mut state)?;
+    Ok(state)
+}
+
+fn ensure_cross_version_contract(
+    prior: &BundleRecord,
+    prior_receipt: &InstalledReceipt,
+    candidate: &BundleRecord,
+) -> Result<()> {
+    let retained = prior.cross_version_compatibility.as_ref().ok_or_else(|| {
+        contract("retained bundle lacks authenticated cross-version compatibility marker")
+    })?;
+    let proposed = candidate
+        .cross_version_compatibility
+        .as_ref()
+        .ok_or_else(|| {
+            contract("candidate bundle lacks authenticated cross-version compatibility marker")
+        })?;
+    retained.validate()?;
+    proposed.validate()?;
+    if prior.version != "0.1.1"
+        || prior_receipt.version != prior.version
+        || candidate.version != "0.1.4"
+        || retained != proposed
+        || retained.retained_version != prior.version
+        || retained.candidate_version != candidate.version
     {
         return Err(contract(
-            "update cannot change immutable host-provision or host-helper inputs",
+            "only the authenticated forward 0.1.1 to 0.1.4 update is supported",
         ));
     }
-    Err(contract(
-        "EC2 update mutation is disabled until replay-safe recovery is implemented",
-    ))
+    if candidate.postgres_image != prior.postgres_image
+        || candidate.caddy_image != prior.caddy_image
+        || candidate.probe_image != prior.probe_image
+        || candidate.host_installer_sha256 != prior.host_installer_sha256
+        || candidate.host_provisioner_sha256 != prior.host_provisioner_sha256
+        || candidate.receipt_reader_sha256 != prior.receipt_reader_sha256
+    {
+        return Err(contract(
+            "cross-version update cannot change retained host, dependency-image, or helper facts",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_update_capacity(
+    store: &Store,
+    state: &Ec2State,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let output = executor.run(&ssh_command(
+        "check-authenticated-update-capacity",
+        state,
+        store,
+        ["/usr/bin/df", "--output=avail,iavail", "-B1", "/"],
+        false,
+        30,
+    )?)?;
+    let values = output
+        .stdout
+        .lines()
+        .skip(1)
+        .flat_map(str::split_ascii_whitespace)
+        .collect::<Vec<_>>();
+    if values.len() != 2 {
+        return Err(contract(
+            "authenticated update capacity response is malformed",
+        ));
+    }
+    let bytes = values[0]
+        .parse::<u64>()
+        .map_err(|_| contract("authenticated update capacity bytes are malformed"))?;
+    let inodes = values[1]
+        .parse::<u64>()
+        .map_err(|_| contract("authenticated update capacity inodes are malformed"))?;
+    if bytes < UPDATE_CAPACITY_BYTES || inodes < UPDATE_CAPACITY_INODES {
+        return Err(contract(
+            "authenticated remote capacity is insufficient for update",
+        ));
+    }
+    Ok(())
+}
+
+/// A separately callable, code-only rollback primitive.  It never invokes a
+/// down migration; the server-owned installer must authenticate a `rolled_back`
+/// receipt against the retained request and candidate receipt chain.
+pub fn rollback_update(
+    manifest: &AwsEc2Manifest,
+    state_dir: &Path,
+    execute: bool,
+    executor: &dyn AwsExecutor,
+) -> Result<Ec2State> {
+    manifest.validate()?;
+    let store = Store::lock(state_dir, &manifest.target)?;
+    let mut state = load_state(&store, manifest)?;
+    if !matches!(
+        state.phase,
+        LifecyclePhase::UpdateVerifying
+            | LifecyclePhase::RollbackStaged
+            | LifecyclePhase::RollbackInstalling
+    ) {
+        return Err(contract("rollback requires an unverified candidate update"));
+    }
+    let prior = state
+        .previous
+        .clone()
+        .ok_or_else(|| contract("retained bundle is absent"))?;
+    let candidate_receipt = state
+        .current_receipt
+        .clone()
+        .ok_or_else(|| contract("candidate receipt is absent"))?;
+    let marker = prior
+        .cross_version_compatibility
+        .as_ref()
+        .ok_or_else(|| contract("retained rollback marker is absent"))?;
+    marker.validate()?;
+    state
+        .desired
+        .cross_version_compatibility
+        .as_ref()
+        .ok_or_else(|| contract("candidate rollback marker is absent"))?
+        .validate()?;
+    if !execute {
+        return Ok(state);
+    }
+    let previous_bundle = state
+        .previous_bundle_suffix
+        .clone()
+        .ok_or_else(|| contract("retained bundle artifact is absent"))?;
+    let request = InstallRequest {
+        schema: "dirextalk.vnext-install-request".into(),
+        schema_version: 1,
+        target: state.target.clone(),
+        domain: state.domain.clone(),
+        version: prior.version.clone(),
+        source_commit: prior.source_commit.clone(),
+        bundle_sha256: prior.bundle_sha256.clone(),
+        manifest_sha256: prior.manifest_sha256.clone(),
+        server_image: prior.server_image.clone(),
+        migrator_image: prior.migrator_image.clone(),
+        previous_receipt_sha256: Some(candidate_receipt.receipt_sha256),
+    };
+    store.write_artifact(ROLLBACK_REQUEST_SUFFIX, &request.canonical_bytes()?, 0o600)?;
+    state.phase = LifecyclePhase::RollbackStaged;
+    persist(&store, &mut state)?;
+    state.phase = LifecyclePhase::RollbackInstalling;
+    persist(&store, &mut state)?;
+    // The two fixed installer inputs are root-owned after a candidate install.
+    // Replace only those transient inputs, after durable rollback intent, so a
+    // replay can safely converge without touching volumes, secrets, TLS, or
+    // configuration paths.
+    let clear_inputs = ssh_command(
+        "clear-candidate-install-inputs-for-code-only-rollback",
+        &state,
+        &store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            "/usr/bin/rm",
+            "--force",
+            "--",
+            REMOTE_BUNDLE,
+            REMOTE_REQUEST,
+        ],
+        true,
+        30,
+    )?;
+    run_effect(&store, &mut state, &clear_inputs, executor)?;
+    let receipt = stage_install_read_receipt(
+        &store,
+        &mut state,
+        &previous_bundle,
+        ROLLBACK_REQUEST_SUFFIX,
+        &request,
+        ReceiptState::RolledBack,
+        executor,
+    )?;
+    state.current = Some(prior);
+    state.current_receipt = Some(receipt.clone());
+    state.rollback_receipt = Some(receipt);
+    state.current_bundle_suffix = Some(previous_bundle);
+    state.current_request_suffix = Some(ROLLBACK_REQUEST_SUFFIX.into());
+    state.phase = LifecyclePhase::RolledBack;
+    state.pending_effect = None;
+    persist(&store, &mut state)?;
+    Ok(state)
 }
 
 /// Reconcile a narrowly fenced operator SSH CIDR recovery without changing lifecycle phase.

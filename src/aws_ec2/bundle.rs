@@ -35,7 +35,38 @@ pub struct StackManifest {
     pub server_image: String,
     pub migrator_image: String,
     pub installer_sha256: String,
+    /// Server-produced, digest-bound evidence that this bundle participates in the
+    /// one supported EC2 migration path.  Older bundles deliberately have no
+    /// default: an update must refuse them rather than guess database safety.
+    #[serde(default)]
+    pub cross_version_compatibility: Option<CrossVersionCompatibility>,
     pub files: Vec<StackFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CrossVersionCompatibility {
+    pub schema: String,
+    pub schema_version: u32,
+    pub retained_version: String,
+    pub candidate_version: String,
+    pub forward_migrations_only: bool,
+    pub code_only_rollback: bool,
+}
+
+impl CrossVersionCompatibility {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != "dirextalk.vnext.cross-version-compatibility"
+            || self.schema_version != 1
+            || self.retained_version != "0.1.1"
+            || self.candidate_version != "0.1.4"
+            || !self.forward_migrations_only
+            || !self.code_only_rollback
+        {
+            return Err(deployment("cross-version compatibility marker is invalid"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,6 +89,7 @@ pub struct BundleFacts {
     pub host_provisioner_sha256: String,
     pub receipt_reader: Vec<u8>,
     pub receipt_reader_sha256: String,
+    pub cross_version_compatibility: Option<CrossVersionCompatibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -219,6 +251,7 @@ pub fn load_bundle(
         expected_host_provisioner_sha256,
         "host provisioner",
     )?;
+    let cross_version_compatibility = manifest.cross_version_compatibility.clone();
     Ok(BundleFacts {
         bundle_sha256: actual_bundle,
         manifest_sha256: hash(&manifest_bytes),
@@ -230,6 +263,7 @@ pub fn load_bundle(
         host_provisioner_sha256: expected_host_provisioner_sha256.to_owned(),
         receipt_reader,
         receipt_reader_sha256: expected_receipt_reader_sha256.to_owned(),
+        cross_version_compatibility,
     })
 }
 
@@ -263,6 +297,9 @@ fn validate_manifest(
     exact_server_image(&manifest.server_image, "bundle server_image")?;
     exact_server_image(&manifest.migrator_image, "bundle migrator_image")?;
     digest(&manifest.installer_sha256, "bundle installer")?;
+    if let Some(marker) = &manifest.cross_version_compatibility {
+        marker.validate()?;
+    }
     if manifest.files.len() != entries.len() {
         return Err(deployment("bundle file index is not exhaustive"));
     }

@@ -22,11 +22,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{ReleaseError, Result, error::io_error};
-use bundle::{BundleFacts, InstalledReceipt, ReceiptState, digest, image, load_bundle};
+use bundle::{
+    BundleFacts, CrossVersionCompatibility, InstalledReceipt, ReceiptState, digest, image,
+    load_bundle,
+};
 use provision::HostReadyReceipt;
 
 pub use workflow::{
-    apply, destroy, rebind_operator_cidr, resume, status, status_with_registry, update, verify,
+    apply, destroy, rebind_operator_cidr, resume, rollback_update, status, status_with_registry,
+    update, verify,
 };
 
 pub(super) const REGION: &str = "ap-east-1";
@@ -537,6 +541,8 @@ pub struct BundleRecord {
     pub host_installer_sha256: String,
     pub host_provisioner_sha256: String,
     pub receipt_reader_sha256: String,
+    #[serde(default)]
+    pub cross_version_compatibility: Option<CrossVersionCompatibility>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -580,6 +586,7 @@ impl BundleRecord {
             host_installer_sha256: facts.host_installer_sha256.clone(),
             host_provisioner_sha256: facts.host_provisioner_sha256.clone(),
             receipt_reader_sha256: facts.receipt_reader_sha256.clone(),
+            cross_version_compatibility: facts.cross_version_compatibility.clone(),
         }
     }
 }
@@ -676,6 +683,10 @@ pub struct Ec2State {
     pub current_request_suffix: Option<String>,
     pub previous_bundle_suffix: Option<String>,
     pub previous_request_suffix: Option<String>,
+    #[serde(default)]
+    pub candidate_bundle_suffix: Option<String>,
+    #[serde(default)]
+    pub candidate_request_suffix: Option<String>,
     pub provision_request_suffix: Option<String>,
     pub phase: LifecyclePhase,
     #[serde(default)]
@@ -783,6 +794,9 @@ fn validate_bundle_record(record: &BundleRecord) -> Result<()> {
         (&record.receipt_reader_sha256, "state receipt reader"),
     ] {
         digest(value, name)?;
+    }
+    if let Some(marker) = &record.cross_version_compatibility {
+        marker.validate()?;
     }
     exact_image(
         &record.server_image,

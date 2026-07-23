@@ -164,6 +164,7 @@ fn fixture_with_directories(
         ),
         migrator_image: format!("dirextalk/vnet-server@sha256:{}", "c".repeat(64)),
         installer_sha256: hash(stack_installer),
+        cross_version_compatibility: None,
         files,
     };
     let mut tar = tar::Builder::new(Vec::new());
@@ -677,18 +678,14 @@ fn update_mutation_and_cross_version_fail_closed_without_effects() {
     let (_same_dir, same_version) = fixture("1.2.3", 'b');
     let executor = Never(AtomicUsize::new(0));
     let error = update(&same_version, &state_dir, true, &executor)
-        .expect_err("update mutation remains disabled");
-    assert!(error.to_string().contains("update mutation is disabled"));
+        .expect_err("missing marker remains fail closed");
+    assert!(error.to_string().contains("compatibility marker"));
     assert_eq!(executor.0.load(Ordering::Relaxed), 0);
 
     let (_new_dir, cross_version) = fixture("2.0.0", 'b');
     let error = update(&cross_version, &state_dir, false, &Identity)
         .expect_err("unsupported cross-version update");
-    assert!(
-        error
-            .to_string()
-            .contains("cross-version update is unsupported")
-    );
+    assert!(error.to_string().contains("compatibility marker"));
 }
 
 fn remote_file(
