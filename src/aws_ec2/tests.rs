@@ -324,6 +324,8 @@ enum SshIngressShape {
 struct RebindExecutor {
     state: Mutex<SshIngressShape>,
     revoke_converges: bool,
+    fail_effect: Option<String>,
+    success_output: String,
     group: Value,
     calls: Mutex<Vec<String>>,
 }
@@ -351,6 +353,8 @@ impl RebindExecutor {
         Self {
             state: Mutex::new(shape),
             revoke_converges,
+            fail_effect: None,
+            success_output: String::new(),
             group: json!({
                 "GroupId": state.security_group_id,
                 "VpcId": state.vpc_id,
@@ -358,6 +362,16 @@ impl RebindExecutor {
             }),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    fn with_ack_loss(mut self, effect: &str) -> Self {
+        self.fail_effect = Some(effect.into());
+        self
+    }
+
+    fn with_success_output(mut self, output: &str) -> Self {
+        self.success_output = output.into();
+        self
     }
 
     fn ingress(shape: SshIngressShape) -> Value {
@@ -394,15 +408,23 @@ impl AwsExecutor for RebindExecutor {
                 group["IpPermissions"] = Self::ingress(*self.state.lock().expect("state"));
                 json!({"SecurityGroups":[group]}).to_string()
             }
-            "rebind-authorize-operator-ssh-cidr" => {
+            "rebind-authorize-operator-ssh-cidr"
+            | "rebind-authorize-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3" => {
                 *self.state.lock().expect("state") = SshIngressShape::Both;
-                String::new()
+                if self.fail_effect.as_deref() == Some(command.id.as_str()) {
+                    return Err(contract("simulated rebind acknowledgement loss"));
+                }
+                self.success_output.clone()
             }
-            "rebind-revoke-operator-ssh-cidr" => {
+            "rebind-revoke-operator-ssh-cidr"
+            | "rebind-revoke-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3" => {
                 if self.revoke_converges {
                     *self.state.lock().expect("state") = SshIngressShape::New;
                 }
-                String::new()
+                if self.fail_effect.as_deref() == Some(command.id.as_str()) {
+                    return Err(contract("simulated rebind acknowledgement loss"));
+                }
+                self.success_output.clone()
             }
             _ => return Err(contract("unexpected rebind command")),
         };
@@ -437,6 +459,21 @@ fn rebind_state(
         .expect("store")
         .write(&state)
         .expect("write");
+    (state_dir, state)
+}
+
+fn rebind_state_with_pending(
+    dir: &TempDir,
+    manifest: &AwsEc2Manifest,
+    pending: &str,
+) -> (PathBuf, Ec2State) {
+    let (state_dir, mut state) = rebind_state(dir, manifest, LifecyclePhase::DnsReady);
+    state.pending_effect = Some(pending.into());
+    state = state.seal().expect("pending state seal");
+    Store::lock(&state_dir, &manifest.target)
+        .expect("store")
+        .write(&state)
+        .expect("pending state write");
     (state_dir, state)
 }
 
@@ -2084,7 +2121,8 @@ fn operator_cidr_rebind_authorizes_then_revokes_and_reseals_state() {
     let (state_dir, state) = rebind_state(&dir, &old_manifest, LifecyclePhase::DnsReady);
     let mut new_manifest = old_manifest.clone();
     new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
-    let executor = RebindExecutor::new(&state, SshIngressShape::Old, true);
+    let executor = RebindExecutor::new(&state, SshIngressShape::Old, true)
+        .with_success_output("{\"Return\":true}");
 
     let updated =
         rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", true, &executor)
@@ -2162,6 +2200,133 @@ fn operator_cidr_rebind_replays_crash_windows_without_widening() {
             .filter_map(|call| call.starts_with("rebind-").then_some(call.as_str()))
             .collect();
         assert_eq!(effects, expected_effects);
+    }
+}
+
+#[test]
+fn operator_cidr_rebind_preserves_runtime_recovery_bridge() {
+    let (dir, old_manifest) = fixture("1.2.3", 'a');
+    let mut new_manifest = old_manifest.clone();
+    new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
+    let (state_dir, state) =
+        rebind_state_with_pending(&dir, &old_manifest, "bridge-runtime-recovery-r2-to-r3");
+    let executor = RebindExecutor::new(&state, SshIngressShape::Old, true)
+        .with_success_output("{\"Return\":true}");
+    let updated =
+        rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", true, &executor)
+            .expect("bridge-preserving rebind");
+    assert_eq!(updated.infrastructure.operator_ssh_cidr, "198.51.100.7/32");
+    assert_eq!(
+        updated.pending_effect.as_deref(),
+        Some("bridge-runtime-recovery-r2-to-r3")
+    );
+    assert!(executor.calls.lock().expect("calls").iter().any(|id| {
+        id == "rebind-authorize-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3"
+    }));
+    assert!(
+        executor.calls.lock().expect("calls").iter().any(|id| {
+            id == "rebind-revoke-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3"
+        })
+    );
+}
+
+#[test]
+fn operator_cidr_rebind_bridge_replays_compound_effects_and_new_only() {
+    let (dir, old_manifest) = fixture("1.2.3", 'a');
+    let mut new_manifest = old_manifest.clone();
+    new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
+    for (pending, shape, expected_effect) in [
+        (
+            "rebind-authorize-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3",
+            SshIngressShape::Both,
+            Some("rebind-revoke-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3"),
+        ),
+        (
+            "rebind-revoke-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3",
+            SshIngressShape::New,
+            None,
+        ),
+    ] {
+        let (state_dir, state) = rebind_state_with_pending(&dir, &old_manifest, pending);
+        let executor = RebindExecutor::new(&state, shape, true);
+        let updated =
+            rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", true, &executor)
+                .expect("compound replay");
+        assert_eq!(
+            updated.pending_effect.as_deref(),
+            Some("bridge-runtime-recovery-r2-to-r3")
+        );
+        if let Some(expected) = expected_effect {
+            assert!(
+                executor
+                    .calls
+                    .lock()
+                    .expect("calls")
+                    .iter()
+                    .any(|id| id == expected)
+            );
+        } else {
+            assert!(
+                !executor
+                    .calls
+                    .lock()
+                    .expect("calls")
+                    .iter()
+                    .any(|id| id.contains("rebind-"))
+            );
+        }
+    }
+}
+
+#[test]
+fn operator_cidr_rebind_bridge_ack_loss_retains_compound_pending_and_dry_run_is_read_only() {
+    let (dir, old_manifest) = fixture("1.2.3", 'a');
+    let mut new_manifest = old_manifest.clone();
+    new_manifest.operator_ssh_cidr = "198.51.100.7/32".into();
+    let (state_dir, state) =
+        rebind_state_with_pending(&dir, &old_manifest, "bridge-runtime-recovery-r2-to-r3");
+    let executor = RebindExecutor::new(&state, SshIngressShape::Old, true)
+        .with_ack_loss("rebind-authorize-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3");
+    assert!(
+        rebind_operator_cidr(&new_manifest, &state_dir, "203.0.113.9/32", true, &executor,)
+            .is_err()
+    );
+    let persisted = Store::lock(&state_dir, "x6")
+        .expect("store")
+        .read::<Ec2State>()
+        .expect("read")
+        .expect("state");
+    assert_eq!(
+        persisted.pending_effect.as_deref(),
+        Some("rebind-authorize-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3")
+    );
+
+    let (dry_dir, dry_state) =
+        rebind_state_with_pending(&dir, &old_manifest, "bridge-runtime-recovery-r2-to-r3");
+    let never = Never(AtomicUsize::new(0));
+    let dry = rebind_operator_cidr(&new_manifest, &dry_dir, "203.0.113.9/32", false, &never)
+        .expect("dry run");
+    assert_eq!(dry.pending_effect, dry_state.pending_effect);
+    assert_eq!(never.0.load(Ordering::Relaxed), 0);
+
+    for pending in [
+        "stage-runtime-recovery-011-to-014-r3",
+        "run-fixed-runtime-attester-011-to-014-r3",
+        "destroy-instance",
+    ] {
+        let (reject_dir, reject_state) = rebind_state_with_pending(&dir, &old_manifest, pending);
+        let reject_executor = RebindExecutor::new(&reject_state, SshIngressShape::Old, true);
+        assert!(
+            rebind_operator_cidr(
+                &new_manifest,
+                &reject_dir,
+                "203.0.113.9/32",
+                true,
+                &reject_executor,
+            )
+            .is_err()
+        );
+        assert!(reject_executor.calls.lock().expect("calls").is_empty());
     }
 }
 

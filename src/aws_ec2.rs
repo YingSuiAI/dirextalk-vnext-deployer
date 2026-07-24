@@ -78,18 +78,36 @@ pub(super) const REMOTE_PROVISIONER_ATOMIC: &str =
     "/usr/local/libexec/dirextalk/.provision-vnext.new";
 pub(super) const REMOTE_RECEIPT_READER_ATOMIC: &str =
     "/usr/local/libexec/dirextalk/.read-vnext-receipt.new";
+#[allow(dead_code)]
 pub(super) const REMOTE_RUNTIME_RECOVERY_UPLOAD: &str =
     "/home/ubuntu/recover-vnext-011-to-014-r2.upload";
+#[allow(dead_code)]
 pub(super) const REMOTE_RUNTIME_RECOVERY_ATOMIC: &str =
     "/usr/local/libexec/dirextalk/.recover-vnext-011-to-014-r2.new";
+#[allow(dead_code)]
 pub(super) const REMOTE_RUNTIME_RECOVERY: &str =
     "/usr/local/libexec/dirextalk/recover-vnext-011-to-014-r2";
+#[allow(dead_code)]
 pub(super) const REMOTE_RUNTIME_ATTESTER_UPLOAD: &str =
     "/home/ubuntu/attest-vnext-011-to-014-r2.upload";
+#[allow(dead_code)]
 pub(super) const REMOTE_RUNTIME_ATTESTER_ATOMIC: &str =
     "/usr/local/libexec/dirextalk/.attest-vnext-011-to-014-r2.new";
+#[allow(dead_code)]
 pub(super) const REMOTE_RUNTIME_ATTESTER: &str =
     "/usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2";
+pub(super) const REMOTE_RUNTIME_RECOVERY_R3_UPLOAD: &str =
+    "/home/ubuntu/recover-vnext-011-to-014-r3.upload";
+pub(super) const REMOTE_RUNTIME_RECOVERY_R3_ATOMIC: &str =
+    "/usr/local/libexec/dirextalk/.recover-vnext-011-to-014-r3.new";
+pub(super) const REMOTE_RUNTIME_RECOVERY_R3: &str =
+    "/usr/local/libexec/dirextalk/recover-vnext-011-to-014-r3";
+pub(super) const REMOTE_RUNTIME_ATTESTER_R3_UPLOAD: &str =
+    "/home/ubuntu/attest-vnext-011-to-014-r3.upload";
+pub(super) const REMOTE_RUNTIME_ATTESTER_R3_ATOMIC: &str =
+    "/usr/local/libexec/dirextalk/.attest-vnext-011-to-014-r3.new";
+pub(super) const REMOTE_RUNTIME_ATTESTER_R3: &str =
+    "/usr/local/libexec/dirextalk/attest-vnext-011-to-014-r3";
 pub(super) const REMOTE_RUNTIME_ATTESTATION: &str =
     "/var/lib/dirextalk-vnext/runtime-attestation.json";
 pub(super) const REMOTE_READY_RECEIPT: &str = "/var/lib/dirextalk-vnext/host-provision/ready.json";
@@ -236,9 +254,14 @@ impl AwsEc2Manifest {
 
 pub(super) const CROSS_VERSION_BOOTSTRAP_SHA256: &str =
     "7b20ee7f048d7d813610659af60b597ab1e74b03b60a159fb685586cab7ac4da";
+#[allow(dead_code)]
 pub(super) const RUNTIME_RECOVERY_SHA256: &str =
     "092d9504d9f2ae20dbee341750aba8dcb9179bbbd64e53495e0f256045af628f";
+#[allow(dead_code)]
 pub(super) const RUNTIME_RECOVERY_SIZE: usize = 78_057;
+pub(super) const RUNTIME_RECOVERY_R3_SHA256: &str =
+    "8e2570f9b6e887b96ad2690357abd53d893129099674583fbc868c2f3c7224aa";
+pub(super) const RUNTIME_RECOVERY_R3_SIZE: usize = 97_781;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

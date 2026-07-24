@@ -29,8 +29,11 @@ use super::{
     REMOTE_PROVISIONER_UPLOAD, REMOTE_READY_RECEIPT, REMOTE_RECEIPT_READER,
     REMOTE_RECEIPT_READER_ATOMIC, REMOTE_RECEIPT_READER_UPLOAD, REMOTE_REQUEST,
     REMOTE_RUNTIME_ATTESTATION, REMOTE_RUNTIME_ATTESTER, REMOTE_RUNTIME_ATTESTER_ATOMIC,
-    REMOTE_RUNTIME_ATTESTER_UPLOAD, REMOTE_RUNTIME_RECOVERY, REMOTE_RUNTIME_RECOVERY_ATOMIC,
-    REMOTE_RUNTIME_RECOVERY_UPLOAD, RUNTIME_RECOVERY_SHA256, RUNTIME_RECOVERY_SIZE, ReceiptState,
+    REMOTE_RUNTIME_ATTESTER_R3, REMOTE_RUNTIME_ATTESTER_R3_ATOMIC,
+    REMOTE_RUNTIME_ATTESTER_R3_UPLOAD, REMOTE_RUNTIME_ATTESTER_UPLOAD, REMOTE_RUNTIME_RECOVERY,
+    REMOTE_RUNTIME_RECOVERY_ATOMIC, REMOTE_RUNTIME_RECOVERY_R3, REMOTE_RUNTIME_RECOVERY_R3_ATOMIC,
+    REMOTE_RUNTIME_RECOVERY_R3_UPLOAD, REMOTE_RUNTIME_RECOVERY_UPLOAD, RUNTIME_RECOVERY_R3_SHA256,
+    RUNTIME_RECOVERY_R3_SIZE, RUNTIME_RECOVERY_SHA256, RUNTIME_RECOVERY_SIZE, ReceiptState,
     RegistryExecutor, SCP, SSH, SSH_KEYGEN, SSH_KEYSCAN, StatusReport, UBUNTU_OWNER,
     UBUNTU_PATTERN, VerifyReport, contract, enforce_cost_guard, expected_tags,
     resolve_latest_digest,
@@ -50,7 +53,15 @@ pub(super) const CROSS_VERSION_BOOTSTRAP_SUFFIX: &str = "cross-version-bootstrap
 const ROLLBACK_REQUEST_SUFFIX: &str = "rollback.request";
 const UPDATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
 const UPDATE_CAPACITY_INODES: u64 = 128;
+#[allow(dead_code)]
 const RUNTIME_RECOVERY_SUFFIX: &str = "runtime-recovery-011-to-014-r2";
+const RUNTIME_RECOVERY_R3_SUFFIX: &str = "runtime-recovery-011-to-014-r3";
+const RUNTIME_RECOVERY_R2_RUN: &str = "run-fixed-runtime-recovery-011-to-014-r2";
+const RUNTIME_RECOVERY_R3_BRIDGE: &str = "bridge-runtime-recovery-r2-to-r3";
+const REBIND_AUTHORIZE_PRESERVE_R3_BRIDGE: &str =
+    "rebind-authorize-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3";
+const REBIND_REVOKE_PRESERVE_R3_BRIDGE: &str =
+    "rebind-revoke-operator-ssh-cidr-preserve-runtime-recovery-r2-to-r3";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,6 +291,40 @@ pub(super) fn run_effect(
     let output = executor.run(command)?;
     after_effect(store, state)?;
     Ok(output)
+}
+
+fn run_quiet_effect(
+    store: &Store,
+    state: &mut Ec2State,
+    command: &FixedCommand,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    before_effect(store, state, &command.id)?;
+    let output = executor.run(command)?;
+    if output.status != 0 || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err(contract(&format!(
+            "{} returned unexpected output",
+            command.id
+        )));
+    }
+    after_effect(store, state)
+}
+
+fn run_quiet_effect_pending(
+    store: &Store,
+    state: &mut Ec2State,
+    command: &FixedCommand,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    before_effect(store, state, &command.id)?;
+    let output = executor.run(command)?;
+    if output.status != 0 || !output.stdout.is_empty() || !output.stderr.is_empty() {
+        return Err(contract(&format!(
+            "{} returned unexpected output",
+            command.id
+        )));
+    }
+    Ok(())
 }
 
 fn bind_account(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecutor) -> Result<()> {
@@ -1694,30 +1739,36 @@ pub fn recover_runtime_011_to_014(
     let mut state = load_state(&store, manifest)?;
     admit_runtime_recovery(&state, manifest, &facts, &store)?;
     authenticate_runtime_recovery_evidence(&store, &state, manifest, &facts)?;
+    let bytes = read_hash_bound_helper(
+        helper,
+        RUNTIME_RECOVERY_R3_SHA256,
+        "runtime recovery r3 helper",
+    )?;
+    if bytes.len() != RUNTIME_RECOVERY_R3_SIZE {
+        return Err(ReleaseError::SourceMismatch(helper.to_owned()));
+    }
     if !execute {
-        let bytes =
-            read_hash_bound_helper(helper, RUNTIME_RECOVERY_SHA256, "runtime recovery helper")?;
-        if bytes.len() != RUNTIME_RECOVERY_SIZE {
-            return Err(ReleaseError::SourceMismatch(helper.to_owned()));
-        }
         return Ok(state);
     }
-    seal_runtime_recovery_helper(&store, helper)?;
-    ensure_runtime_recovery_helpers(&store, &mut state, executor)?;
-    let command = ssh_command(
-        "run-fixed-runtime-recovery-011-to-014-r2",
+    if state.pending_effect.as_deref() == Some(RUNTIME_RECOVERY_R2_RUN) {
+        before_effect(&store, &mut state, RUNTIME_RECOVERY_R3_BRIDGE)?;
+    }
+    seal_runtime_recovery_r3_helper(&store, helper, &bytes)?;
+    ensure_runtime_recovery_r3_helpers(&store, &mut state, executor)?;
+    let recovery_command = ssh_command(
+        "run-fixed-runtime-recovery-011-to-014-r3",
         &state,
         &store,
         [
             "/usr/bin/sudo",
             "--non-interactive",
-            REMOTE_RUNTIME_RECOVERY,
+            REMOTE_RUNTIME_RECOVERY_R3,
         ],
         true,
         900,
     )?;
-    run_effect(&store, &mut state, &command, executor)?;
-    attest_runtime_011_to_014_locked(&store, &mut state, manifest, &facts, executor)?;
+    run_quiet_effect(&store, &mut state, &recovery_command, executor)?;
+    attest_runtime_011_to_014_locked_for_recovery(&store, &mut state, manifest, &facts, executor)?;
     state.pending_effect = None;
     persist(&store, &mut state)?;
     Ok(state)
@@ -1737,6 +1788,34 @@ pub fn attest_runtime_011_to_014(
     attest_runtime_011_to_014_locked(&store, &mut state, manifest, &facts, executor)
 }
 
+fn seal_runtime_recovery_r3_helper(store: &Store, helper: &Path, bytes: &[u8]) -> Result<()> {
+    match store.read_artifact(
+        RUNTIME_RECOVERY_R3_SUFFIX,
+        (RUNTIME_RECOVERY_R3_SIZE + 1) as u64,
+    ) {
+        Ok(existing)
+            if existing.len() == RUNTIME_RECOVERY_R3_SIZE
+                && hash(&existing) == RUNTIME_RECOVERY_R3_SHA256 =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(ReleaseError::SourceMismatch(
+            store.artifact_path(RUNTIME_RECOVERY_R3_SUFFIX)?,
+        )),
+        Err(ReleaseError::MissingArtifact(_)) => {
+            if bytes.len() != RUNTIME_RECOVERY_R3_SIZE || hash(bytes) != RUNTIME_RECOVERY_R3_SHA256
+            {
+                return Err(ReleaseError::SourceMismatch(helper.to_owned()));
+            }
+            store
+                .write_artifact(RUNTIME_RECOVERY_R3_SUFFIX, bytes, 0o600)
+                .map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(dead_code)]
 fn seal_runtime_recovery_helper(store: &Store, helper: &Path) -> Result<()> {
     match store.read_artifact(RUNTIME_RECOVERY_SUFFIX, (RUNTIME_RECOVERY_SIZE + 1) as u64) {
         Ok(bytes)
@@ -1760,6 +1839,7 @@ fn seal_runtime_recovery_helper(store: &Store, helper: &Path) -> Result<()> {
     }
 }
 
+#[allow(dead_code)]
 fn ensure_runtime_recovery_helpers(
     store: &Store,
     state: &mut Ec2State,
@@ -1794,6 +1874,50 @@ fn ensure_runtime_recovery_helpers(
             atomic_name: ".attest-vnext-011-to-014-r2.new",
             installed: REMOTE_RUNTIME_ATTESTER,
             installed_name: "attest-vnext-011-to-014-r2",
+        },
+    ] {
+        ensure_host_helper(store, state, &helper, executor)?;
+    }
+    Ok(())
+}
+
+fn ensure_runtime_recovery_r3_helpers(
+    store: &Store,
+    state: &mut Ec2State,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    let bytes = store.read_artifact(
+        RUNTIME_RECOVERY_R3_SUFFIX,
+        (RUNTIME_RECOVERY_R3_SIZE + 1) as u64,
+    )?;
+    if bytes.len() != RUNTIME_RECOVERY_R3_SIZE || hash(&bytes) != RUNTIME_RECOVERY_R3_SHA256 {
+        return Err(ReleaseError::OperationConflict);
+    }
+    let local = store.artifact_path(RUNTIME_RECOVERY_R3_SUFFIX)?;
+    for helper in [
+        HostHelperSpec {
+            label: "runtime-recovery-011-to-014-r3",
+            local: &local,
+            sha256: RUNTIME_RECOVERY_R3_SHA256,
+            size: bytes.len(),
+            upload: REMOTE_RUNTIME_RECOVERY_R3_UPLOAD,
+            upload_name: "recover-vnext-011-to-014-r3.upload",
+            atomic: REMOTE_RUNTIME_RECOVERY_R3_ATOMIC,
+            atomic_name: ".recover-vnext-011-to-014-r3.new",
+            installed: REMOTE_RUNTIME_RECOVERY_R3,
+            installed_name: "recover-vnext-011-to-014-r3",
+        },
+        HostHelperSpec {
+            label: "runtime-attester-011-to-014-r3",
+            local: &local,
+            sha256: RUNTIME_RECOVERY_R3_SHA256,
+            size: bytes.len(),
+            upload: REMOTE_RUNTIME_ATTESTER_R3_UPLOAD,
+            upload_name: "attest-vnext-011-to-014-r3.upload",
+            atomic: REMOTE_RUNTIME_ATTESTER_R3_ATOMIC,
+            atomic_name: ".attest-vnext-011-to-014-r3.new",
+            installed: REMOTE_RUNTIME_ATTESTER_R3,
+            installed_name: "attest-vnext-011-to-014-r3",
         },
     ] {
         ensure_host_helper(store, state, &helper, executor)?;
@@ -1850,20 +1974,22 @@ fn admit_runtime_recovery(
 fn runtime_recovery_pending_effect(effect: &str) -> bool {
     matches!(
         effect,
-        "clear-upload-runtime-recovery-011-to-014-r2"
-            | "stage-runtime-recovery-011-to-014-r2"
-            | "protect-uploaded-runtime-recovery-011-to-014-r2"
-            | "clear-atomic-runtime-recovery-011-to-014-r2"
-            | "prepare-atomic-runtime-recovery-011-to-014-r2"
-            | "activate-runtime-recovery-011-to-014-r2"
-            | "clear-upload-runtime-attester-011-to-014-r2"
-            | "stage-runtime-attester-011-to-014-r2"
-            | "protect-uploaded-runtime-attester-011-to-014-r2"
-            | "clear-atomic-runtime-attester-011-to-014-r2"
-            | "prepare-atomic-runtime-attester-011-to-014-r2"
-            | "activate-runtime-attester-011-to-014-r2"
-            | "run-fixed-runtime-recovery-011-to-014-r2"
-            | "run-fixed-runtime-attester-011-to-014-r2"
+        RUNTIME_RECOVERY_R2_RUN
+            | RUNTIME_RECOVERY_R3_BRIDGE
+            | "clear-upload-runtime-recovery-011-to-014-r3"
+            | "stage-runtime-recovery-011-to-014-r3"
+            | "protect-uploaded-runtime-recovery-011-to-014-r3"
+            | "clear-atomic-runtime-recovery-011-to-014-r3"
+            | "prepare-atomic-runtime-recovery-011-to-014-r3"
+            | "activate-runtime-recovery-011-to-014-r3"
+            | "clear-upload-runtime-attester-011-to-014-r3"
+            | "stage-runtime-attester-011-to-014-r3"
+            | "protect-uploaded-runtime-attester-011-to-014-r3"
+            | "clear-atomic-runtime-attester-011-to-014-r3"
+            | "prepare-atomic-runtime-attester-011-to-014-r3"
+            | "activate-runtime-attester-011-to-014-r3"
+            | "run-fixed-runtime-recovery-011-to-014-r3"
+            | "run-fixed-runtime-attester-011-to-014-r3"
     )
 }
 
@@ -1874,20 +2000,22 @@ mod runtime_recovery_pending_tests {
     #[test]
     fn accepts_only_exact_recovery_helper_effect_ids() {
         for effect in [
-            "clear-upload-runtime-recovery-011-to-014-r2",
-            "stage-runtime-recovery-011-to-014-r2",
-            "protect-uploaded-runtime-recovery-011-to-014-r2",
-            "clear-atomic-runtime-recovery-011-to-014-r2",
-            "prepare-atomic-runtime-recovery-011-to-014-r2",
-            "activate-runtime-recovery-011-to-014-r2",
-            "clear-upload-runtime-attester-011-to-014-r2",
-            "stage-runtime-attester-011-to-014-r2",
-            "protect-uploaded-runtime-attester-011-to-014-r2",
-            "clear-atomic-runtime-attester-011-to-014-r2",
-            "prepare-atomic-runtime-attester-011-to-014-r2",
-            "activate-runtime-attester-011-to-014-r2",
             "run-fixed-runtime-recovery-011-to-014-r2",
-            "run-fixed-runtime-attester-011-to-014-r2",
+            "bridge-runtime-recovery-r2-to-r3",
+            "clear-upload-runtime-recovery-011-to-014-r3",
+            "stage-runtime-recovery-011-to-014-r3",
+            "protect-uploaded-runtime-recovery-011-to-014-r3",
+            "clear-atomic-runtime-recovery-011-to-014-r3",
+            "prepare-atomic-runtime-recovery-011-to-014-r3",
+            "activate-runtime-recovery-011-to-014-r3",
+            "clear-upload-runtime-attester-011-to-014-r3",
+            "stage-runtime-attester-011-to-014-r3",
+            "protect-uploaded-runtime-attester-011-to-014-r3",
+            "clear-atomic-runtime-attester-011-to-014-r3",
+            "prepare-atomic-runtime-attester-011-to-014-r3",
+            "activate-runtime-attester-011-to-014-r3",
+            "run-fixed-runtime-recovery-011-to-014-r3",
+            "run-fixed-runtime-attester-011-to-014-r3",
         ] {
             assert!(runtime_recovery_pending_effect(effect));
         }
@@ -1955,58 +2083,82 @@ pub(crate) fn attest_runtime_011_to_014_locked(
     facts: &BundleFacts,
     executor: &dyn AwsExecutor,
 ) -> Result<()> {
+    attest_runtime_011_to_014_locked_inner(store, state, manifest, facts, executor, false)
+}
+
+fn attest_runtime_011_to_014_locked_for_recovery(
+    store: &Store,
+    state: &mut Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+    executor: &dyn AwsExecutor,
+) -> Result<()> {
+    attest_runtime_011_to_014_locked_inner(store, state, manifest, facts, executor, true)
+}
+
+fn attest_runtime_011_to_014_locked_inner(
+    store: &Store,
+    state: &mut Ec2State,
+    manifest: &AwsEc2Manifest,
+    facts: &BundleFacts,
+    executor: &dyn AwsExecutor,
+    recovery_replay: bool,
+) -> Result<()> {
+    if !recovery_replay && state.pending_effect.is_some() {
+        return Err(contract(
+            "runtime attestation requires no pending recovery effect",
+        ));
+    }
     admit_runtime_recovery(state, manifest, facts, store)?;
     authenticate_runtime_recovery_evidence(store, state, manifest, facts)?;
     // A missing or substituted helper is never self-healed here: recovery is
     // the sole authority that seals and stages this exceptional executable.
-    let sealed =
-        store.read_artifact(RUNTIME_RECOVERY_SUFFIX, (RUNTIME_RECOVERY_SIZE + 1) as u64)?;
-    if sealed.len() != RUNTIME_RECOVERY_SIZE || hash(&sealed) != RUNTIME_RECOVERY_SHA256 {
+    let sealed = store.read_artifact(
+        RUNTIME_RECOVERY_R3_SUFFIX,
+        (RUNTIME_RECOVERY_R3_SIZE + 1) as u64,
+    )?;
+    if sealed.len() != RUNTIME_RECOVERY_R3_SIZE || hash(&sealed) != RUNTIME_RECOVERY_R3_SHA256 {
         return Err(ReleaseError::OperationConflict);
     }
     let installed = inspect_remote_file(
         state,
         store,
         executor,
-        "inspect-installed-runtime-attester-011-to-014-r2",
+        "inspect-installed-runtime-attester-011-to-014-r3",
         "/usr/local/libexec/dirextalk",
-        "attest-vnext-011-to-014-r2",
+        "attest-vnext-011-to-014-r3",
     )?
     .ok_or(ReleaseError::OperationConflict)?;
     require_remote_metadata(
         &installed,
-        REMOTE_RUNTIME_ATTESTER,
+        REMOTE_RUNTIME_ATTESTER_R3,
         "root",
         "root",
         "555",
-        RUNTIME_RECOVERY_SIZE,
+        RUNTIME_RECOVERY_R3_SIZE,
     )?;
     verify_remote_helper_hash(
         state,
         store,
         executor,
-        "verify-installed-runtime-attester-011-to-014-r2",
-        REMOTE_RUNTIME_ATTESTER,
-        RUNTIME_RECOVERY_SHA256,
+        "verify-installed-runtime-attester-011-to-014-r3",
+        REMOTE_RUNTIME_ATTESTER_R3,
+        RUNTIME_RECOVERY_R3_SHA256,
         true,
     )?;
-    run_effect(
-        store,
+    let attester_command = ssh_command(
+        "run-fixed-runtime-attester-011-to-014-r3",
         state,
-        &ssh_command(
-            "run-fixed-runtime-attester-011-to-014-r2",
-            state,
-            store,
-            [
-                "/usr/bin/sudo",
-                "--non-interactive",
-                REMOTE_RUNTIME_ATTESTER,
-            ],
-            true,
-            900,
-        )?,
-        executor,
+        store,
+        [
+            "/usr/bin/sudo",
+            "--non-interactive",
+            REMOTE_RUNTIME_ATTESTER_R3,
+        ],
+        true,
+        900,
     )?;
+    run_quiet_effect_pending(store, state, &attester_command, executor)?;
     let metadata = inspect_remote_file(
         state,
         store,
@@ -2060,7 +2212,7 @@ pub(crate) fn attest_runtime_011_to_014_locked(
         false,
         30,
     )?)?;
-    if !receipt.stderr.is_empty() {
+    if receipt.status != 0 || !receipt.stderr.is_empty() {
         return Err(ReleaseError::OperationConflict);
     }
     let current = InstalledReceipt::parse_and_verify(
@@ -2073,7 +2225,7 @@ pub(crate) fn attest_runtime_011_to_014_locked(
             "current receipt changed after runtime attestation",
         ));
     }
-    Ok(())
+    after_effect(store, state)
 }
 
 fn validate_runtime_attestation(
@@ -4065,18 +4217,33 @@ pub fn rebind_operator_cidr(
         expected_old_cidr,
         &manifest.operator_ssh_cidr,
     )?;
+    let preserve_bridge = matches!(
+        state.pending_effect.as_deref(),
+        Some(
+            RUNTIME_RECOVERY_R3_BRIDGE
+                | REBIND_AUTHORIZE_PRESERVE_R3_BRIDGE
+                | REBIND_REVOKE_PRESERVE_R3_BRIDGE,
+        )
+    );
     match ingress {
         RebindIngress::OldOnly => {
-            run_effect(
+            let authorize_id = if preserve_bridge {
+                REBIND_AUTHORIZE_PRESERVE_R3_BRIDGE
+            } else {
+                "rebind-authorize-operator-ssh-cidr"
+            };
+            run_rebind_effect(
                 &store,
                 &mut state,
+                authorize_id,
                 &operator_ingress_command(
-                    "rebind-authorize-operator-ssh-cidr",
+                    authorize_id,
                     "authorize-security-group-ingress",
                     &security_group_id,
                     &manifest.operator_ssh_cidr,
                 )?,
                 executor,
+                preserve_bridge,
             )?;
             if !matches!(
                 classify_rebind_ingress(
@@ -4097,16 +4264,20 @@ pub fn rebind_operator_cidr(
                 expected_old_cidr,
                 &manifest.operator_ssh_cidr,
                 executor,
+                preserve_bridge,
             )?;
         }
-        RebindIngress::Both => revoke_old_operator_ingress(
-            &store,
-            &mut state,
-            &security_group_id,
-            expected_old_cidr,
-            &manifest.operator_ssh_cidr,
-            executor,
-        )?,
+        RebindIngress::Both => {
+            revoke_old_operator_ingress(
+                &store,
+                &mut state,
+                &security_group_id,
+                expected_old_cidr,
+                &manifest.operator_ssh_cidr,
+                executor,
+                preserve_bridge,
+            )?;
+        }
         RebindIngress::NewOnly => {}
     }
     // A crash after revoke leaves state old but the exact new-only remote shape; this is
@@ -4115,7 +4286,11 @@ pub fn rebind_operator_cidr(
         .infrastructure
         .operator_ssh_cidr
         .clone_from(&manifest.operator_ssh_cidr);
-    state.pending_effect = None;
+    state.pending_effect = if preserve_bridge {
+        Some(RUNTIME_RECOVERY_R3_BRIDGE.into())
+    } else {
+        None
+    };
     persist(&store, &mut state)?;
     Ok(state)
 }
@@ -4140,11 +4315,39 @@ fn ensure_rebind_phase(phase: &LifecyclePhase) -> Result<()> {
 fn ensure_rebind_pending_effect(pending_effect: Option<&str>) -> Result<()> {
     if matches!(
         pending_effect,
-        None | Some("rebind-authorize-operator-ssh-cidr" | "rebind-revoke-operator-ssh-cidr")
+        None | Some(
+            "rebind-authorize-operator-ssh-cidr"
+                | "rebind-revoke-operator-ssh-cidr"
+                | RUNTIME_RECOVERY_R3_BRIDGE
+                | REBIND_AUTHORIZE_PRESERVE_R3_BRIDGE
+                | REBIND_REVOKE_PRESERVE_R3_BRIDGE,
+        )
     ) {
         Ok(())
     } else {
         Err(ReleaseError::OperationConflict)
+    }
+}
+
+fn run_rebind_effect(
+    store: &Store,
+    state: &mut Ec2State,
+    id: &str,
+    command: &FixedCommand,
+    executor: &dyn AwsExecutor,
+    preserve_bridge: bool,
+) -> Result<()> {
+    if !preserve_bridge {
+        run_effect(store, state, command, executor)?;
+        return Ok(());
+    }
+    before_effect(store, state, id)?;
+    let _ = executor.run(command)?;
+    if preserve_bridge {
+        state.pending_effect = Some(RUNTIME_RECOVERY_R3_BRIDGE.into());
+        persist(store, state)
+    } else {
+        after_effect(store, state)
     }
 }
 
@@ -4277,17 +4480,25 @@ fn revoke_old_operator_ingress(
     old_cidr: &str,
     new_cidr: &str,
     executor: &dyn AwsExecutor,
+    preserve_bridge: bool,
 ) -> Result<()> {
-    run_effect(
+    let revoke_id = if preserve_bridge {
+        REBIND_REVOKE_PRESERVE_R3_BRIDGE
+    } else {
+        "rebind-revoke-operator-ssh-cidr"
+    };
+    run_rebind_effect(
         store,
         state,
+        revoke_id,
         &operator_ingress_command(
-            "rebind-revoke-operator-ssh-cidr",
+            revoke_id,
             "revoke-security-group-ingress",
             security_group_id,
             old_cidr,
         )?,
         executor,
+        preserve_bridge,
     )?;
     if !matches!(
         classify_rebind_ingress(

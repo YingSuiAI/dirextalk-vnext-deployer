@@ -726,6 +726,7 @@ fn validate_ec2_terminal(
     if state.target != manifest.target
         || state.domain != manifest.domain
         || state.phase != LifecyclePhase::Verified
+        || state.pending_effect.is_some()
         || state.current_receipt.is_none()
         || state.host_ready_receipt.is_none()
         || state.current.as_ref().map(|record| &record.bundle_sha256) != Some(&facts.bundle_sha256)
@@ -1639,6 +1640,7 @@ mod tests {
         current_receipt: String,
         runtime_attester_metadata: String,
         runtime_attester_digest: String,
+        fixed_output: Mutex<Option<(String, aws_ec2::ExecOutput)>>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1655,6 +1657,7 @@ mod tests {
         runtime_attestation: String,
         current_receipt: String,
         calls: Mutex<Vec<aws_ec2::FixedCommand>>,
+        fixed_output: Mutex<Option<(String, aws_ec2::ExecOutput)>>,
     }
 
     impl RuntimeRecoveryExecutor {
@@ -1679,7 +1682,20 @@ mod tests {
                 runtime_attestation: fixture.runtime_attestation.clone(),
                 current_receipt: fixture.current_receipt.clone(),
                 calls: Mutex::new(Vec::new()),
+                fixed_output: Mutex::new(None),
             }
+        }
+
+        fn with_fixed_output(self, id: &str, status: i32, stdout: &str, stderr: &str) -> Self {
+            self.fixed_output.lock().expect("fixed output").replace((
+                id.into(),
+                aws_ec2::ExecOutput {
+                    status,
+                    stdout: stdout.into(),
+                    stderr: stderr.into(),
+                },
+            ));
+            self
         }
 
         fn calls(&self) -> Vec<aws_ec2::FixedCommand> {
@@ -1711,30 +1727,36 @@ mod tests {
         ) -> String {
             match state {
                 RuntimeHelperState::Absent => String::new(),
-                RuntimeHelperState::Uploaded => format!("f ubuntu ubuntu 600 1 78057 {upload}\n"),
-                RuntimeHelperState::Protected => format!("f ubuntu ubuntu 400 1 78057 {upload}\n"),
-                RuntimeHelperState::Atomic => format!("f root root 555 1 78057 {atomic}\n"),
-                RuntimeHelperState::Installed => format!("f root root 555 1 78057 {installed}\n"),
+                RuntimeHelperState::Uploaded => format!("f ubuntu ubuntu 600 1 97781 {upload}\n"),
+                RuntimeHelperState::Protected => format!("f ubuntu ubuntu 400 1 97781 {upload}\n"),
+                RuntimeHelperState::Atomic => format!("f root root 555 1 97781 {atomic}\n"),
+                RuntimeHelperState::Installed => format!("f root root 555 1 97781 {installed}\n"),
             }
         }
     }
 
     impl AwsExecutor for RuntimeRecoveryExecutor {
+        #[allow(clippy::too_many_lines)]
         fn run(&self, command: &aws_ec2::FixedCommand) -> Result<aws_ec2::ExecOutput> {
             self.calls.lock().expect("calls").push(command.clone());
             let id = command.id.as_str();
+            if let Some((target, output)) = self.fixed_output.lock().expect("fixed output").clone()
+                && target == id
+            {
+                return Ok(output);
+            }
             let helper = Self::helper_for(id);
             let (upload, atomic, installed) = if helper == "attester" {
                 (
-                    aws_ec2::REMOTE_RUNTIME_ATTESTER_UPLOAD,
-                    aws_ec2::REMOTE_RUNTIME_ATTESTER_ATOMIC,
-                    aws_ec2::REMOTE_RUNTIME_ATTESTER,
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER_R3_UPLOAD,
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER_R3_ATOMIC,
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER_R3,
                 )
             } else {
                 (
-                    aws_ec2::REMOTE_RUNTIME_RECOVERY_UPLOAD,
-                    aws_ec2::REMOTE_RUNTIME_RECOVERY_ATOMIC,
-                    aws_ec2::REMOTE_RUNTIME_RECOVERY,
+                    aws_ec2::REMOTE_RUNTIME_RECOVERY_R3_UPLOAD,
+                    aws_ec2::REMOTE_RUNTIME_RECOVERY_R3_ATOMIC,
+                    aws_ec2::REMOTE_RUNTIME_RECOVERY_R3,
                 )
             };
             let mut states = self.helper_state.lock().expect("helper state");
@@ -1778,7 +1800,7 @@ mod tests {
                     } else {
                         installed
                     };
-                    format!("{}  {path}\n", aws_ec2::RUNTIME_RECOVERY_SHA256)
+                    format!("{}  {path}\n", aws_ec2::RUNTIME_RECOVERY_R3_SHA256)
                 }
                 id if id.starts_with("clear-upload-runtime-") => {
                     *state = RuntimeHelperState::Absent;
@@ -1801,8 +1823,8 @@ mod tests {
                     *state = RuntimeHelperState::Installed;
                     String::new()
                 }
-                "run-fixed-runtime-recovery-011-to-014-r2"
-                | "run-fixed-runtime-attester-011-to-014-r2" => String::new(),
+                "run-fixed-runtime-recovery-011-to-014-r3"
+                | "run-fixed-runtime-attester-011-to-014-r3" => String::new(),
                 "inspect-runtime-attestation" => format!(
                     "f root root 600 1 {} {}\n",
                     self.runtime_attestation.len(),
@@ -1855,11 +1877,24 @@ mod tests {
                 runtime_attestation: fixture.runtime_attestation.clone(),
                 current_receipt: fixture.current_receipt.clone(),
                 runtime_attester_metadata: format!(
-                    "f root root 555 1 78057 {}\n",
-                    aws_ec2::REMOTE_RUNTIME_ATTESTER
+                    "f root root 555 1 97781 {}\n",
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER_R3
                 ),
-                runtime_attester_digest: aws_ec2::RUNTIME_RECOVERY_SHA256.into(),
+                runtime_attester_digest: aws_ec2::RUNTIME_RECOVERY_R3_SHA256.into(),
+                fixed_output: Mutex::new(None),
             }
+        }
+
+        fn with_fixed_output(self, id: &str, status: i32, stdout: &str, stderr: &str) -> Self {
+            self.fixed_output.lock().expect("fixed output").replace((
+                id.into(),
+                aws_ec2::ExecOutput {
+                    status,
+                    stdout: stdout.into(),
+                    stderr: stderr.into(),
+                },
+            ));
+            self
         }
 
         fn with_root_outputs(mut self, outputs: Vec<String>) -> Self {
@@ -1901,14 +1936,19 @@ mod tests {
                 .lock()
                 .expect("commands")
                 .push(command.clone());
+            if let Some((target, output)) = self.fixed_output.lock().expect("fixed output").clone()
+                && target == command.id
+            {
+                return Ok(output);
+            }
             let stdout = match command.id.as_str() {
-                "inspect-installed-runtime-attester-011-to-014-r2" => {
+                "inspect-installed-runtime-attester-011-to-014-r3" => {
                     self.runtime_attester_metadata.clone()
                 }
-                "verify-installed-runtime-attester-011-to-014-r2" => format!(
+                "verify-installed-runtime-attester-011-to-014-r3" => format!(
                     "{}  {}\n",
                     self.runtime_attester_digest,
-                    aws_ec2::REMOTE_RUNTIME_ATTESTER
+                    aws_ec2::REMOTE_RUNTIME_ATTESTER_R3
                 ),
                 "inspect-runtime-attestation" => format!(
                     "f root root 600 1 {} {}\n",
@@ -1983,7 +2023,7 @@ mod tests {
                 | "run-client-binding-issue"
                 | "verify-client-binding-import-regular"
                 | "verify-client-binding-import-not-symlink"
-                | "run-fixed-runtime-attester-011-to-014-r2" => String::new(),
+                | "run-fixed-runtime-attester-011-to-014-r3" => String::new(),
                 other => return Err(contract(&format!("unexpected test command {other}"))),
             };
             Ok(aws_ec2::ExecOutput {
@@ -2459,6 +2499,13 @@ mod tests {
                 0o600,
             )
             .expect("sealed runtime helper");
+        store
+            .write_artifact(
+                "runtime-recovery-011-to-014-r3",
+                include_bytes!("../tests/fixtures/runtime-recovery-r3/install-vnext"),
+                0o600,
+            )
+            .expect("sealed runtime r3 helper");
         store.write(&fixture.state).expect("EC2 state");
     }
 
@@ -2472,18 +2519,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_recovery_r3_fixture_matches_server_contract() {
+        let helper = include_bytes!("../tests/fixtures/runtime-recovery-r3/install-vnext");
+        assert_eq!(helper.len(), aws_ec2::RUNTIME_RECOVERY_R3_SIZE);
+        assert_eq!(
+            aws_ec2::bundle::hash(helper),
+            aws_ec2::RUNTIME_RECOVERY_R3_SHA256
+        );
+    }
+
     fn recovery_fixture() -> (IssueEc2Fixture, PathBuf, PathBuf) {
         let fixture = issue_ec2_fixture();
         let state_dir = fixture.root.path().join("ec2-state");
         let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("EC2 state store");
         write_issue_ec2_state(&store, &fixture);
         store
-            .remove_artifact("runtime-recovery-011-to-014-r2")
+            .remove_artifact("runtime-recovery-011-to-014-r3")
             .expect("remove unsealed recovery helper");
-        let helper = fixture.root.path().join("recover-vnext-011-to-014-r2");
+        let helper = fixture.root.path().join("recover-vnext-011-to-014-r3");
         fs::write(
             &helper,
-            include_bytes!("../tests/fixtures/runtime-recovery-r2/install-vnext"),
+            include_bytes!("../tests/fixtures/runtime-recovery-r3/install-vnext"),
         )
         .expect("recovery helper");
         (fixture, state_dir, helper)
@@ -2510,7 +2567,7 @@ mod tests {
         assert!(
             aws_ec2::store::Store::lock(&state_dir, "x6")
                 .expect("store")
-                .read_artifact("runtime-recovery-011-to-014-r2", 78_058)
+                .read_artifact("runtime-recovery-011-to-014-r3", 97_782)
                 .is_err()
         );
 
@@ -2547,22 +2604,22 @@ mod tests {
         state.verify().expect("sealed state");
         let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
         let sealed = store
-            .read_artifact("runtime-recovery-011-to-014-r2", 78_058)
+            .read_artifact("runtime-recovery-011-to-014-r3", 97_782)
             .expect("sealed helper");
-        assert_eq!(sealed.len(), 78_057);
+        assert_eq!(sealed.len(), 97_781);
         assert_eq!(
             sealed,
-            include_bytes!("../tests/fixtures/runtime-recovery-r2/install-vnext")
+            include_bytes!("../tests/fixtures/runtime-recovery-r3/install-vnext")
         );
         let calls = executor.calls();
         for (id, basename) in [
             (
-                "stage-runtime-recovery-011-to-014-r2",
-                aws_ec2::REMOTE_RUNTIME_RECOVERY_UPLOAD,
+                "stage-runtime-recovery-011-to-014-r3",
+                aws_ec2::REMOTE_RUNTIME_RECOVERY_R3_UPLOAD,
             ),
             (
-                "stage-runtime-attester-011-to-014-r2",
-                aws_ec2::REMOTE_RUNTIME_ATTESTER_UPLOAD,
+                "stage-runtime-attester-011-to-014-r3",
+                aws_ec2::REMOTE_RUNTIME_ATTESTER_R3_UPLOAD,
             ),
         ] {
             let command = calls.iter().find(|command| command.id == id).expect(id);
@@ -2575,17 +2632,17 @@ mod tests {
             );
         }
         for id in [
-            "run-fixed-runtime-recovery-011-to-014-r2",
-            "run-fixed-runtime-attester-011-to-014-r2",
+            "run-fixed-runtime-recovery-011-to-014-r3",
+            "run-fixed-runtime-attester-011-to-014-r3",
         ] {
             let command = calls.iter().find(|command| command.id == id).expect(id);
             assert!(command.mutation);
             assert_eq!(
                 command.argv.last().map(String::as_str),
-                Some(if id == "run-fixed-runtime-recovery-011-to-014-r2" {
-                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/recover-vnext-011-to-014-r2'"
+                Some(if id == "run-fixed-runtime-recovery-011-to-014-r3" {
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/recover-vnext-011-to-014-r3'"
                 } else {
-                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/attest-vnext-011-to-014-r2'"
+                    "'/usr/bin/sudo' '--non-interactive' '/usr/local/libexec/dirextalk/attest-vnext-011-to-014-r3'"
                 })
             );
         }
@@ -2601,64 +2658,64 @@ mod tests {
     fn recover_runtime_accepts_only_exact_pending_effect_classes() {
         for (pending, recovery, attester, expected) in [
             (
-                "stage-runtime-recovery-011-to-014-r2",
+                "stage-runtime-recovery-011-to-014-r3",
                 RuntimeHelperState::Absent,
                 RuntimeHelperState::Installed,
-                "stage-runtime-recovery-011-to-014-r2",
+                "stage-runtime-recovery-011-to-014-r3",
             ),
             (
-                "protect-uploaded-runtime-recovery-011-to-014-r2",
+                "protect-uploaded-runtime-recovery-011-to-014-r3",
                 RuntimeHelperState::Uploaded,
                 RuntimeHelperState::Installed,
-                "protect-uploaded-runtime-recovery-011-to-014-r2",
+                "protect-uploaded-runtime-recovery-011-to-014-r3",
             ),
             (
-                "prepare-atomic-runtime-recovery-011-to-014-r2",
+                "prepare-atomic-runtime-recovery-011-to-014-r3",
                 RuntimeHelperState::Protected,
                 RuntimeHelperState::Installed,
-                "prepare-atomic-runtime-recovery-011-to-014-r2",
+                "prepare-atomic-runtime-recovery-011-to-014-r3",
             ),
             (
-                "activate-runtime-recovery-011-to-014-r2",
+                "activate-runtime-recovery-011-to-014-r3",
                 RuntimeHelperState::Atomic,
                 RuntimeHelperState::Installed,
-                "activate-runtime-recovery-011-to-014-r2",
+                "activate-runtime-recovery-011-to-014-r3",
             ),
             (
-                "activate-runtime-recovery-011-to-014-r2",
+                "activate-runtime-recovery-011-to-014-r3",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Installed,
-                "run-fixed-runtime-recovery-011-to-014-r2",
+                "run-fixed-runtime-recovery-011-to-014-r3",
             ),
             (
-                "stage-runtime-attester-011-to-014-r2",
+                "stage-runtime-attester-011-to-014-r3",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Absent,
-                "stage-runtime-attester-011-to-014-r2",
+                "stage-runtime-attester-011-to-014-r3",
             ),
             (
-                "protect-uploaded-runtime-attester-011-to-014-r2",
+                "protect-uploaded-runtime-attester-011-to-014-r3",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Uploaded,
-                "protect-uploaded-runtime-attester-011-to-014-r2",
+                "protect-uploaded-runtime-attester-011-to-014-r3",
             ),
             (
-                "prepare-atomic-runtime-attester-011-to-014-r2",
+                "prepare-atomic-runtime-attester-011-to-014-r3",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Protected,
-                "prepare-atomic-runtime-attester-011-to-014-r2",
+                "prepare-atomic-runtime-attester-011-to-014-r3",
             ),
             (
-                "activate-runtime-attester-011-to-014-r2",
+                "activate-runtime-attester-011-to-014-r3",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Atomic,
-                "activate-runtime-attester-011-to-014-r2",
+                "activate-runtime-attester-011-to-014-r3",
             ),
             (
-                "activate-runtime-attester-011-to-014-r2",
+                "activate-runtime-attester-011-to-014-r3",
                 RuntimeHelperState::Installed,
                 RuntimeHelperState::Installed,
-                "run-fixed-runtime-attester-011-to-014-r2",
+                "run-fixed-runtime-attester-011-to-014-r3",
             ),
         ] {
             let (fixture, state_dir, helper) = recovery_fixture();
@@ -2725,6 +2782,305 @@ mod tests {
             .is_err()
         );
         assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn recover_runtime_bridges_legacy_r2_run_and_replays_bridge() {
+        for pending in [
+            "run-fixed-runtime-recovery-011-to-014-r2",
+            "bridge-runtime-recovery-r2-to-r3",
+        ] {
+            let (fixture, state_dir, helper) = recovery_fixture();
+            let mut state = fixture.state.clone();
+            state.pending_effect = Some(pending.into());
+            state = state.seal().expect("pending state");
+            aws_ec2::store::Store::lock(&state_dir, "x6")
+                .expect("store")
+                .write(&state)
+                .expect("pending state write");
+            let executor = RuntimeRecoveryExecutor::new(&fixture);
+            aws_ec2::recover_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &helper,
+                true,
+                &executor,
+            )
+            .expect("bridge replay");
+            let calls = executor.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|command| { command.id.ends_with("runtime-recovery-011-to-014-r2") })
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|command| { command.id == "run-fixed-runtime-recovery-011-to-014-r3" })
+            );
+            let final_state = aws_ec2::store::Store::lock(&state_dir, "x6")
+                .expect("store")
+                .read::<Ec2State>()
+                .expect("state read")
+                .expect("final state");
+            assert_eq!(final_state.pending_effect, None);
+        }
+    }
+
+    #[test]
+    fn standalone_attestation_and_binding_reject_pending_recovery_effects() {
+        let pending_effects = [
+            "run-fixed-runtime-recovery-011-to-014-r2",
+            "bridge-runtime-recovery-r2-to-r3",
+            "stage-runtime-recovery-011-to-014-r3",
+            "protect-uploaded-runtime-recovery-011-to-014-r3",
+            "prepare-atomic-runtime-recovery-011-to-014-r3",
+            "activate-runtime-recovery-011-to-014-r3",
+            "stage-runtime-attester-011-to-014-r3",
+            "protect-uploaded-runtime-attester-011-to-014-r3",
+            "prepare-atomic-runtime-attester-011-to-014-r3",
+            "activate-runtime-attester-011-to-014-r3",
+            "run-fixed-runtime-recovery-011-to-014-r3",
+            "run-fixed-runtime-attester-011-to-014-r3",
+        ];
+        for pending in pending_effects {
+            let fixture = issue_ec2_fixture();
+            let state_dir = fixture.root.path().join("ec2-state");
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
+            write_issue_ec2_state(&store, &fixture);
+            let mut state = fixture.state.clone();
+            state.pending_effect = Some(pending.into());
+            store
+                .write(&state.seal().expect("pending state"))
+                .expect("state write");
+
+            let attest_executor = RuntimeRecoveryExecutor::new(&fixture);
+            assert!(aws_ec2::attest_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &attest_executor,
+            )
+            .is_err());
+            assert!(attest_executor.calls().is_empty());
+
+            let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding"));
+            let output = fixture.root.path().join("binding.import.json");
+            let issue_executor = IssueReplayExecutor::new(&fixture, None);
+            assert!(
+                issue_ec2(
+                    &fixture.manifest,
+                    &state_dir,
+                    &output,
+                    &binding_store,
+                    &issue_executor,
+                )
+                .is_err()
+            );
+            assert!(issue_executor.calls().is_empty());
+            assert!(!state_dir.join("client-binding.request").exists());
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn recovery_quiet_effects_retain_pending_on_unexpected_output() {
+        for (status, stdout, stderr) in [(1, "", ""), (0, "unexpected", ""), (0, "", "unexpected")]
+        {
+            let (fixture, state_dir, helper) = recovery_fixture();
+            let executor = RuntimeRecoveryExecutor::new(&fixture).with_fixed_output(
+                "run-fixed-runtime-recovery-011-to-014-r3",
+                status,
+                stdout,
+                stderr,
+            );
+            assert!(
+                aws_ec2::recover_runtime_011_to_014(
+                    &fixture.manifest,
+                    &state_dir,
+                    &helper,
+                    true,
+                    &executor,
+                )
+                .is_err()
+            );
+            let state: Ec2State =
+                serde_json::from_slice(&fs::read(state_dir.join("x6.json")).expect("state bytes"))
+                    .expect("state");
+            assert_eq!(
+                state.pending_effect.as_deref(),
+                Some("run-fixed-runtime-recovery-011-to-014-r3")
+            );
+            assert!(
+                !executor
+                    .calls()
+                    .iter()
+                    .any(|command| command.id == "inspect-runtime-attestation")
+            );
+        }
+
+        let (fixture, state_dir, helper) = recovery_fixture();
+        let executor = RuntimeRecoveryExecutor::new(&fixture).with_fixed_output(
+            "run-fixed-runtime-attester-011-to-014-r3",
+            0,
+            "unexpected",
+            "",
+        );
+        assert!(
+            aws_ec2::recover_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &helper,
+                true,
+                &executor,
+            )
+            .is_err()
+        );
+        let state = aws_ec2::store::Store::lock(&state_dir, "x6")
+            .expect("store")
+            .read::<Ec2State>()
+            .expect("state read")
+            .expect("state");
+        assert_eq!(
+            state.pending_effect.as_deref(),
+            Some("run-fixed-runtime-attester-011-to-014-r3")
+        );
+        assert!(
+            !executor
+                .calls()
+                .iter()
+                .any(|command| command.id == "read-runtime-attestation")
+        );
+    }
+
+    #[test]
+    fn binding_quiet_attester_effect_rejects_before_binding_effects() {
+        for (status, stdout, stderr) in [(1, "", ""), (0, "unexpected", ""), (0, "", "unexpected")]
+        {
+            let fixture = issue_ec2_fixture();
+            let state_dir = fixture.root.path().join("ec2-state");
+            let store = aws_ec2::store::Store::lock(&state_dir, "x6").expect("store");
+            write_issue_ec2_state(&store, &fixture);
+            drop(store);
+            let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding"));
+            let output = fixture.root.path().join("binding.import.json");
+            let executor = IssueReplayExecutor::new(&fixture, None).with_fixed_output(
+                "run-fixed-runtime-attester-011-to-014-r3",
+                status,
+                stdout,
+                stderr,
+            );
+            assert!(
+                issue_ec2(
+                    &fixture.manifest,
+                    &state_dir,
+                    &output,
+                    &binding_store,
+                    &executor,
+                )
+                .is_err()
+            );
+            let state: Ec2State =
+                serde_json::from_slice(&fs::read(state_dir.join("x6.json")).expect("state bytes"))
+                    .expect("state");
+            assert_eq!(
+                state.pending_effect.as_deref(),
+                Some("run-fixed-runtime-attester-011-to-014-r3")
+            );
+            let calls = executor.calls();
+            assert!(!calls.iter().any(|id| id == "read-runtime-attestation"));
+            assert!(!calls.iter().any(|id| id == "inspect-client-binding-root"));
+            assert!(!state_dir.join("client-binding.request").exists());
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn attester_pending_survives_post_effect_evidence_failures() {
+        for (bad_attestation, bad_receipt) in [(true, false), (false, true)] {
+            let (fixture, state_dir, helper) = recovery_fixture();
+            let mut executor = RuntimeRecoveryExecutor::new(&fixture);
+            if bad_attestation {
+                executor.runtime_attestation = " malformed".into();
+            }
+            if bad_receipt {
+                executor.current_receipt = " stale receipt".into();
+            }
+            assert!(
+                aws_ec2::recover_runtime_011_to_014(
+                    &fixture.manifest,
+                    &state_dir,
+                    &helper,
+                    true,
+                    &executor,
+                )
+                .is_err()
+            );
+            let state = aws_ec2::store::Store::lock(&state_dir, "x6")
+                .expect("store")
+                .read::<Ec2State>()
+                .expect("state read")
+                .expect("state");
+            assert_eq!(
+                state.pending_effect.as_deref(),
+                Some("run-fixed-runtime-attester-011-to-014-r3")
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_valid_receipt_retains_attester_pending_and_blocks_reentry() {
+        let (fixture, state_dir, helper) = recovery_fixture();
+        let executor = RuntimeRecoveryExecutor::new(&fixture).with_fixed_output(
+            "read-runtime-attestation-current-receipt",
+            1,
+            &fixture.current_receipt,
+            "",
+        );
+        assert!(
+            aws_ec2::recover_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &helper,
+                true,
+                &executor,
+            )
+            .is_err()
+        );
+        let state: Ec2State =
+            serde_json::from_slice(&fs::read(state_dir.join("x6.json")).expect("state bytes"))
+                .expect("state");
+        assert_eq!(
+            state.pending_effect.as_deref(),
+            Some("run-fixed-runtime-attester-011-to-014-r3")
+        );
+
+        let attestation_executor = RuntimeRecoveryExecutor::new(&fixture);
+        assert!(
+            aws_ec2::attest_runtime_011_to_014(
+                &fixture.manifest,
+                &state_dir,
+                &attestation_executor,
+            )
+            .is_err()
+        );
+        assert!(attestation_executor.calls().is_empty());
+
+        let binding_store = ClientBindingStore::for_test(fixture.root.path().join("binding"));
+        let output = fixture.root.path().join("binding.import.json");
+        let binding_executor = IssueReplayExecutor::new(&fixture, None);
+        assert!(
+            issue_ec2(
+                &fixture.manifest,
+                &state_dir,
+                &output,
+                &binding_store,
+                &binding_executor,
+            )
+            .is_err()
+        );
+        assert!(binding_executor.calls().is_empty());
+        assert!(!state_dir.join("client-binding.request").exists());
+        assert!(!output.exists());
     }
 
     #[test]

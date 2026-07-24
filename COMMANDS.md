@@ -63,12 +63,15 @@ manifest `sha256:<64>` and compare it to the installed immutable
 used to gate `ec2-update`.
 
 `ec2-recover-runtime-011-to-014` admits only the sealed, verified 0.1.1 to
-0.1.4 receipt chain and the reviewed r2 helper bytes. It stages the sealed
-helper only under the fixed `recover-vnext-011-to-014-r2` and
-`attest-vnext-011-to-014-r2` basenames, runs no-argument recovery, then
-requires canonical runtime attestation and an unchanged current receipt.
-Client-binding issuance performs that proof-only attestation before it can
-create a request or remote binding root.
+0.1.4 receipt chain and the reviewed r3 helper bytes from Server commit
+`f51fc1d8a7c701cbc727dbc1bc0931755d9d86b9`. It preserves the legacy r2
+artifact and remote files, and stages the
+r3 helper only under the fixed `recover-vnext-011-to-014-r3` and
+`attest-vnext-011-to-014-r3` basenames. A legacy r2 recovery-run pending effect
+is bridged durably before any r3 remote effect. Recovery runs no-argument r3
+helpers, then requires canonical runtime attestation and an unchanged current
+receipt. Client-binding issuance performs that proof-only r3 attestation before
+it can create a request or remote binding root.
 
 On Windows without Visual C++ Build Tools, use the repository's development
 wrapper, for example `powershell -File scripts\cargo.ps1 test --locked`. It
