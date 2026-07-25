@@ -38,6 +38,8 @@ use crate::{
 
 const MAX_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_MATERIAL_BYTES: u64 = 64 * 1024 * 1024;
+const LOCAL_PROVENANCE_SCHEMA: &str = "dirextalk.local-provenance";
+const LOCAL_PROVENANCE_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 mod test_seams {
@@ -651,8 +653,8 @@ pub fn assemble(
             sha256: artifact_file.sha256.clone(),
         };
         let provenance = LocalProvenanceV1 {
-            schema: "dirextalk.local-provenance".into(),
-            schema_version: 1,
+            schema: LOCAL_PROVENANCE_SCHEMA.into(),
+            schema_version: LOCAL_PROVENANCE_SCHEMA_VERSION,
             component: component.component.clone(),
             release_manifest_sha256: manifest_digest.clone(),
             source_commit: component.source_commit.clone(),
@@ -840,6 +842,8 @@ impl ReleaseMaterialsV1 {
             let provenance_bytes = files[&provenance_path];
             if strict_json::canonical_bytes(&serde_json::to_value(&provenance)?, true)?
                 != provenance_bytes
+                || provenance.schema != LOCAL_PROVENANCE_SCHEMA
+                || provenance.schema_version != LOCAL_PROVENANCE_SCHEMA_VERSION
                 || provenance.component != component.component
                 || provenance.source_commit != component.source_commit
                 || !commit(&provenance.source_tree)
@@ -1706,6 +1710,74 @@ mod tests {
         assemble(&inputs_path, &manifest_path, &roots, &output).expect("assemble");
         fs::remove_file(output.join("release-inputs.json")).expect("remove snapshot");
         assert!(ReleaseMaterialsV1::validate_dir(&output).is_err());
+    }
+
+    fn assert_recanonicalized_provenance_schema_tamper_rejected(
+        field: &str,
+        value: serde_json::Value,
+    ) {
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let output = root.path().join("output");
+        assemble(&inputs_path, &manifest_path, &roots, &output).expect("assemble");
+        let path = output.join("provenance/server.json");
+        let mut provenance =
+            strict_json::parse_value(&fs::read(&path).expect("provenance")).expect("parse");
+        provenance
+            .as_object_mut()
+            .expect("object")
+            .insert(field.to_owned(), value);
+        let provenance_bytes = strict_json::canonical_bytes(&provenance, true).expect("canonical");
+        fs::write(&path, &provenance_bytes).expect("provenance");
+        let evidence_path = output.join("release-evidence.json");
+        let mut evidence =
+            ReleaseEvidenceV1::from_bytes(&fs::read(&evidence_path).expect("evidence"))
+                .expect("evidence");
+        let attestation = evidence
+            .attestations
+            .iter_mut()
+            .find(|entry| entry.component == "server")
+            .expect("attestation");
+        attestation.size = provenance_bytes.len() as u64;
+        attestation.sha256 = digest(&provenance_bytes);
+        fs::write(
+            &evidence_path,
+            evidence.canonical_bytes().expect("canonical evidence"),
+        )
+        .expect("evidence");
+        let fd = open(
+            &output,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .expect("fd");
+        let inventory = validated_inventory_fd(fd.as_fd()).expect("inventory");
+        let checksums = checksum_manifest(
+            &inventory
+                .files
+                .iter()
+                .filter(|entry| entry.relative != Path::new("SHA256SUMS"))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        fs::write(output.join("SHA256SUMS"), checksums).expect("sums");
+        assert!(ReleaseMaterialsV1::validate_dir(&output).is_err());
+    }
+
+    #[test]
+    fn recanonicalized_provenance_schema_tamper_is_rejected() {
+        assert_recanonicalized_provenance_schema_tamper_rejected(
+            "schema",
+            serde_json::json!("other"),
+        );
+    }
+
+    #[test]
+    fn recanonicalized_provenance_version_tamper_is_rejected() {
+        assert_recanonicalized_provenance_schema_tamper_rejected(
+            "schema_version",
+            serde_json::json!(2),
+        );
     }
 
     #[test]
