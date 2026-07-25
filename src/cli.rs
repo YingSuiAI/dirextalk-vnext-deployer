@@ -59,6 +59,8 @@ enum Commands {
         source_roots: Vec<String>,
     },
     /// Atomically bind pre-generated local release material into immutable evidence.
+    /// Run this on a dedicated release-operator UID: other principals must not
+    /// be able to write any component of the output parent path.
     #[command(name = "release-evidence-assemble")]
     ReleaseEvidenceAssemble {
         #[arg(long)]

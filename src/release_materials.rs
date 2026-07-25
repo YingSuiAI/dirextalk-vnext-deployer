@@ -5,7 +5,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::Write,
+    io::{Read, Write},
     os::{
         fd::{AsFd, OwnedFd},
         unix::fs::MetadataExt,
@@ -83,8 +83,7 @@ mod test_seams {
 struct Stage {
     parent_path: PathBuf,
     parent_fd: OwnedFd,
-    parent_dev: u64,
-    parent_ino: u64,
+    parent_chain: Vec<DirectoryIdentity>,
     stage_name: String,
     root_fd: OwnedFd,
     root_dev: u64,
@@ -92,15 +91,108 @@ struct Stage {
     _lock_file: File,
     published: bool,
 }
-impl Stage {
-    #[allow(clippy::needless_continue)]
-    fn create(parent: &Path) -> Result<Self> {
-        let parent_fd = open(
-            parent,
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectoryIdentity {
+    relative: PathBuf,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    nlink: u64,
+}
+
+/// Owns a just-created staging name until its inode has been retained by
+/// `Stage`.  This deliberately starts at the `mkdirat` success boundary: no
+/// initialization error can strand a visible staging directory.
+struct InitStage<'a> {
+    parent: &'a OwnedFd,
+    name: String,
+    created: Option<rustix::fs::Stat>,
+    armed: bool,
+}
+impl InitStage<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for InitStage<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(created) = &self.created {
+            cleanup_created_stage(self.parent, &self.name, created);
+        } else {
+            // The namespace was checked owner-only before mkdirat.  Until an
+            // identity is available, only remove the exact empty name we made.
+            let _ = unlinkat(self.parent, &self.name, AtFlags::REMOVEDIR);
+        }
+    }
+}
+
+fn open_trusted_parent(parent: &Path) -> Result<(OwnedFd, Vec<DirectoryIdentity>)> {
+    let absolute = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(io_error(parent))?
+            .join(parent)
+    };
+    let root = open(
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+    let mut directory = root;
+    let mut relative = PathBuf::from("/");
+    let mut chain = Vec::new();
+    for component in absolute.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(ReleaseError::InvalidPath(parent.to_path_buf()));
+            }
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| ReleaseError::InvalidPath(parent.to_path_buf()))?;
+        directory = openat(
+            &directory,
+            name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )
         .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        let stat =
+            fstat(&directory).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        if stat.st_mode & 0o022 != 0 {
+            return Err(contract(
+                "output path components must not be group/other writable",
+            ));
+        }
+        relative.push(name);
+        chain.push(DirectoryIdentity {
+            relative: relative.clone(),
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            mode: stat.st_mode,
+            nlink: stat.st_nlink,
+        });
+    }
+    Ok((directory, chain))
+}
+
+fn trusted_parent_matches(parent: &Path, expected: &[DirectoryIdentity]) -> Result<bool> {
+    let (fd, actual) = open_trusted_parent(parent)?;
+    let _ = fd;
+    Ok(actual == expected)
+}
+impl Stage {
+    #[allow(clippy::needless_continue)]
+    fn create(parent: &Path) -> Result<Self> {
+        let (parent_fd, parent_chain) = open_trusted_parent(parent)?;
         let parent_stat =
             fstat(&parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
         if parent_stat.st_uid != rustix::process::geteuid().as_raw()
@@ -139,13 +231,19 @@ impl Stage {
             let stage_name = format!(".release-evidence-{}", uuid::Uuid::new_v4());
             match mkdirat(&parent_fd, &stage_name, Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
+                    let mut init = InitStage {
+                        parent: &parent_fd,
+                        name: stage_name.clone(),
+                        created: None,
+                        armed: true,
+                    };
                     let created = statat(&parent_fd, &stage_name, AtFlags::SYMLINK_NOFOLLOW)
                         .map_err(|error| {
                             io_error(parent.join(&stage_name))(std::io::Error::from(error))
                         })?;
+                    init.created = Some(created);
                     #[cfg(test)]
                     if test_seams::should_fail_stage_init() {
-                        cleanup_created_stage(&parent_fd, &stage_name, &created);
                         return Err(contract("injected staging initialization failure"));
                     }
                     let root_fd = openat(
@@ -155,11 +253,9 @@ impl Stage {
                         Mode::empty(),
                     )
                     .map_err(|error| {
-                        cleanup_created_stage(&parent_fd, &stage_name, &created);
                         io_error(parent.join(&stage_name))(std::io::Error::from(error))
                     })?;
                     if let Err(error) = fchmod(&root_fd, Mode::from_raw_mode(0o700)) {
-                        cleanup_created_stage(&parent_fd, &stage_name, &created);
                         return Err(io_error(parent.join(&stage_name))(std::io::Error::from(
                             error,
                         )));
@@ -168,14 +264,14 @@ impl Stage {
                         io_error(parent.join(&stage_name))(std::io::Error::from(error))
                     })?;
                     if root_stat.st_dev != created.st_dev || root_stat.st_ino != created.st_ino {
-                        cleanup_created_stage(&parent_fd, &stage_name, &created);
                         return Err(contract("staging inode changed during initialization"));
                     }
+                    init.disarm();
+                    drop(init);
                     return Ok(Self {
                         parent_path: parent.to_path_buf(),
                         parent_fd,
-                        parent_dev: parent_stat.st_dev,
-                        parent_ino: parent_stat.st_ino,
+                        parent_chain,
                         stage_name,
                         root_fd,
                         root_dev: root_stat.st_dev,
@@ -199,15 +295,7 @@ impl Stage {
             .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?;
         #[cfg(test)]
         test_seams::before_parent_reresolve();
-        let reopened = open(
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
-        let reopened_stat =
-            fstat(&reopened).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
-        if reopened_stat.st_dev != self.parent_dev || reopened_stat.st_ino != self.parent_ino {
+        if !trusted_parent_matches(parent, &self.parent_chain)? {
             return Err(contract("output parent changed during assembly"));
         }
         if !self.stage_matches_root()? {
@@ -244,17 +332,7 @@ impl Stage {
             return Err(contract("published output does not match staged root"));
         }
         validate_inventory_fd(output_fd.as_fd(), inventory)?;
-        let parent_after = open(
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
-        let parent_after_stat =
-            fstat(&parent_after).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
-        if parent_after_stat.st_dev != self.parent_dev
-            || parent_after_stat.st_ino != self.parent_ino
-        {
+        if !trusted_parent_matches(parent, &self.parent_chain)? {
             return Err(contract("output parent changed after publication"));
         }
         fsync(&self.parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
@@ -655,30 +733,13 @@ struct InventoryEntry {
 
 struct ValidatedInventory {
     files: Vec<InventoryEntry>,
-    directories: BTreeSet<PathBuf>,
+    directories: BTreeSet<DirectoryIdentity>,
 }
 
 fn validated_inventory_fd(root: impl AsFd) -> Result<ValidatedInventory> {
     let mut files = Vec::new();
     collect_files_fd(root.as_fd(), PathBuf::new(), &mut files)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let files: Vec<InventoryEntry> = files
-        .into_iter()
-        .map(|(relative, bytes, identity)| {
-            let stat = statat(&root, &relative, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
-            Ok(InventoryEntry {
-                relative,
-                bytes,
-                identity,
-                nlink: stat.st_nlink,
-                mode: stat.st_mode,
-                size: stat.st_size.cast_unsigned(),
-                mtime: stat.st_mtime,
-                mtime_nsec: stat.st_mtime_nsec,
-            })
-        })
-        .collect::<Result<_>>()?;
+    files.sort_by(|a, b| a.relative.cmp(&b.relative));
     let mut directories = BTreeSet::new();
     collect_directories_fd(root.as_fd(), PathBuf::new(), &mut directories)?;
     Ok(ValidatedInventory { files, directories })
@@ -755,7 +816,7 @@ fn validate_original_inventory(
 fn collect_directories_fd(
     root: impl AsFd,
     current: PathBuf,
-    result: &mut BTreeSet<PathBuf>,
+    result: &mut BTreeSet<DirectoryIdentity>,
 ) -> Result<()> {
     let scan = openat(
         root.as_fd(),
@@ -787,7 +848,6 @@ fn collect_directories_fd(
             } else {
                 current.join(name)
             };
-            result.insert(relative.clone());
             let child = openat(
                 &scan,
                 name,
@@ -795,6 +855,18 @@ fn collect_directories_fd(
                 Mode::empty(),
             )
             .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+            let opened = fstat(&child)
+                .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+            if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino {
+                return Err(contract("staging directory changed while scanning"));
+            }
+            result.insert(DirectoryIdentity {
+                relative: relative.clone(),
+                device: opened.st_dev,
+                inode: opened.st_ino,
+                mode: opened.st_mode,
+                nlink: opened.st_nlink,
+            });
             collect_directories_fd(&child, relative, result)?;
         }
     }
@@ -824,7 +896,7 @@ fn checksum_manifest(files: &[InventoryEntry]) -> Vec<u8> {
 fn collect_files_fd(
     root: impl AsFd,
     current: PathBuf,
-    result: &mut Vec<(PathBuf, Vec<u8>, FileIdentity)>,
+    result: &mut Vec<InventoryEntry>,
 ) -> Result<()> {
     let scan_root = openat(
         root.as_fd(),
@@ -868,14 +940,54 @@ fn collect_files_fd(
                 collect_files_fd(&child, relative, result)?;
             }
             FileType::RegularFile => {
-                let (bytes, identity) = crate::digest::read_regular_file_fd_relative_descriptor(
-                    root.as_fd(),
-                    Path::new(name_str),
-                    stat.st_size.cast_unsigned(),
-                    None,
-                    MAX_MATERIAL_BYTES,
-                )?;
-                result.push((relative, bytes, identity));
+                let fd = openat(
+                    root,
+                    name_str,
+                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
+                let before =
+                    fstat(&fd).map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
+                if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+                    || before.st_nlink != 1
+                    || before.st_size < 0
+                    || before.st_size.cast_unsigned() > MAX_MATERIAL_BYTES
+                {
+                    return Err(ReleaseError::UnsafeFile(relative));
+                }
+                let mut file = File::from(fd);
+                let mut bytes = Vec::new();
+                Read::by_ref(&mut file)
+                    .take(MAX_MATERIAL_BYTES.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(io_error(&relative))?;
+                let after = fstat(&file)
+                    .map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
+                if before.st_dev != after.st_dev
+                    || before.st_ino != after.st_ino
+                    || before.st_nlink != after.st_nlink
+                    || before.st_mode != after.st_mode
+                    || before.st_size != after.st_size
+                    || before.st_mtime != after.st_mtime
+                    || before.st_mtime_nsec != after.st_mtime_nsec
+                    || bytes.len() as u64 != before.st_size.cast_unsigned()
+                {
+                    return Err(contract("staged file changed while reading"));
+                }
+                result.push(InventoryEntry {
+                    relative,
+                    bytes,
+                    identity: FileIdentity {
+                        device: before.st_dev,
+                        inode: before.st_ino,
+                    },
+                    nlink: before.st_nlink,
+                    mode: before.st_mode,
+                    size: before.st_size.cast_unsigned(),
+                    mtime: before.st_mtime,
+                    mtime_nsec: before.st_mtime_nsec,
+                });
             }
             _ => return Err(ReleaseError::UnsafeFile(relative)),
         }
@@ -1341,6 +1453,89 @@ mod tests {
         crate::digest::set_after_material_read_barrier(None);
         assert!(!output.exists());
         assert_eq!(staging_count(root.path()), 0);
+    }
+
+    fn staged_mutation_after_sha_is_rejected<F>(mutate: F)
+    where
+        F: FnOnce(PathBuf) + Send + 'static,
+    {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let parent = root.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_before_rename(Some(Arc::clone(&barrier)));
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            let stage = fs::read_dir(&parent)
+                .expect("parent")
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name().is_some_and(|name| {
+                        name.to_string_lossy().starts_with(".release-evidence-")
+                    })
+                })
+                .expect("stage");
+            mutate(stage);
+            barrier.wait();
+        });
+        let output = root.path().join("output");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        worker.join().expect("worker");
+        test_seams::set_before_rename(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
+    }
+
+    #[test]
+    fn staged_insertion_after_sha_is_rejected_without_residue() {
+        staged_mutation_after_sha_is_rejected(|stage| {
+            fs::write(stage.join("injected"), b"x").expect("insert");
+        });
+    }
+
+    #[test]
+    fn staged_removal_after_sha_is_rejected_without_residue() {
+        staged_mutation_after_sha_is_rejected(|stage| {
+            fs::remove_file(stage.join("release-evidence.json")).expect("remove");
+        });
+    }
+
+    #[test]
+    fn staged_same_name_replacement_after_sha_is_rejected_without_residue() {
+        staged_mutation_after_sha_is_rejected(|stage| {
+            let path = stage.join("release-evidence.json");
+            fs::rename(&path, stage.join("saved-evidence")).expect("rename");
+            fs::write(path, b"replacement").expect("replace");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_hardlink_after_sha_is_rejected_without_residue() {
+        staged_mutation_after_sha_is_rejected(|stage| {
+            fs::hard_link(stage.join("release-evidence.json"), stage.join("alias")).expect("link");
+        });
+    }
+
+    #[test]
+    fn staged_nonzero_modify_after_sha_is_rejected_without_residue() {
+        staged_mutation_after_sha_is_rejected(|stage| {
+            fs::write(stage.join("release-evidence.json"), b"nonzero replacement").expect("modify");
+        });
+    }
+
+    #[test]
+    fn staged_directory_replacement_after_sha_is_rejected_without_residue() {
+        staged_mutation_after_sha_is_rejected(|stage| {
+            let directory = stage.join("provenance");
+            for entry in fs::read_dir(&directory).expect("dir") {
+                fs::remove_file(entry.expect("entry").path()).expect("file");
+            }
+            fs::remove_dir(&directory).expect("remove dir");
+            fs::create_dir(&directory).expect("replace dir");
+        });
     }
 
     #[test]
