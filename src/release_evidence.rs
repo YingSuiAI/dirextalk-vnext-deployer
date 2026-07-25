@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 use crate::{
     digest::{FileIdentity, read_regular_file_descriptor, verify_regular_file_descriptor},
     error::{ReleaseError, Result, io_error},
-    manifest::LoadedManifest,
+    manifest::{LoadedManifest, ReleaseTarget},
     source::verify_source_root,
     strict_json,
 };
@@ -368,17 +368,13 @@ impl ReleaseEvidenceV1 {
             }
         }
         let mut covered_targets: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut covered_server_platforms = BTreeSet::new();
         for component in &self.components {
             for component_target in component_targets(component) {
-                let target = manifest.manifest.targets.iter().find(|target| {
-                    target.id == component_target
-                        || format!("{}-{}", target.goos, target.goarch) == component_target
-                        || format!("{}-{}", target.node_platform, target.node_arch)
-                            == component_target
-                        || target.rust_target == component_target
-                });
+                let target = manifest_target_for(&manifest.manifest.targets, component_target)?;
                 if let Some(target) = target {
-                    if let Some(toolchain) = &target.rust_toolchain
+                    if component.component == "deployer"
+                        && let Some(toolchain) = &target.rust_toolchain
                         && component.toolchain != *toolchain
                     {
                         return Err(contract(
@@ -389,6 +385,16 @@ impl ReleaseEvidenceV1 {
                         .entry(component.component.as_str())
                         .or_default()
                         .insert(target.id.as_str());
+                    if component.component == "server" {
+                        let platform = format!("{}/{}", target.goos, target.goarch);
+                        if manifest.manifest.server.platforms.contains(&platform) {
+                            covered_server_platforms.insert(platform);
+                        } else {
+                            return Err(contract(
+                                "release evidence server target is not a declared server platform",
+                            ));
+                        }
+                    }
                     continue;
                 }
                 if component.component == "server"
@@ -399,6 +405,7 @@ impl ReleaseEvidenceV1 {
                         .iter()
                         .any(|platform| platform.replace('/', "-") == component_target)
                 {
+                    covered_server_platforms.insert(component_target.replace('-', "/"));
                     continue;
                 }
                 return Err(contract(
@@ -424,21 +431,21 @@ impl ReleaseEvidenceV1 {
                 )));
             }
         }
-        let server_expected: BTreeSet<_> = manifest
-            .manifest
-            .targets
-            .iter()
-            .filter(|target| {
-                manifest
-                    .manifest
-                    .server
-                    .platforms
-                    .iter()
-                    .any(|platform| platform == &format!("{}/{}", target.goos, target.goarch))
-            })
-            .map(|target| target.id.as_str())
-            .collect();
-        if covered_targets.get("server").cloned().unwrap_or_default() != server_expected {
+        let server_expected: BTreeSet<_> =
+            manifest.manifest.server.platforms.iter().cloned().collect();
+        for platform in &server_expected {
+            if !manifest
+                .manifest
+                .targets
+                .iter()
+                .any(|target| platform == &format!("{}/{}", target.goos, target.goarch))
+            {
+                return Err(contract(
+                    "manifest server platform has no mapped release target",
+                ));
+            }
+        }
+        if covered_server_platforms != server_expected {
             return Err(contract(
                 "release evidence server does not cover every server platform target",
             ));
@@ -487,6 +494,16 @@ impl ReleaseEvidenceV1 {
             }
             validate_lower_token(&component.component, "component")?;
             validate_lower_token(&component.target, "target")?;
+            if !component.targets.is_empty()
+                && !component
+                    .targets
+                    .iter()
+                    .any(|target| target == &component.target)
+            {
+                return Err(contract(
+                    "component.target must be included in component.targets",
+                ));
+            }
             let mut target_values = BTreeSet::new();
             for target in component_targets(component) {
                 validate_lower_token(target, "target")?;
@@ -621,6 +638,28 @@ fn component_targets(component: &EvidenceComponent) -> Vec<&str> {
         vec![component.target.as_str()]
     } else {
         component.targets.iter().map(String::as_str).collect()
+    }
+}
+
+fn manifest_target_for<'a>(
+    targets: &'a [ReleaseTarget],
+    value: &str,
+) -> Result<Option<&'a ReleaseTarget>> {
+    if let Some(target) = targets.iter().find(|target| target.id == value) {
+        return Ok(Some(target));
+    }
+    let matches: Vec<_> = targets
+        .iter()
+        .filter(|target| {
+            format!("{}-{}", target.goos, target.goarch) == value
+                || format!("{}-{}", target.node_platform, target.node_arch) == value
+                || target.rust_target == value
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [target] => Ok(Some(target)),
+        _ => Err(contract("release evidence target alias is ambiguous")),
     }
 }
 
@@ -960,6 +999,11 @@ mod tests {
         let manifest_path = manifest_root.path().join("release.json");
         for component in &mut evidence.components {
             component.targets = vec!["linux-amd64".into(), "linux-arm64".into()];
+            component.toolchain = if component.component == "deployer" {
+                "rust-linux".into()
+            } else {
+                "go-or-android".into()
+            };
         }
         fs::write(
             &manifest_path,
@@ -969,7 +1013,7 @@ mod tests {
                 "server": {"repository": "server", "dockerfile": "docker/release/Dockerfile", "image": "dirextalk/vent", "platforms": ["linux/amd64", "linux/arm64"]},
                 "deployer": {"repository": "deployer", "package": "dirextalk-vnext-deployer", "binary": "dirextalk-vnext-deployer"},
                 "connector": {"repository": "connector", "module": "./cmd/dirextalk-agent-connector", "binary": "dirextalk-agent-connector"},
-                "targets": [{"id": "linux-x64", "rust_target": "x86_64-unknown-linux-gnu", "goos": "linux", "goarch": "amd64", "node_platform": "linux", "node_arch": "x64", "archive": "tar_gz"}, {"id": "linux-arm64", "rust_target": "aarch64-unknown-linux-gnu", "goos": "linux", "goarch": "arm64", "node_platform": "linux", "node_arch": "arm64", "archive": "tar_gz"}],
+                "targets": [{"id": "linux-x64", "rust_target": "x86_64-unknown-linux-gnu", "rust_toolchain": "rust-linux", "goos": "linux", "goarch": "amd64", "node_platform": "linux", "node_arch": "x64", "archive": "tar_gz"}, {"id": "linux-arm64", "rust_target": "aarch64-unknown-linux-gnu", "goos": "linux", "goarch": "arm64", "node_platform": "linux", "node_arch": "arm64", "archive": "tar_gz"}],
                 "npm": {"package": "@dirextalk/vnext-deployer", "access": "public"},
                 "github": {"repository": "YingSuiAI/dirextalk-vnext-deployer", "tag_prefix": "v"}
             }))
@@ -980,11 +1024,46 @@ mod tests {
         evidence
             .cross_check_manifest(&manifest)
             .expect("overlapping facts match");
+        let mut contradictory = evidence.clone();
+        contradictory.components[0].targets = vec!["linux-arm64".into()];
+        assert!(contradictory.validate().is_err());
+        let mut only_amd64 = evidence.clone();
+        only_amd64
+            .components
+            .iter_mut()
+            .find(|component| component.component == "server")
+            .expect("server")
+            .targets = vec!["linux-amd64".into()];
+        assert!(only_amd64.cross_check_manifest(&manifest).is_err());
         evidence.release.source_date_epoch = 2;
         assert!(evidence.cross_check_manifest(&manifest).is_err());
         evidence.release.source_date_epoch = 1;
         evidence.components[0].targets = vec!["windows-x64".into()];
         assert!(evidence.cross_check_manifest(&manifest).is_err());
         drop(evidence_root);
+    }
+
+    #[test]
+    fn target_alias_collision_is_rejected_but_canonical_id_wins() {
+        let make = |id: &str| ReleaseTarget {
+            id: id.into(),
+            rust_target: "shared-rust-target".into(),
+            rust_toolchain: None,
+            rust_native: false,
+            goos: "linux".into(),
+            goarch: if id == "linux-x64" { "amd64" } else { "arm64" }.into(),
+            node_platform: "linux".into(),
+            node_arch: if id == "linux-x64" { "x64" } else { "arm64" }.into(),
+            archive: crate::manifest::ArchiveKind::TarGz,
+        };
+        let targets = vec![make("linux-x64"), make("linux-arm64")];
+        assert_eq!(
+            manifest_target_for(&targets, "linux-x64")
+                .expect("canonical id")
+                .expect("target")
+                .id,
+            "linux-x64"
+        );
+        assert!(manifest_target_for(&targets, "shared-rust-target").is_err());
     }
 }

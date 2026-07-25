@@ -40,8 +40,10 @@ contacts a network or invokes a publication command. Attestation references
 are DSSE, in-toto, SLSA, or detached-signature evidence files bound by local
 digest; cryptographic signatures are not claimed or verified here. When
 `--source-root` is supplied, validation takes a cooperative repository-local
-lock and compares HEAD, HEAD tree, index digest/size, and clean status before
-and after validation. This detects cooperating same-user mutations;
+lock at `.git/dirextalk-release-evidence.lock` (created if absent; the empty
+lock file persists under `.git`) and compares HEAD, HEAD tree, index
+digest/size, and clean status before and after validation. This detects
+cooperating same-user mutations;
 non-cooperating filesystem writers remain outside the lock's guarantee.
 
 `deployment-connector-claim` is the root-only, local prerequisite for

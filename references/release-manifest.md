@@ -105,8 +105,11 @@ checks their path, size and digest and makes no cryptographic-verification or
 network-access claim. `--manifest` cross-checks release version and any source
 commits pinned by the existing release manifest. Repeated `--source-root
 component=path` arguments additionally acquire a cooperative repository-local
-lock and require an unchanged HEAD/tree/index/status snapshot for the whole
-validation. This protects cooperating same-user mutations; writers that do
+lock at `.git/dirextalk-release-evidence.lock` (creating and persistently
+retaining that empty file under `.git`) and require an unchanged
+HEAD/tree/index/status snapshot for the whole validation. This is the one
+local lock-file side effect; evidence, artifacts, and Git contents remain
+otherwise read-only. It protects cooperating same-user mutations; writers that do
 not take the lock are detected by the before/after snapshot when observable,
 but are not prevented during the read. The command is read-only and does not
 publish or invoke remote commands. Non-Unix hosts fail closed with an
