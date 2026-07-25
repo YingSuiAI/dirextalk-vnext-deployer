@@ -411,6 +411,7 @@ pub struct ReleaseInputsV1 {
 pub struct ReleaseInputComponent {
     pub component: String,
     pub source_commit: String,
+    pub source_tree: String,
     pub targets: Vec<String>,
     pub toolchain: String,
     pub build_recipe: InputFile,
@@ -498,7 +499,10 @@ impl ReleaseInputsV1 {
             token(&component.component)?;
             token(&component.toolchain)?;
             token(&component.artifact.identity)?;
-            if !commit(&component.source_commit) || component.targets.is_empty() {
+            if !commit(&component.source_commit)
+                || !commit(&component.source_tree)
+                || component.targets.is_empty()
+            {
                 return Err(contract("source commit or targets are invalid"));
             }
             let mut targets = BTreeSet::new();
@@ -565,6 +569,9 @@ pub fn assemble(
             .ok_or_else(|| contract("missing source root"))?;
         let guard = SourceEvidenceGuard::begin(root)?;
         guard.verify_expected(&component.source_commit)?;
+        if guard.head_tree() != component.source_tree {
+            return Err(contract("source tree mismatches release inputs"));
+        }
         guards.push((component.component.as_str(), guard));
     }
     let parent = output
@@ -602,13 +609,6 @@ pub fn assemble(
     let mut components = Vec::new();
     let mut attestations = Vec::new();
     for component in &inputs.components {
-        let tree = guards
-            .iter()
-            .find(|(name, _)| *name == component.component)
-            .ok_or_else(|| contract("missing source guard"))?
-            .1
-            .head_tree()
-            .to_owned();
         let recipe = copy_material(
             &stage,
             input_root,
@@ -656,7 +656,7 @@ pub fn assemble(
             component: component.component.clone(),
             release_manifest_sha256: manifest_digest.clone(),
             source_commit: component.source_commit.clone(),
-            source_tree: tree,
+            source_tree: component.source_tree.clone(),
             targets: component.targets.clone(),
             toolchain: component.toolchain.clone(),
             build_recipe: recipe,
@@ -843,6 +843,7 @@ impl ReleaseMaterialsV1 {
                 || provenance.component != component.component
                 || provenance.source_commit != component.source_commit
                 || !commit(&provenance.source_tree)
+                || provenance.source_tree != input.source_tree
                 || provenance.targets != input.targets
                 || provenance.toolchain != component.toolchain
                 || provenance.release_manifest_sha256 != manifest_digest
@@ -1487,6 +1488,7 @@ mod tests {
                 .map(|component| ReleaseInputComponent {
                     component: (*component).into(),
                     source_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    source_tree: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                     targets: vec!["linux-amd64".into()],
                     toolchain: "stable-1.97.0".into(),
                     build_recipe: InputFile {
@@ -1549,7 +1551,7 @@ mod tests {
                 .success()
         );
     }
-    fn repository(root: &Path, name: &str) -> (PathBuf, String) {
+    fn repository(root: &Path, name: &str) -> (PathBuf, String, String) {
         let path = root.join(name);
         fs::create_dir(&path).expect("repo");
         git(&path, &["init", "-q"]);
@@ -1567,8 +1569,19 @@ mod tests {
             .args(["rev-parse", "HEAD"])
             .output()
             .expect("head");
+        let commit = String::from_utf8(output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .expect("tree");
         (
             path,
+            commit,
             String::from_utf8(output.stdout)
                 .expect("utf8")
                 .trim()
@@ -1580,14 +1593,17 @@ mod tests {
     ) -> (PathBuf, PathBuf, BTreeMap<String, PathBuf>, ReleaseInputsV1) {
         let mut roots = BTreeMap::new();
         let mut commits = BTreeMap::new();
+        let mut trees = BTreeMap::new();
         for component in REQUIRED_RELEASE_COMPONENTS {
-            let (path, commit) = repository(root, &format!("repo-{component}"));
+            let (path, commit, tree) = repository(root, &format!("repo-{component}"));
             roots.insert((*component).into(), path);
             commits.insert(*component, commit);
+            trees.insert(*component, tree);
         }
         let mut fixture = inputs();
         for component in &mut fixture.components {
             component.source_commit = commits[component.component.as_str()].clone();
+            component.source_tree = trees[component.component.as_str()].clone();
             component.targets = if component.component == "server" {
                 vec!["linux-amd64".into()]
             } else {
@@ -1690,6 +1706,18 @@ mod tests {
         assemble(&inputs_path, &manifest_path, &roots, &output).expect("assemble");
         fs::remove_file(output.join("release-inputs.json")).expect("remove snapshot");
         assert!(ReleaseMaterialsV1::validate_dir(&output).is_err());
+    }
+
+    #[test]
+    fn wrong_input_source_tree_rejects_before_staging() {
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, mut fixture) = assembly_fixture(root.path());
+        fixture.components[0].source_tree = "b".repeat(40);
+        fs::write(&inputs_path, fixture.canonical_bytes().expect("inputs")).expect("rewrite");
+        let output = root.path().join("output");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
     }
 
     #[test]
