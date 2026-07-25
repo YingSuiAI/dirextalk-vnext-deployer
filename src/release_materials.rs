@@ -596,10 +596,11 @@ pub fn assemble(
     // Re-open every staged member through the existing no-follow validator
     // before the checksums and atomic publication make the directory visible.
     evidence.validate_files_fd(stage.root_fd.as_fd())?;
-    let inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
-    let checksums = checksum_manifest(&inventory.files);
+    let original_inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
+    let checksums = checksum_manifest(&original_inventory.files);
     stage.write_new(Path::new("SHA256SUMS"), &checksums)?;
     let inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
+    validate_original_inventory(&original_inventory, &inventory, &checksums)?;
     validate_inventory_fd(stage.root_fd.as_fd(), &inventory)?;
     sync_tree_fd(stage.root_fd.as_fd())?;
     for (_, guard) in guards {
@@ -700,6 +701,49 @@ fn validate_inventory_fd(root: impl AsFd, expected: &ValidatedInventory) -> Resu
             })
     {
         return Err(contract("staged inventory changed during publication"));
+    }
+    Ok(())
+}
+
+fn validate_original_inventory(
+    original: &ValidatedInventory,
+    final_inventory: &ValidatedInventory,
+    checksums: &[u8],
+) -> Result<()> {
+    if final_inventory.directories != original.directories
+        || final_inventory.files.len() != original.files.len() + 1
+    {
+        return Err(contract(
+            "final inventory differs from original release set",
+        ));
+    }
+    for (actual, expected) in final_inventory
+        .files
+        .iter()
+        .filter(|entry| entry.relative != Path::new("SHA256SUMS"))
+        .zip(&original.files)
+    {
+        if actual.relative != expected.relative
+            || actual.identity != expected.identity
+            || actual.nlink != expected.nlink
+            || actual.mode != expected.mode
+            || actual.size != expected.size
+            || actual.mtime != expected.mtime
+            || actual.mtime_nsec != expected.mtime_nsec
+            || digest(&actual.bytes) != digest(&expected.bytes)
+        {
+            return Err(contract("original release inventory changed"));
+        }
+    }
+    let Some(checksum) = final_inventory
+        .files
+        .iter()
+        .find(|entry| entry.relative == Path::new("SHA256SUMS"))
+    else {
+        return Err(contract("SHA256SUMS is missing from final inventory"));
+    };
+    if checksum.bytes != checksums {
+        return Err(contract("SHA256SUMS does not match original inventory"));
     }
     Ok(())
 }
