@@ -48,6 +48,17 @@ The image repository, npm package, GitHub repository, target matrix, version,
 and source-date epoch are configurable in the release manifest. The example
 uses `dirextalk/vent`; no `latest` tag is generated.
 
+`release-inputs-compose` joins exactly five canonical
+`dirextalk.release-input-fragment` v1 files into the directory consumed by
+`release-evidence-assemble`. It resolves each fragment's material paths
+relative to its parent through no-follow descriptors, copies fixed component
+role files, and writes canonical `release-inputs.json`. Releases, components,
+targets, paths, regular single-link files, and the staged inventory are checked
+before fsync and atomic no-replace publication; no build, signing, network, or
+arbitrary command is performed. Pass the resulting
+`release-inputs/release-inputs.json` directly to
+`release-evidence-assemble` with the exact source roots.
+
 ## Quick start
 
 ```powershell

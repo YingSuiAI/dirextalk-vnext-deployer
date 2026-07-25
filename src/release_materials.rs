@@ -408,6 +408,44 @@ pub struct ReleaseInputsV1 {
     pub components: Vec<ReleaseInputComponent>,
 }
 
+/// One canonical producer fragment for exactly one release component.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseInputFragmentV1 {
+    pub schema: String,
+    pub schema_version: u32,
+    pub release: EvidenceRelease,
+    pub component: ReleaseInputComponent,
+}
+impl ReleaseInputFragmentV1 {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe, non-canonical, or invalid fragments.
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = read_regular_file_descriptor(path, MAX_INPUT_BYTES)?;
+        let value = strict_json::parse_value(&bytes)?;
+        let fragment: Self = serde_json::from_value(value)?;
+        if fragment.schema != "dirextalk.release-input-fragment" || fragment.schema_version != 1 {
+            return Err(contract("fragment schema/version is unsupported"));
+        }
+        fragment.validate()?;
+        if strict_json::canonical_bytes(&serde_json::to_value(&fragment)?, true)? != bytes {
+            return Err(contract("fragment JSON is not canonical"));
+        }
+        Ok(fragment)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.release.source_date_epoch == 0
+            || semver::Version::parse(&self.release.version).is_err()
+        {
+            return Err(contract("fragment release is invalid"));
+        }
+        validate_input_component(&self.component, &mut BTreeSet::new())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseInputComponent {
@@ -498,37 +536,48 @@ impl ReleaseInputsV1 {
             {
                 return Err(contract("components are incomplete or duplicated"));
             }
-            token(&component.component)?;
-            token(&component.toolchain)?;
-            token(&component.artifact.identity)?;
-            if !commit(&component.source_commit)
-                || !commit(&component.source_tree)
-                || component.targets.is_empty()
-            {
-                return Err(contract("source commit or targets are invalid"));
-            }
-            let mut targets = BTreeSet::new();
-            for target in &component.targets {
-                token(target)?;
-                if !targets.insert(target) {
-                    return Err(contract("duplicate target"));
-                }
-            }
-            for path in [
-                &component.build_recipe.path,
-                &component.artifact.path,
-                &component.sbom.path,
-                &component.third_party_notice.path,
-                &component.license.path,
-            ] {
-                safe_relative(path)?;
-                if !all_paths.insert(path.clone()) {
-                    return Err(contract("input material paths must be unique"));
-                }
-            }
+            validate_input_component(component, &mut all_paths)?;
         }
         Ok(())
     }
+}
+
+fn validate_input_component(
+    component: &ReleaseInputComponent,
+    all_paths: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    if !REQUIRED_RELEASE_COMPONENTS.contains(&component.component.as_str()) {
+        return Err(contract("component is not required"));
+    }
+    token(&component.component)?;
+    token(&component.toolchain)?;
+    token(&component.artifact.identity)?;
+    if !commit(&component.source_commit)
+        || !commit(&component.source_tree)
+        || component.targets.is_empty()
+    {
+        return Err(contract("source commit or targets are invalid"));
+    }
+    let mut targets = BTreeSet::new();
+    for target in &component.targets {
+        token(target)?;
+        if !targets.insert(target) {
+            return Err(contract("duplicate target"));
+        }
+    }
+    for path in [
+        &component.build_recipe.path,
+        &component.artifact.path,
+        &component.sbom.path,
+        &component.third_party_notice.path,
+        &component.license.path,
+    ] {
+        safe_relative(path)?;
+        if !all_paths.insert(path.clone()) {
+            return Err(contract("input material paths must be unique"));
+        }
+    }
+    Ok(())
 }
 
 /// Assemble an immutable directory without invoking a builder, shell, or network.
@@ -722,6 +771,170 @@ pub fn assemble(
     }
     stage.publish(output, &inventory)?;
     Ok(evidence)
+}
+
+/// Compose exactly one producer fragment for each required release component
+/// into a self-contained release-inputs directory. This operation only copies
+/// already-produced material; it never invokes a builder or network.
+///
+/// # Errors
+///
+/// Returns an error for malformed or mismatched fragments, unsafe/changing
+/// material, an existing output, or an atomic publication failure.
+#[allow(clippy::too_many_lines)]
+pub fn compose(fragments: &[PathBuf], output: &Path) -> Result<ReleaseInputsV1> {
+    if fragments.len() != REQUIRED_RELEASE_COMPONENTS.len() {
+        return Err(contract("requires exactly five --fragment inputs"));
+    }
+    let mut loaded = Vec::with_capacity(fragments.len());
+    let mut names = BTreeSet::new();
+    let mut release: Option<EvidenceRelease> = None;
+    for path in fragments {
+        let fragment = ReleaseInputFragmentV1::load(path)?;
+        if !names.insert(fragment.component.component.clone()) {
+            return Err(contract("fragment components are duplicated"));
+        }
+        if let Some(expected) = &release {
+            if expected != &fragment.release {
+                return Err(contract("fragment releases differ"));
+            }
+        } else {
+            release = Some(fragment.release.clone());
+        }
+        loaded.push((path.clone(), fragment));
+    }
+    if names.len() != REQUIRED_RELEASE_COMPONENTS.len()
+        || REQUIRED_RELEASE_COMPONENTS
+            .iter()
+            .any(|name| !names.contains(*name))
+    {
+        return Err(contract("fragments must cover exactly five components"));
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?;
+    ensure_directory(parent)?;
+    let output_candidate = fs::canonicalize(parent).map_err(io_error(parent))?.join(
+        output
+            .file_name()
+            .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?,
+    );
+    for (path, _) in &loaded {
+        if fs::canonicalize(path)
+            .map_err(io_error(path))?
+            .starts_with(&output_candidate)
+        {
+            return Err(contract("fragments must be outside output"));
+        }
+    }
+    let stage = Stage::create(parent)?;
+    if stage.output_exists(output)? {
+        return Err(ReleaseError::OutputNotEmpty(output.to_path_buf()));
+    }
+    let mut identities = BTreeSet::new();
+    let mut components = Vec::with_capacity(loaded.len());
+    for (fragment_path, fragment) in loaded {
+        let input_root = fragment_path
+            .parent()
+            .ok_or_else(|| ReleaseError::InvalidPath(fragment_path.clone()))?;
+        let name = fragment.component.component.clone();
+        let base = format!("components/{name}");
+        let recipe = copy_material(
+            &stage,
+            input_root,
+            &fragment.component.build_recipe.path,
+            &format!("{base}/build-recipe"),
+            &mut identities,
+        )?;
+        let artifact = copy_material(
+            &stage,
+            input_root,
+            &fragment.component.artifact.path,
+            &format!("{base}/artifact"),
+            &mut identities,
+        )?;
+        let sbom = copy_material(
+            &stage,
+            input_root,
+            &fragment.component.sbom.path,
+            &format!("{base}/sbom"),
+            &mut identities,
+        )?;
+        let notice = copy_material(
+            &stage,
+            input_root,
+            &fragment.component.third_party_notice.path,
+            &format!("{base}/third-party-notice"),
+            &mut identities,
+        )?;
+        let license = copy_material(
+            &stage,
+            input_root,
+            &fragment.component.license.path,
+            &format!("{base}/license"),
+            &mut identities,
+        )?;
+        let mut component = fragment.component;
+        component.build_recipe.path = recipe.path;
+        component.artifact.path = artifact.path;
+        component.sbom.path = sbom.path;
+        component.third_party_notice.path = notice.path;
+        component.license.path = license.path;
+        components.push(component);
+    }
+    components.sort_by(|a, b| a.component.cmp(&b.component));
+    let inputs = ReleaseInputsV1 {
+        schema: "dirextalk.release-inputs".into(),
+        schema_version: 1,
+        release: release.ok_or_else(|| contract("missing release"))?,
+        components,
+    };
+    inputs.validate()?;
+    stage.write_new(Path::new("release-inputs.json"), &inputs.canonical_bytes()?)?;
+    let inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
+    validate_composed_inventory(&inventory, &inputs)?;
+    sync_tree_fd(stage.root_fd.as_fd())?;
+    stage.publish(output, &inventory)?;
+    Ok(inputs)
+}
+
+fn validate_composed_inventory(
+    inventory: &ValidatedInventory,
+    inputs: &ReleaseInputsV1,
+) -> Result<()> {
+    let mut expected = BTreeSet::from([PathBuf::from("release-inputs.json")]);
+    for component in &inputs.components {
+        expected.extend([
+            component.build_recipe.path.clone(),
+            component.artifact.path.clone(),
+            component.sbom.path.clone(),
+            component.third_party_notice.path.clone(),
+            component.license.path.clone(),
+        ]);
+    }
+    let actual: BTreeSet<_> = inventory
+        .files
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    if actual != expected {
+        return Err(contract("composed inventory does not match release inputs"));
+    }
+    let expected_directories: BTreeSet<PathBuf> = expected
+        .iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    let actual_directories: BTreeSet<PathBuf> = inventory
+        .directories
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
+    if actual_directories != expected_directories {
+        return Err(contract("composed directory layout is not exact"));
+    }
+    Ok(())
 }
 
 /// Strict read-only verifier for one finalized, self-contained v1 directory.
@@ -1529,6 +1742,97 @@ mod tests {
         )
         .expect("write");
         assert!(ReleaseInputsV1::load(&path).is_err());
+    }
+
+    #[test]
+    fn fragments_compose_to_rewritable_inputs_and_refuse_existing_output() {
+        let root = TempDir::new().expect("temp");
+        let fixture = inputs();
+        let mut fragments = Vec::new();
+        for component in &fixture.components {
+            let name = &component.component;
+            let mut component = component.clone();
+            for (path, bytes) in [
+                (&component.build_recipe.path, b"recipe".as_slice()),
+                (&component.artifact.path, b"artifact".as_slice()),
+                (&component.sbom.path, b"sbom".as_slice()),
+                (&component.third_party_notice.path, b"notice".as_slice()),
+                (&component.license.path, b"license".as_slice()),
+            ] {
+                let full = root.path().join(path);
+                fs::create_dir_all(full.parent().expect("parent")).expect("directories");
+                fs::write(full, bytes).expect("material");
+            }
+            let fragment = ReleaseInputFragmentV1 {
+                schema: "dirextalk.release-input-fragment".into(),
+                schema_version: 1,
+                release: fixture.release.clone(),
+                component: {
+                    component.source_commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+                    component.source_tree = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+                    component
+                },
+            };
+            let path = root.path().join(format!("{name}.json"));
+            fs::write(
+                &path,
+                strict_json::canonical_bytes(&serde_json::to_value(&fragment).expect("json"), true)
+                    .expect("canonical"),
+            )
+            .expect("fragment");
+            fragments.push(path);
+        }
+        let output = root.path().join("composed");
+        let composed = compose(&fragments, &output).expect("compose");
+        assert_eq!(composed.components.len(), 5);
+        assert_eq!(
+            ReleaseInputsV1::load(&output.join("release-inputs.json")).expect("reload"),
+            composed
+        );
+        assert!(compose(&fragments, &output).is_err());
+        assert!(!root.path().read_dir().expect("entries").any(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".release-evidence-")
+        }));
+    }
+
+    #[test]
+    fn composed_inputs_feed_evidence_assembly() {
+        let root = TempDir::new().expect("temp");
+        let (_inputs_path, manifest, roots, fixture) = assembly_fixture(root.path());
+        let mut fragments = Vec::new();
+        for component in fixture.components {
+            let fragment = ReleaseInputFragmentV1 {
+                schema: "dirextalk.release-input-fragment".into(),
+                schema_version: 1,
+                release: fixture.release.clone(),
+                component,
+            };
+            let path = root
+                .path()
+                .join(format!("fragment-{}.json", fragment.component.component));
+            fs::write(
+                &path,
+                strict_json::canonical_bytes(&serde_json::to_value(&fragment).expect("json"), true)
+                    .expect("canonical"),
+            )
+            .expect("fragment");
+            fragments.push(path);
+        }
+        let composed_dir = root.path().join("composed");
+        compose(&fragments, &composed_dir).expect("compose");
+        let evidence_dir = root.path().join("evidence");
+        assemble(
+            &composed_dir.join("release-inputs.json"),
+            &manifest,
+            &roots,
+            &evidence_dir,
+        )
+        .expect("assemble");
+        ReleaseMaterialsV1::validate_dir(&evidence_dir).expect("validate");
     }
 
     #[test]

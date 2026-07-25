@@ -72,6 +72,14 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Compose five canonical component fragments into release-inputs material.
+    #[command(name = "release-inputs-compose")]
+    ReleaseInputsCompose {
+        #[arg(long = "fragment", required = true)]
+        fragments: Vec<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Read-only verify one finalized, self-contained release-materials directory.
     #[command(name = "release-materials-validate")]
     ReleaseMaterialsValidate { directory: PathBuf },
@@ -363,6 +371,26 @@ pub fn run(cli: Cli) -> Result<()> {
                     "schema": evidence.schema,
                     "schema_version": evidence.schema_version,
                     "components": evidence.components.iter().map(|component| &component.component).collect::<Vec<_>>(),
+                }))?;
+            }
+        }
+        Commands::ReleaseInputsCompose { fragments, output } => {
+            #[cfg(not(unix))]
+            {
+                let _ = (fragments, output);
+                return Err(crate::error::ReleaseError::UnsupportedPlatform(
+                    "release-inputs-compose requires a Unix release host",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                let inputs = release_materials::compose(&fragments, &output)?;
+                print_json(&json!({
+                    "composed": true,
+                    "output": output,
+                    "schema": inputs.schema,
+                    "schema_version": inputs.schema_version,
+                    "components": inputs.components.iter().map(|component| &component.component).collect::<Vec<_>>(),
                 }))?;
             }
         }

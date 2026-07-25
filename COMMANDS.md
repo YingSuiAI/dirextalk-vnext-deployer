@@ -11,6 +11,7 @@ Run from the repository root.
 | validate example | `cargo run --locked -- validate --manifest release.example.json` |
 | release evidence validation | `cargo run --locked -- release-evidence-validate --evidence release-evidence.json [--manifest release.example.json] [--source-root component=path]` |
 | release evidence assembly | `cargo run --locked -- release-evidence-assemble --inputs release-inputs.json --manifest release.example.json --source-root component=repo --output release-evidence-dir` |
+| release-inputs composition | `cargo run --locked -- release-inputs-compose --fragment server.json --fragment client.json --fragment connector.json --fragment sidecar.json --fragment deployer.json --output release-inputs-dir` |
 | dry-run plan | `cargo run --locked -- plan --manifest release.example.json --artifacts-dir artifacts --output-dir dist` |
 | native build plan | `cargo run --locked -- build --manifest release.example.json --target windows-x64` |
 | deployment contract validation | `cargo run --locked -- deployment-validate --manifest deployment.example.json` |
