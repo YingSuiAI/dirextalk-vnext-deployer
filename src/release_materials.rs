@@ -428,7 +428,18 @@ fn checksum_manifest(root: &Path) -> Result<Vec<u8>> {
             .strip_prefix(root)
             .map_err(|_| ReleaseError::InvalidPath(path.clone()))?;
         let value = fs::read(&path).map_err(io_error(&path))?;
-        bytes.extend_from_slice(format!("{}  {}\n", digest(&value), relative.display()).as_bytes());
+        // SHA256SUMS is deliberately the only excluded member: including its
+        // own digest would be recursive. Every other regular final member is
+        // represented once as `sha256 size path`, sorted by its relative path.
+        bytes.extend_from_slice(
+            format!(
+                "{} {} {}\n",
+                digest(&value),
+                value.len(),
+                relative.display()
+            )
+            .as_bytes(),
+        );
     }
     Ok(bytes)
 }
@@ -715,6 +726,29 @@ mod tests {
             );
         }
         ReleaseEvidenceV1::load(&first.join("release-evidence.json")).expect("reopen");
+        let checksums = String::from_utf8(fs::read(first.join("SHA256SUMS")).expect("checksums"))
+            .expect("utf8");
+        let entries: Vec<_> = checksums.lines().collect();
+        assert_eq!(
+            entries.len(),
+            31,
+            "every material, provenance file, and evidence file is covered once"
+        );
+        let paths: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.splitn(3, ' ').nth(2).expect("path"))
+            .collect();
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        for entry in entries {
+            let mut fields = entry.splitn(3, ' ');
+            let hash = fields.next().expect("hash");
+            let size: u64 = fields.next().expect("size").parse().expect("numeric size");
+            let path = fields.next().expect("path");
+            assert_ne!(path, "SHA256SUMS");
+            let bytes = fs::read(first.join(path)).expect("covered file");
+            assert_eq!(hash, digest(&bytes));
+            assert_eq!(size, bytes.len() as u64);
+        }
         assert!(assemble(&inputs_path, &manifest_path, &roots, &first).is_err());
     }
     #[test]

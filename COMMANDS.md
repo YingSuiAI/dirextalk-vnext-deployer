@@ -56,7 +56,9 @@ hardlinks across input roles, copies pre-generated artifact/SBOM/notice/license
 and recipe bytes to a new owner-only staging directory, then writes canonical
 local provenance and release evidence records plus sorted SHA-256 checksums.
 It fsyncs and atomically renames the complete directory, refusing any existing
-output. It does not generate an SBOM.
+output. `SHA256SUMS` is the sole excluded file (self-inclusion is recursive);
+every other regular member appears exactly once in lexical-path order as
+`sha256 size path`. It does not generate an SBOM.
 
 `deployment-connector-claim` is the root-only, local prerequisite for
 `deployment-connector-apply`. It accepts only a root-owned `0600` deployment
