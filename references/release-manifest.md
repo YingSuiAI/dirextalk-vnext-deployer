@@ -86,12 +86,15 @@ slice.
 
 ## Release evidence v1
 
-`release-evidence-validate` validates a separate canonical JSON contract with
+`release-evidence-validate` is a Unix-only release-host gate that validates a
+separate canonical JSON contract with
 `schema: "dirextalk.release-evidence"` and `schema_version: 1`. One SemVer
 release records `source_date_epoch` and exactly these components:
 `server`, `client-android`, `connector`, `agent-device-sidecar`, and
 `deployer`. Each component carries a lowercase 40-hex source commit, target,
-toolchain and build-recipe identities, one digest-bound regular-file artifact,
+and optional explicit `targets` applicability (the singular `target` remains
+the v1 compatibility form), toolchain and build-recipe identities, one
+digest-bound regular-file artifact,
 SBOM, third-party notice, and license evidence. Paths are local, relative to
 the evidence file, bounded, non-empty, non-symlink regular files; recorded
 sizes and SHA-256 digests must match.
@@ -101,5 +104,10 @@ local regular files bound to the component artifact digest. The validator only
 checks their path, size and digest and makes no cryptographic-verification or
 network-access claim. `--manifest` cross-checks release version and any source
 commits pinned by the existing release manifest. Repeated `--source-root
-component=path` arguments additionally require an exact clean Git root. The
-command is read-only and does not publish or invoke remote commands.
+component=path` arguments additionally acquire a cooperative repository-local
+lock and require an unchanged HEAD/tree/index/status snapshot for the whole
+validation. This protects cooperating same-user mutations; writers that do
+not take the lock are detected by the before/after snapshot when observable,
+but are not prevented during the read. The command is read-only and does not
+publish or invoke remote commands. Non-Unix hosts fail closed with an
+`unsupported platform` result.

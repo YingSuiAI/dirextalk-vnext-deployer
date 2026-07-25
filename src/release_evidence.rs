@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    digest::{FileIdentity, verify_regular_file_descriptor},
+    digest::{FileIdentity, read_regular_file_descriptor, verify_regular_file_descriptor},
     error::{ReleaseError, Result, io_error},
     manifest::LoadedManifest,
     source::verify_source_root,
@@ -66,6 +66,8 @@ pub struct EvidenceComponent {
     pub component: String,
     pub source_commit: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
     pub toolchain: String,
     #[serde(alias = "build-recipe")]
     pub build_recipe: String,
@@ -127,21 +129,67 @@ impl ReleaseEvidenceV1 {
     /// Returns an error for unsafe evidence files, non-canonical JSON, invalid
     /// contract fields, missing references, or digest/size mismatches.
     pub fn load(path: &Path) -> Result<Self> {
-        let metadata = fs::symlink_metadata(path).map_err(io_error(path))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() == 0
-            || metadata.len() > MAX_EVIDENCE_BYTES
-        {
-            return Err(ReleaseError::UnsafeFile(path.to_path_buf()));
-        }
-        let bytes = fs::read(path).map_err(io_error(path))?;
+        let bytes = read_regular_file_descriptor(path, MAX_EVIDENCE_BYTES)?;
         let evidence = Self::from_bytes(&bytes)?;
         let root = path
             .parent()
             .ok_or_else(|| ReleaseError::InvalidPath(path.to_path_buf()))?;
         evidence.validate_files(root)?;
         Ok(evidence)
+    }
+
+    /// Unix release-host load that holds cooperative source locks across the
+    /// complete evidence-file validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported or changing source repositories,
+    /// unsafe evidence files, or invalid release evidence.
+    #[cfg(unix)]
+    pub fn load_with_source_roots(path: &Path, roots: &BTreeMap<String, PathBuf>) -> Result<Self> {
+        use crate::source::SourceEvidenceGuard;
+
+        let initial = Self::load_contract(path)?;
+        let mut guards = Vec::new();
+        for (component, root) in roots {
+            let expected = initial
+                .components
+                .iter()
+                .find(|entry| entry.component == *component)
+                .ok_or_else(|| contract("source root names an unknown component"))?
+                .source_commit
+                .clone();
+            if let Some(guard) = guards
+                .iter()
+                .find(|guard: &&SourceEvidenceGuard| guard.repository() == root.as_path())
+            {
+                guard.verify_expected(&expected)?;
+            } else {
+                let guard = SourceEvidenceGuard::begin(root)?;
+                guard.verify_expected(&expected)?;
+                guards.push(guard);
+            }
+        }
+        let evidence = Self::load_contract(path)?;
+        if evidence != initial {
+            return Err(contract(
+                "release evidence changed while acquiring source locks",
+            ));
+        }
+        let root = path
+            .parent()
+            .ok_or_else(|| ReleaseError::InvalidPath(path.to_path_buf()))?;
+        evidence.validate_files(root)?;
+        for guard in guards {
+            guard.finish()?;
+        }
+        Ok(evidence)
+    }
+
+    #[cfg(unix)]
+    fn load_contract(path: &Path) -> Result<Self> {
+        let bytes = read_regular_file_descriptor(path, MAX_EVIDENCE_BYTES)?;
+        Self::from_bytes(&bytes)
     }
 
     /// Decode only; file records are checked by [`Self::validate_files`].
@@ -230,7 +278,7 @@ impl ReleaseEvidenceV1 {
                 .iter()
                 .find(|component| {
                     component.component == attestation.component
-                        && component.target == attestation.target
+                        && component_targets(component).contains(&attestation.target.as_str())
                 })
                 .ok_or_else(|| contract("attestation component/target is not present"))?;
             verify_attestation(
@@ -282,6 +330,7 @@ impl ReleaseEvidenceV1 {
     ///
     /// Returns an error when the release version or a configured source commit
     /// differs from this evidence.
+    #[allow(clippy::too_many_lines)]
     pub fn cross_check_manifest(&self, manifest: &LoadedManifest) -> Result<()> {
         if self.release.version != manifest.manifest.release.version {
             return Err(contract("release evidence version mismatches manifest"));
@@ -318,42 +367,80 @@ impl ReleaseEvidenceV1 {
                 }
             }
         }
-        let mut covered_targets = BTreeSet::new();
+        let mut covered_targets: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for component in &self.components {
-            let target = manifest.manifest.targets.iter().find(|target| {
-                target.id == component.target
-                    || format!("{}-{}", target.goos, target.goarch) == component.target
-                    || format!("{}-{}", target.node_platform, target.node_arch) == component.target
-                    || target.rust_target == component.target
-            });
-            if let Some(target) = target {
-                if let Some(toolchain) = &target.rust_toolchain
-                    && component.toolchain != *toolchain
-                {
-                    return Err(contract(
-                        "release evidence toolchain mismatches manifest target",
-                    ));
+            for component_target in component_targets(component) {
+                let target = manifest.manifest.targets.iter().find(|target| {
+                    target.id == component_target
+                        || format!("{}-{}", target.goos, target.goarch) == component_target
+                        || format!("{}-{}", target.node_platform, target.node_arch)
+                            == component_target
+                        || target.rust_target == component_target
+                });
+                if let Some(target) = target {
+                    if let Some(toolchain) = &target.rust_toolchain
+                        && component.toolchain != *toolchain
+                    {
+                        return Err(contract(
+                            "release evidence toolchain mismatches manifest target",
+                        ));
+                    }
+                    covered_targets
+                        .entry(component.component.as_str())
+                        .or_default()
+                        .insert(target.id.as_str());
+                    continue;
                 }
-                covered_targets.insert(target.id.as_str());
-                continue;
+                if component.component == "server"
+                    && manifest
+                        .manifest
+                        .server
+                        .platforms
+                        .iter()
+                        .any(|platform| platform.replace('/', "-") == component_target)
+                {
+                    continue;
+                }
+                return Err(contract(
+                    "release evidence target is not a manifest member or server platform",
+                ));
             }
-            if component.component == "server"
-                && manifest
+        }
+        let all_targets: BTreeSet<_> = manifest
+            .manifest
+            .targets
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect();
+        for component_name in ["connector", "deployer"] {
+            if covered_targets
+                .get(component_name)
+                .cloned()
+                .unwrap_or_default()
+                != all_targets
+            {
+                return Err(contract(&format!(
+                    "release evidence {component_name} does not cover every manifest target"
+                )));
+            }
+        }
+        let server_expected: BTreeSet<_> = manifest
+            .manifest
+            .targets
+            .iter()
+            .filter(|target| {
+                manifest
                     .manifest
                     .server
                     .platforms
                     .iter()
-                    .any(|platform| platform.replace('/', "-") == component.target)
-            {
-                continue;
-            }
+                    .any(|platform| platform == &format!("{}/{}", target.goos, target.goarch))
+            })
+            .map(|target| target.id.as_str())
+            .collect();
+        if covered_targets.get("server").cloned().unwrap_or_default() != server_expected {
             return Err(contract(
-                "release evidence target is not a manifest member or server platform",
-            ));
-        }
-        if covered_targets.len() < manifest.manifest.targets.len() {
-            return Err(contract(
-                "release evidence does not cover every manifest target",
+                "release evidence server does not cover every server platform target",
             ));
         }
         Ok(())
@@ -400,11 +487,18 @@ impl ReleaseEvidenceV1 {
             }
             validate_lower_token(&component.component, "component")?;
             validate_lower_token(&component.target, "target")?;
+            let mut target_values = BTreeSet::new();
+            for target in component_targets(component) {
+                validate_lower_token(target, "target")?;
+                if !target_values.insert(target) {
+                    return Err(contract("duplicate component target identity"));
+                }
+                if !targets.insert((component.component.clone(), target.to_owned())) {
+                    return Err(contract("duplicate component/target identity"));
+                }
+            }
             validate_identity(&component.toolchain, "toolchain")?;
             validate_identity(&component.build_recipe, "build_recipe")?;
-            if !targets.insert((component.component.clone(), component.target.clone())) {
-                return Err(contract("duplicate component/target identity"));
-            }
             if !artifacts.insert(component.artifact.identity.clone()) {
                 return Err(contract("duplicate artifact identity"));
             }
@@ -475,7 +569,7 @@ fn validate_attestation_list(
             .iter()
             .find(|component| {
                 component.component == attestation.component
-                    && component.target == attestation.target
+                    && component_targets(component).contains(&attestation.target.as_str())
             })
             .ok_or_else(|| contract("attestation component/target is not present"))?;
         validate_attestation(attestation, component)?;
@@ -504,7 +598,9 @@ fn validate_attestation(
     attestation: &AttestationReference,
     component: &EvidenceComponent,
 ) -> Result<()> {
-    if attestation.component != component.component || attestation.target != component.target {
+    if attestation.component != component.component
+        || !component_targets(component).contains(&attestation.target.as_str())
+    {
         return Err(contract("attestation component/target binding mismatch"));
     }
     if attestation.artifact_sha256 != component.artifact.sha256 {
@@ -518,6 +614,14 @@ fn validate_attestation(
         return Err(contract("attestation size is out of bounds"));
     }
     Ok(())
+}
+
+fn component_targets(component: &EvidenceComponent) -> Vec<&str> {
+    if component.targets.is_empty() {
+        vec![component.target.as_str()]
+    } else {
+        component.targets.iter().map(String::as_str).collect()
+    }
 }
 
 fn verify_attestation(
@@ -686,7 +790,7 @@ fn contract(message: &str) -> ReleaseError {
     ReleaseError::Manifest(format!("release evidence: {message}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -728,6 +832,7 @@ mod tests {
                 component: component.to_owned(),
                 source_commit: "a".repeat(40),
                 target: "linux-amd64".into(),
+                targets: Vec::new(),
                 toolchain: "stable-1.97.0".into(),
                 build_recipe: "recipe-v1".into(),
                 artifact: ArtifactEvidence {
@@ -853,15 +958,18 @@ mod tests {
         fs::write(manifest_root.path().join("connector/NOTICE"), b"NOTICE\n")
             .expect("connector notice");
         let manifest_path = manifest_root.path().join("release.json");
+        for component in &mut evidence.components {
+            component.targets = vec!["linux-amd64".into(), "linux-arm64".into()];
+        }
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&json!({
                 "schema_version": 1,
                 "release": {"version": "1.2.3", "source_date_epoch": 1},
-                "server": {"repository": "server", "dockerfile": "docker/release/Dockerfile", "image": "dirextalk/vent", "platforms": ["linux/amd64"]},
+                "server": {"repository": "server", "dockerfile": "docker/release/Dockerfile", "image": "dirextalk/vent", "platforms": ["linux/amd64", "linux/arm64"]},
                 "deployer": {"repository": "deployer", "package": "dirextalk-vnext-deployer", "binary": "dirextalk-vnext-deployer"},
                 "connector": {"repository": "connector", "module": "./cmd/dirextalk-agent-connector", "binary": "dirextalk-agent-connector"},
-                "targets": [{"id": "linux-x64", "rust_target": "x86_64-unknown-linux-gnu", "goos": "linux", "goarch": "amd64", "node_platform": "linux", "node_arch": "x64", "archive": "tar_gz"}],
+                "targets": [{"id": "linux-x64", "rust_target": "x86_64-unknown-linux-gnu", "goos": "linux", "goarch": "amd64", "node_platform": "linux", "node_arch": "x64", "archive": "tar_gz"}, {"id": "linux-arm64", "rust_target": "aarch64-unknown-linux-gnu", "goos": "linux", "goarch": "arm64", "node_platform": "linux", "node_arch": "arm64", "archive": "tar_gz"}],
                 "npm": {"package": "@dirextalk/vnext-deployer", "access": "public"},
                 "github": {"repository": "YingSuiAI/dirextalk-vnext-deployer", "tag_prefix": "v"}
             }))
@@ -875,7 +983,7 @@ mod tests {
         evidence.release.source_date_epoch = 2;
         assert!(evidence.cross_check_manifest(&manifest).is_err());
         evidence.release.source_date_epoch = 1;
-        evidence.components[0].target = "windows-x64".into();
+        evidence.components[0].targets = vec!["windows-x64".into()];
         assert!(evidence.cross_check_manifest(&manifest).is_err());
         drop(evidence_root);
     }

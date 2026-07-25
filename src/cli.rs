@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::collections::BTreeMap;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -15,8 +18,10 @@ use crate::{
     manifest::LoadedManifest,
     plan::ReleasePlan,
     publish::{PublicationPlan, PublicationSelection},
-    release_evidence::ReleaseEvidenceV1,
 };
+
+#[cfg(unix)]
+use crate::release_evidence::ReleaseEvidenceV1;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -283,25 +288,38 @@ pub fn run(cli: Cli) -> Result<()> {
             manifest,
             source_roots,
         } => {
-            let loaded = ReleaseEvidenceV1::load(&evidence)?;
-            let roots = parse_source_roots(&source_roots)?;
-            loaded.validate_source_roots(&roots)?;
-            if let Some(manifest_path) = manifest.as_deref() {
-                let release_manifest = LoadedManifest::load(manifest_path)?;
-                loaded.cross_check_manifest(&release_manifest)?;
+            #[cfg(not(unix))]
+            {
+                let _ = (evidence, manifest, source_roots);
+                return Err(crate::error::ReleaseError::UnsupportedPlatform(
+                    "release-evidence-validate requires a Unix release host",
+                ));
             }
-            print_json(&json!({
-                "valid": true,
-                "schema": &loaded.schema,
-                "schema_version": loaded.schema_version,
-                "version": &loaded.release.version,
-                "source_date_epoch": loaded.release.source_date_epoch,
-                "components": loaded.components.iter().map(|component| &component.component).collect::<Vec<_>>(),
-                "source_roots_checked": roots.keys().collect::<Vec<_>>(),
-                "manifest_checked": manifest.is_some(),
-                "attestations": loaded.attestations.len()
-                    + loaded.components.iter().map(|component| component.attestations.len()).sum::<usize>(),
-            }))?;
+            #[cfg(unix)]
+            {
+                let roots = parse_source_roots(&source_roots)?;
+                let loaded = if roots.is_empty() {
+                    ReleaseEvidenceV1::load(&evidence)?
+                } else {
+                    ReleaseEvidenceV1::load_with_source_roots(&evidence, &roots)?
+                };
+                if let Some(manifest_path) = manifest.as_deref() {
+                    let release_manifest = LoadedManifest::load(manifest_path)?;
+                    loaded.cross_check_manifest(&release_manifest)?;
+                }
+                print_json(&json!({
+                    "valid": true,
+                    "schema": &loaded.schema,
+                    "schema_version": loaded.schema_version,
+                    "version": &loaded.release.version,
+                    "source_date_epoch": loaded.release.source_date_epoch,
+                    "components": loaded.components.iter().map(|component| &component.component).collect::<Vec<_>>(),
+                    "source_roots_checked": roots.keys().collect::<Vec<_>>(),
+                    "manifest_checked": manifest.is_some(),
+                    "attestations": loaded.attestations.len()
+                        + loaded.components.iter().map(|component| component.attestations.len()).sum::<usize>(),
+                }))?;
+            }
         }
         Commands::Plan {
             manifest,
@@ -575,6 +593,7 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn parse_source_roots(values: &[String]) -> Result<BTreeMap<String, PathBuf>> {
     let mut roots = BTreeMap::new();
     for value in values {

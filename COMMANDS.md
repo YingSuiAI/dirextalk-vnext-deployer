@@ -29,13 +29,20 @@ Run from the repository root.
 `build` only executes commands when `--execute` is supplied. `publish` also
 requires `--execute` plus one or more destination flags.
 
-`release-evidence-validate` is read-only. It accepts only canonical,
-duplicate-key-free `dirextalk.release-evidence` JSON, verifies local artifact,
-SBOM, notice/license and optional attestation-reference digests, and can check
+`release-evidence-validate` is a Unix-only release-host gate and is read-only.
+On non-Unix hosts it fails with `unsupported platform` and performs no file or
+Git validation. It accepts only canonical, duplicate-key-free
+`dirextalk.release-evidence` JSON, verifies local artifact,
+SBOM, notice/license and optional attestation-reference digests, and checks
+per-component target applicability/coverage against a supplied manifest. It can check
 supplied Git roots for the pinned commit and a clean worktree. It never
 contacts a network or invokes a publication command. Attestation references
 are DSSE, in-toto, SLSA, or detached-signature evidence files bound by local
-digest; cryptographic signatures are not claimed or verified here.
+digest; cryptographic signatures are not claimed or verified here. When
+`--source-root` is supplied, validation takes a cooperative repository-local
+lock and compares HEAD, HEAD tree, index digest/size, and clean status before
+and after validation. This detects cooperating same-user mutations;
+non-cooperating filesystem writers remain outside the lock's guarantee.
 
 `deployment-connector-claim` is the root-only, local prerequisite for
 `deployment-connector-apply`. It accepts only a root-owned `0600` deployment

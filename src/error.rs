@@ -52,6 +52,8 @@ pub enum ReleaseError {
     OperationConflict,
     #[error("deployment operation is locked by another process")]
     OperationLocked,
+    #[error("unsupported platform: {0}")]
+    UnsupportedPlatform(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, ReleaseError>;

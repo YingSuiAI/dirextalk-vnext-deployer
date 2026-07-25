@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 
 use dirextalk_vnext_deployer::release_evidence::ReleaseEvidenceV1;

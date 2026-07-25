@@ -5,10 +5,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::{os::fd::OwnedFd, os::unix::fs::MetadataExt};
 
 #[cfg(unix)]
-use rustix::fs::{Mode, OFlags, open, openat};
+use rustix::fs::{AtFlags, Mode, OFlags, open, openat, statat};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -79,18 +79,17 @@ pub(crate) fn verify_regular_file_descriptor(
     expected_sha256: &str,
     maximum_size: u64,
 ) -> Result<FileIdentity> {
-    let file = open_relative_nofollow(root, relative)?;
-    let before = file.metadata().map_err(io_error(relative))?;
+    let mut opened = open_relative_nofollow(root, relative)?;
+    let before = opened.file.metadata().map_err(io_error(relative))?;
     validate_open_metadata(&before, maximum_size, relative)?;
     if before.len() != expected_size {
         return Err(ReleaseError::SourceMismatch(relative.to_path_buf()));
     }
-    let mut file = file;
     let mut hasher = Sha256::new();
     let mut bytes_read = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
-        let count = file.read(&mut buffer).map_err(io_error(relative))?;
+        let count = opened.file.read(&mut buffer).map_err(io_error(relative))?;
         if count == 0 {
             break;
         }
@@ -100,8 +99,11 @@ pub(crate) fn verify_regular_file_descriptor(
         }
         hasher.update(&buffer[..count]);
     }
-    let after = file.metadata().map_err(io_error(relative))?;
+    let after = opened.file.metadata().map_err(io_error(relative))?;
+    let path_stat = statat(&opened.directory, &opened.name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
     if !same_open_metadata(&before, &after)
+        || !same_path_stat(&before, &path_stat)
         || bytes_read != expected_size
         || hex::encode(hasher.finalize()) != expected_sha256
     {
@@ -111,6 +113,48 @@ pub(crate) fn verify_regular_file_descriptor(
         device: before.dev(),
         inode: before.ino(),
     })
+}
+
+/// Read one bounded regular file through the same stable descriptor path used
+/// for evidence members. This is used for the evidence JSON document itself.
+#[cfg(unix)]
+pub(crate) fn read_regular_file_descriptor(path: &Path, maximum_size: u64) -> Result<Vec<u8>> {
+    let root = path
+        .parent()
+        .ok_or_else(|| ReleaseError::InvalidPath(path.to_path_buf()))?;
+    let relative = path
+        .file_name()
+        .ok_or_else(|| ReleaseError::InvalidPath(path.to_path_buf()))?;
+    let relative = Path::new(relative);
+    let mut opened = open_relative_nofollow(root, relative)?;
+    let before = opened.file.metadata().map_err(io_error(path))?;
+    validate_open_metadata(&before, maximum_size, path)?;
+    let mut bytes = Vec::new();
+    opened
+        .file
+        .by_ref()
+        .take(maximum_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_error(path))?;
+    let after = opened.file.metadata().map_err(io_error(path))?;
+    let path_stat = statat(&opened.directory, &opened.name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error(path)(std::io::Error::from(error)))?;
+    if bytes.is_empty()
+        || bytes.len() as u64 > maximum_size
+        || !same_open_metadata(&before, &after)
+        || !same_path_stat(&before, &path_stat)
+    {
+        return Err(ReleaseError::SourceMismatch(path.to_path_buf()));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_regular_file_descriptor(path: &Path, _maximum_size: u64) -> Result<Vec<u8>> {
+    Err(ReleaseError::Manifest(format!(
+        "release evidence file verification is unsupported on this platform: {}",
+        path.display()
+    )))
 }
 
 /// Non-Unix builds deliberately fail closed because std cannot express a
@@ -130,7 +174,15 @@ pub(crate) fn verify_regular_file_descriptor(
 }
 
 #[cfg(unix)]
-fn open_relative_nofollow(root: &Path, relative: &Path) -> Result<File> {
+#[cfg(unix)]
+struct OpenedFile {
+    file: File,
+    directory: OwnedFd,
+    name: String,
+}
+
+#[cfg(unix)]
+fn open_relative_nofollow(root: &Path, relative: &Path) -> Result<OpenedFile> {
     let components: Vec<_> = relative.components().collect();
     let (last, parents) = components
         .split_last()
@@ -163,14 +215,19 @@ fn open_relative_nofollow(root: &Path, relative: &Path) -> Result<File> {
     let name = name
         .to_str()
         .ok_or_else(|| ReleaseError::InvalidPath(relative.to_path_buf()))?;
-    openat(
+    let file = openat(
         &directory,
         name,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map(File::from)
-    .map_err(|error| io_error(relative)(std::io::Error::from(error)))
+    .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
+    Ok(OpenedFile {
+        file,
+        directory,
+        name: name.to_owned(),
+    })
 }
 
 #[cfg(unix)]
@@ -199,4 +256,16 @@ fn same_open_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> 
         && before.len() == after.len()
         && before.mtime() == after.mtime()
         && before.mtime_nsec() == after.mtime_nsec()
+}
+
+#[cfg(unix)]
+fn same_path_stat(before: &std::fs::Metadata, path_stat: &rustix::fs::Stat) -> bool {
+    (path_stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+        && path_stat.st_dev == before.dev()
+        && path_stat.st_ino == before.ino()
+        && path_stat.st_nlink == before.nlink()
+        && path_stat.st_size >= 0
+        && path_stat.st_size.cast_unsigned() == before.len()
+        && path_stat.st_mtime == before.mtime()
+        && path_stat.st_mtime_nsec == before.mtime_nsec().cast_unsigned()
 }
