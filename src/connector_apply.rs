@@ -13,21 +13,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustix::{
-    fs::{Mode, OFlags, open},
-    process::geteuid,
-};
+use rustix::fs::{Mode, OFlags, open};
+#[cfg(not(test))]
+use rustix::process::geteuid;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[cfg(not(test))]
+use crate::deployment::validate_host_evidence;
 use crate::{
     agent_bundle::{AgentBundle, AgentBundleComponent},
     deployment::{
         AdapterKind, BindingWorkload, ConnectorClaimPhase, DeploymentManifest,
         DeploymentStateStore, OperationPhase, OperationRecord, require_canonical_uuid7,
-        validate_host_evidence,
     },
     error::{ReleaseError, Result, io_error},
 };
@@ -42,6 +42,7 @@ const MAX_OUTPUT: usize = 65_536;
 const OPERATOR_TIMEOUT: Duration = Duration::from_secs(45);
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
 
+#[derive(Clone)]
 pub struct ConnectorApplyInputs {
     pub operation_id: String,
     pub manifest: PathBuf,
@@ -237,10 +238,11 @@ impl ProtectedBytes {
         let file: File = descriptor.into();
         let metadata = file.metadata().map_err(io_error(path))?;
         let mode = metadata.mode() & 0o777;
+        let owner_uid = if cfg!(test) { 0 } else { metadata.uid() };
         if !protected_metadata_valid(
             metadata.is_file(),
             metadata.nlink(),
-            metadata.uid(),
+            owner_uid,
             mode,
             metadata.len(),
             max,
@@ -307,7 +309,7 @@ fn apply_with(
     operator: &dyn Operator,
     store: &DeploymentStateStore,
 ) -> Result<ApplyResult> {
-    if geteuid().as_raw() != 0 {
+    if !apply_authorized() {
         return Err(deployment("deployment-connector-apply requires root"));
     }
     require_canonical_uuid7(&inputs.operation_id, "deployment operation")?;
@@ -321,7 +323,7 @@ fn apply_with(
 
     let mut operation = store.read(&inputs.operation_id)?;
     validate_operation(&operation, &manifest, &plan, &inputs.target)?;
-    let proof = validate_host_evidence(&plan_host_tuple(&plan))?;
+    let proof = validate_host_binding(&plan_host_tuple(&plan))?;
     let existing_claim =
         store.read_connector_claim(&inputs.operation_id, &plan.connector.instance_id)?;
     let plan_expired = expired(plan.connector.expires_at_millis)?;
@@ -495,6 +497,35 @@ fn apply_with(
         lifecycle_operation_id: record.lifecycle_operation_id,
         state: "finalized".into(),
     })
+}
+
+fn apply_authorized() -> bool {
+    #[cfg(test)]
+    {
+        // Unit tests exercise the same state machine with a temp durable store;
+        // production builds retain the root-only boundary below.
+        true
+    }
+    #[cfg(not(test))]
+    {
+        geteuid().as_raw() == 0
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn validate_host_binding(
+    expected: &crate::deployment::HostTuple,
+) -> Result<crate::deployment::VerifiedHostBinding> {
+    #[cfg(test)]
+    {
+        Ok(crate::deployment::verified_host_binding_for_test(
+            expected.clone(),
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        validate_host_evidence(expected)
+    }
 }
 
 fn ensure_v2_finalization_ready(record: &ConnectorExecutionRecordV1) -> Result<()> {
@@ -1735,6 +1766,539 @@ fn valid_dns_name(value: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         })
+}
+
+#[cfg(test)]
+mod durable_replay_tests {
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+    };
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        agent_bundle::{
+            AgentBundle, AgentBundleComponent, AgentBundleProtocol, AgentControlBounds,
+            RequiredCapability, RuntimeBinding,
+        },
+        deployment::{
+            DeploymentContract, DeploymentManifest, DeploymentStateStore, DeploymentTarget,
+            HostTuple, ImmutableArtifact, OperationPhase, OperationRecord,
+        },
+    };
+
+    const OPERATION_ID: &str = "019f8cc9-1d0c-71d3-a377-c7ad49572611";
+    const LIFECYCLE_ID: &str = "019f8cc9-1d0c-71d3-a377-c7ad49572612";
+    const INSTANCE_ID: &str = "019f8cc9-1d0c-71d3-a377-c7ad49572613";
+    const TENANT_ID: &str = "019f8cc9-1d0c-71d3-a377-c7ad49572614";
+    const HOST_ID: &str = "019f8cc9-1d0c-71d3-a377-c7ad49572615";
+    const CREDENTIAL_ID: &str = "019f8cc9-1d0c-71d3-a377-c7ad49572616";
+    const OWNER_ID: &str = "dtxi1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TARGET: &str = "connector-host-a";
+    const ARTIFACT_DIGEST: &str = "a";
+    const HANDOFF: &[u8] = b"handoff-secret-descriptor";
+    const CONFIG: &[u8] = b"connector-config";
+    const ENROLLMENT: &[u8] = b"enrollment-ca";
+    const CONTROL: &[u8] = b"control-ca";
+    const ISSUER: &[u8] = b"issuer-ca";
+
+    #[derive(Clone)]
+    struct Harness {
+        _temp: Arc<TempDir>,
+        root: PathBuf,
+        inputs: ConnectorApplyInputs,
+        manifest: Vec<u8>,
+        plan: Vec<u8>,
+        bundle: AgentBundle,
+    }
+
+    #[derive(Default)]
+    struct RecordingOperator {
+        calls: Mutex<Vec<Call>>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Call {
+        Snapshot,
+        PrepareEmpty,
+        PrepareMaterial,
+        Start,
+        Observe,
+        Finalize,
+    }
+
+    impl RecordingOperator {
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+
+        fn response(value: &serde_json::Value) -> Result<Vec<u8>> {
+            serde_json::to_vec(value).map_err(ReleaseError::from)
+        }
+    }
+
+    impl Operator for RecordingOperator {
+        fn invoke(&self, frame: Vec<u8>) -> Result<Vec<u8>> {
+            let magic = frame
+                .get(..8)
+                .ok_or_else(|| deployment("test operator frame is short"))?;
+            let header_len = u32::from_be_bytes(
+                frame
+                    .get(8..12)
+                    .ok_or_else(|| deployment("test operator header is short"))?
+                    .try_into()
+                    .map_err(|_| deployment("test operator header length"))?,
+            ) as usize;
+            let header: serde_json::Value = serde_json::from_slice(
+                frame
+                    .get(12..12 + header_len)
+                    .ok_or_else(|| deployment("test operator header bounds"))?,
+            )?;
+            let payload_len_offset = 12 + header_len;
+            let payload_len = u32::from_be_bytes(
+                frame
+                    .get(payload_len_offset..payload_len_offset + 4)
+                    .ok_or_else(|| deployment("test operator payload length"))?
+                    .try_into()
+                    .map_err(|_| deployment("test operator payload length"))?,
+            ) as usize;
+            let payload = frame
+                .get(payload_len_offset + 4..payload_len_offset + 4 + payload_len)
+                .ok_or_else(|| deployment("test operator payload bounds"))?;
+            match magic {
+                b"DTXHC01\0" => self.invoke_v1(&header),
+                b"DTXHC02\0" => self.invoke_v2(&header, payload),
+                _ => Err(deployment("test operator magic mismatch")),
+            }
+        }
+    }
+
+    impl RecordingOperator {
+        fn invoke_v1(&self, request: &serde_json::Value) -> Result<Vec<u8>> {
+            let kind = request["request"]["kind"]
+                .as_str()
+                .ok_or_else(|| deployment("test V1 request kind"))?;
+            match kind {
+                "snapshot" => {
+                    self.calls.lock().expect("calls lock").push(Call::Snapshot);
+                    Self::response(&serde_json::json!({
+                        "protocol": PROTOCOL_V1,
+                        "status": "succeeded",
+                        "result": {"kind":"snapshot", "host": {
+                            "tenant_id": TENANT_ID, "host_id": HOST_ID,
+                            "revision": {"desired":1,"observed":1}, "connectors": []
+                        }}, "error": null
+                    }))
+                }
+                "execute" => {
+                    self.calls.lock().expect("calls lock").push(Call::Start);
+                    Self::response(&serde_json::json!({
+                        "protocol": PROTOCOL_V1,
+                        "status": "succeeded",
+                        "result": {"kind":"command", "application":"applied", "disposition":"applied",
+                            "revision":{"desired":3,"observed":3}, "connector": connector_projection("running")},
+                        "error": null
+                    }))
+                }
+                "observe" => {
+                    self.calls.lock().expect("calls lock").push(Call::Observe);
+                    Self::response(&serde_json::json!({
+                        "protocol": PROTOCOL_V1,
+                        "status": "succeeded",
+                        "result": {"kind":"observation", "revision":{"desired":3,"observed":3},
+                            "connector": connector_projection("running"), "actual_observation":"running"},
+                        "error": null
+                    }))
+                }
+                _ => Err(deployment("unexpected test V1 request")),
+            }
+        }
+
+        fn invoke_v2(&self, header: &serde_json::Value, payload: &[u8]) -> Result<Vec<u8>> {
+            let operation = header["operation"]
+                .as_str()
+                .ok_or_else(|| deployment("test V2 operation"))?;
+            if operation == "finalize_connector_material" {
+                self.calls.lock().expect("calls lock").push(Call::Finalize);
+                return Err(deployment("finalize must not be invoked before readiness"));
+            }
+            if payload.is_empty() {
+                self.calls
+                    .lock()
+                    .expect("calls lock")
+                    .push(Call::PrepareEmpty);
+                return Self::response(&serde_json::json!({
+                    "protocol": PROTOCOL_V2, "status":"rejected", "result":null,
+                    "error":"MATERIAL_REQUIRED"
+                }));
+            }
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(Call::PrepareMaterial);
+            Self::response(&serde_json::json!({
+                "protocol": PROTOCOL_V2, "status":"succeeded", "error":null,
+                "result": {"operation":"prepare_connector_material", "application":"applied",
+                    "disposition":"applied", "desired_revision":2, "observed_revision":2,
+                    "connector_id":INSTANCE_ID, "lifecycle_state":"prepared",
+                    "prepared_receipt_sha256": format!("{}{}", "c".repeat(63), "c"),
+                    "finalized_receipt_sha256":null}
+            }))
+        }
+    }
+
+    fn connector_projection(observation: &str) -> serde_json::Value {
+        serde_json::json!({
+            "connector_id": INSTANCE_ID, "adapter_kind":"codex",
+            "release_sha256": format!("{}{}", ARTIFACT_DIGEST, "0".repeat(63)),
+            "desired_state":"running", "recorded_observation":observation,
+            "credential_generation":1
+        })
+    }
+
+    fn host() -> HostTuple {
+        HostTuple {
+            tenant_id: TENANT_ID.into(),
+            host_id: HOST_ID.into(),
+            owner_id: OWNER_ID.into(),
+            host_credential_id: CREDENTIAL_ID.into(),
+        }
+    }
+
+    fn bundle() -> AgentBundle {
+        let mut value = AgentBundle {
+            schema: "dirextalk.agent-bundle".into(),
+            schema_version: 1,
+            target: "linux-amd64".into(),
+            acceptance_profile: "codex-app-server-safe-v1".into(),
+            bundle_digest: String::new(),
+            protocol: AgentBundleProtocol {
+                agent_control: AgentControlBounds {
+                    major: 1,
+                    minimum_minor: 2,
+                    maximum_minor: 5,
+                },
+                sidecar_route: RequiredCapability {
+                    required: "agent-route-bootstrap-v1".into(),
+                },
+                sidecar_approval: RequiredCapability {
+                    required: "runtime.approval.v1".into(),
+                },
+            },
+            components: ["connector", "agent_device", "runtime_launcher"]
+                .into_iter()
+                .map(|role| AgentBundleComponent {
+                    role: role.into(),
+                    identity: format!("dirextalk-{role}"),
+                    version: "1.0.0".into(),
+                    source_commit: "a".repeat(40),
+                    sha256: "b".repeat(64),
+                    size: 1,
+                })
+                .collect(),
+            runtime: RuntimeBinding {
+                kind: "codex".into(),
+                adapter: "codex-app-server".into(),
+                profile: "safe".into(),
+                launcher_component: "runtime_launcher".into(),
+                required_options: BTreeMap::from([
+                    ("app_server_url".into(), "stdio".into()),
+                    ("backend".into(), "app_server".into()),
+                    ("mode".into(), "suggest".into()),
+                ]),
+                required_capabilities: vec!["runtime.execute".into(), "runtime.approval.v1".into()],
+            },
+        };
+        value.bundle_digest = value.computed_digest().expect("bundle digest");
+        value
+    }
+
+    fn harness() -> Harness {
+        let temp = Arc::new(TempDir::new().expect("temp"));
+        let root = temp.path().join("state");
+        let b = bundle();
+        let artifact = ImmutableArtifact {
+            version: "1.0.0".into(),
+            digest: format!("{}{}", ARTIFACT_DIGEST, "0".repeat(63)),
+        };
+        let handoff_digest = digest(HANDOFF);
+        let contract = DeploymentContract {
+            schema_version: 2,
+            server: artifact.clone(),
+            connector: artifact.clone(),
+            targets: vec![DeploymentTarget::ConnectorHost {
+                id: TARGET.into(),
+                host: host(),
+                connectors: vec![crate::deployment::ConnectorBinding {
+                    instance_id: INSTANCE_ID.into(),
+                    adapter_kind: AdapterKind::Codex,
+                    handoff_digest: handoff_digest.clone(),
+                    agent_bundle: Some(b.clone()),
+                }],
+            }],
+        };
+        let manifest_value = serde_json::to_value(&contract).expect("manifest value");
+        let manifest = crate::strict_json::canonical_bytes(&manifest_value, false)
+            .expect("manifest canonical");
+        let manifest_parsed = DeploymentManifest::from_bytes(&manifest).expect("manifest");
+        let trust = PlanTrust {
+            enrollment_url: "https://enrollment.example.invalid".into(),
+            enrollment_server_name: "enrollment.example.invalid".into(),
+            enrollment_root_ca_sha256: digest(ENROLLMENT),
+            control_url: "https://control.example.invalid".into(),
+            control_server_name: "control.example.invalid".into(),
+            control_server_root_ca_sha256: digest(CONTROL),
+            connector_issuer_root_ca_sha256: digest(ISSUER),
+        };
+        let p = BootstrapPlan {
+            schema: "dirextalk.connector-bootstrap-plan".into(),
+            schema_version: 1,
+            state: "prepared".into(),
+            operation_id: LIFECYCLE_ID.into(),
+            manifest_digest: manifest_parsed.digest().into(),
+            target: "linux-amd64".into(),
+            connector_artifact: ConnectorArtifact {
+                version: "1.0.0".into(),
+                digest: artifact.digest.clone(),
+            },
+            host: PlanHost {
+                tenant_id: TENANT_ID.into(),
+                host_id: HOST_ID.into(),
+                owner_id: OWNER_ID.into(),
+                host_credential_id: CREDENTIAL_ID.into(),
+            },
+            connector: PlanConnector {
+                instance_id: INSTANCE_ID.into(),
+                adapter_kind: Adapter::Codex,
+                handoff_digest,
+                display_name: "Connector A".into(),
+                generation: 1,
+                spec_revision: 1,
+                enrollment_request_id: "019f8cc9-1d0c-71d3-a377-c7ad49572617".into(),
+                enrollment_intent_id: "019f8cc9-1d0c-71d3-a377-c7ad49572618".into(),
+                installation_id: "019f8cc9-1d0c-71d3-a377-c7ad49572619".into(),
+                agent_device_id: "019f8cc9-1d0c-71d3-a377-c7ad49572620".into(),
+                binding_id: "019f8cc9-1d0c-71d3-a377-c7ad49572621".into(),
+                expires_at_millis: 4_000_000_000_000,
+                server_origin: "https://server.example.invalid".into(),
+                trust,
+                runtime_profile: "safe".into(),
+                agent_bundle: Some(b.clone()),
+                remote_mcp: RemoteMcp {
+                    mcp_server_name: "mcp-server".into(),
+                    mcp_url: "https://mcp.example.invalid/mcp".into(),
+                    mcp_node_id: "019f8cc9-1d0c-71d3-a377-c7ad49572622".into(),
+                    max_concurrent_runs: 4,
+                    offline_policy: "queue".into(),
+                },
+            },
+        };
+        let plan = serde_json::to_vec(&p).expect("plan");
+        let manifest_path = root.join("manifest.json");
+        let plan_path = root.join("plan.json");
+        let handoff_path = root.join("handoff");
+        let config_path = root.join("config");
+        let enrollment_path = root.join("enrollment");
+        let control_path = root.join("control");
+        let issuer_path = root.join("issuer");
+        fs::create_dir_all(&root).expect("root");
+        fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("root mode");
+        write_protected(&manifest_path, &manifest, 0o400);
+        write_protected(&plan_path, &plan, 0o400);
+        write_protected(&handoff_path, HANDOFF, 0o600);
+        write_protected(&config_path, CONFIG, 0o400);
+        write_protected(&enrollment_path, ENROLLMENT, 0o400);
+        write_protected(&control_path, CONTROL, 0o400);
+        write_protected(&issuer_path, ISSUER, 0o400);
+        Harness {
+            _temp: temp,
+            root: root.clone(),
+            inputs: ConnectorApplyInputs {
+                operation_id: OPERATION_ID.into(),
+                manifest: manifest_path,
+                target: TARGET.into(),
+                plan: plan_path,
+                handoff: handoff_path,
+                config: config_path,
+                enrollment_ca: enrollment_path,
+                control_ca: control_path,
+                issuer_ca: issuer_path,
+            },
+            manifest,
+            plan,
+            bundle: b,
+        }
+    }
+
+    fn write_protected(path: &Path, bytes: &[u8], mode: u32) {
+        if path.exists() {
+            fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("writable fixture");
+        }
+        fs::write(path, bytes).expect("write fixture");
+        #[cfg(unix)]
+        std::os::unix::fs::PermissionsExt::set_mode(
+            &mut fs::metadata(path).expect("metadata").permissions(),
+            mode,
+        );
+        #[cfg(unix)]
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))
+            .expect("mode");
+    }
+
+    fn seed_store(h: &Harness) -> DeploymentStateStore {
+        let manifest = DeploymentManifest::from_bytes(&h.manifest).expect("manifest");
+        let record =
+            OperationRecord::planned(&manifest, TARGET, OPERATION_ID, None).expect("planned");
+        let store = DeploymentStateStore::for_test(h.root.clone());
+        let proof = crate::deployment::verified_host_binding_for_test(host());
+        store.claim(&manifest, &record, &proof).expect("claim");
+        store
+    }
+
+    fn apply_once(
+        h: &Harness,
+        operator: &RecordingOperator,
+        store: &DeploymentStateStore,
+    ) -> Result<ApplyResult> {
+        apply_with(&h.inputs, operator, store)
+    }
+
+    #[test]
+    fn schema_v2_bundle_reaches_not_ready_without_finalize_and_replays_durably() {
+        let h = harness();
+        let store = seed_store(&h);
+        let operator = RecordingOperator::default();
+        let result = apply_once(&h, &operator, &store);
+        assert!(
+            matches!(result, Err(ReleaseError::Deployment(ref message)) if message.starts_with("NotReady:")),
+            "{result:?}"
+        );
+        assert_eq!(
+            operator.calls(),
+            vec![
+                Call::Snapshot,
+                Call::PrepareEmpty,
+                Call::PrepareMaterial,
+                Call::Start,
+                Call::Observe
+            ]
+        );
+        let operation = store.read(OPERATION_ID).expect("operation");
+        assert_eq!(operation.phase(), OperationPhase::ServicesConverged);
+        drop(store);
+        let reopened = DeploymentStateStore::for_test(h.root.clone());
+        let replay_operator = RecordingOperator::default();
+        assert!(
+            matches!(apply_once(&h, &replay_operator, &reopened), Err(ReleaseError::Deployment(message)) if message.starts_with("NotReady:"))
+        );
+        assert!(
+            replay_operator.calls().is_empty(),
+            "exact Running replay must not duplicate Host effects"
+        );
+        let lease = reopened
+            .lock_connector_execution(OPERATION_ID, INSTANCE_ID)
+            .expect("lease");
+        let record: ConnectorExecutionRecordV1 =
+            serde_json::from_slice(&lease.read().expect("read").expect("record"))
+                .expect("record json");
+        assert_eq!(record.phase, Phase::Running);
+        assert_eq!(
+            record.agent_bundle_digest.as_deref(),
+            Some(h.bundle.bundle_digest.as_str())
+        );
+        assert_eq!(
+            record.agent_bundle_components.as_deref(),
+            Some(h.bundle.components.as_slice())
+        );
+    }
+
+    #[test]
+    fn nested_manifest_and_plan_tamper_reject_before_store_or_operator_mutation() {
+        let h = harness();
+        let operator = RecordingOperator::default();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&h.manifest).expect("manifest value");
+        value["targets"][0]["connectors"][0]["agent_bundle"]["components"][0]["size"] = 2.into();
+        let tampered_manifest =
+            crate::strict_json::canonical_bytes(&value, false).expect("manifest canonical");
+        let inputs = h.inputs.clone();
+        write_protected(&inputs.manifest, &tampered_manifest, 0o400);
+        let store = DeploymentStateStore::for_test(h.root.join("manifest-tamper-state"));
+        assert!(apply_with(&inputs, &operator, &store).is_err());
+        assert!(operator.calls().is_empty());
+        assert!(matches!(
+            store.read(OPERATION_ID),
+            Err(ReleaseError::Io { .. })
+        ));
+
+        let h = harness();
+        let mut plan_value: serde_json::Value =
+            serde_json::from_slice(&h.plan).expect("plan value");
+        plan_value["connector"]["agent_bundle"]["components"][0]["size"] = 2.into();
+        let tampered_plan = serde_json::to_vec(&plan_value).expect("plan canonical");
+        write_protected(&h.inputs.plan, &tampered_plan, 0o400);
+        let store = DeploymentStateStore::for_test(h.root.join("plan-tamper-state"));
+        assert!(apply_with(&h.inputs, &operator, &store).is_err());
+        assert!(operator.calls().is_empty());
+    }
+
+    #[test]
+    fn schema_v1_manifest_or_plan_carrying_bundle_rejects_before_claim() {
+        let h = harness();
+        let mut manifest_value: serde_json::Value =
+            serde_json::from_slice(&h.manifest).expect("manifest");
+        manifest_value["schema_version"] = 1.into();
+        let bytes = crate::strict_json::canonical_bytes(&manifest_value, false).expect("canonical");
+        assert!(DeploymentManifest::from_bytes(&bytes).is_err());
+
+        let manifest = DeploymentManifest::from_bytes(&h.manifest).expect("manifest");
+        let schema_v1 = DeploymentManifest::from_bytes(&serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"server":manifest.contract().server,"connector":manifest.contract().connector,
+            "targets":[{"kind":"connector_host","id":TARGET,"host":host(),"connectors":[{"instance_id":INSTANCE_ID,"adapter_kind":"codex","handoff_digest":digest(HANDOFF)}]}]
+        })).expect("v1 bytes")).expect("schema v1");
+        let plan = parse_plan(&h.plan).expect("plan");
+        assert!(validate_plan_bundle(&schema_v1, &plan, TARGET).is_err());
+    }
+
+    #[test]
+    fn persisted_bundle_digest_or_components_conflict_on_changed_replay() {
+        for change_components in [false, true] {
+            let h = harness();
+            let store = seed_store(&h);
+            let operator = RecordingOperator::default();
+            assert!(apply_once(&h, &operator, &store).is_err());
+            let lease = store
+                .lock_connector_execution(OPERATION_ID, INSTANCE_ID)
+                .expect("lease");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&lease.read().expect("read").expect("record"))
+                    .expect("record");
+            if change_components {
+                value["agent_bundle_components"][0]["size"] = 2.into();
+            } else {
+                value["agent_bundle_digest"] = "d".repeat(64).into();
+            }
+            value["integrity_sha256"] = serde_json::Value::String(String::new());
+            let mut record: ConnectorExecutionRecordV1 =
+                serde_json::from_value(value).expect("record");
+            record.integrity_sha256.clear();
+            record.integrity_sha256 = digest(&serde_json::to_vec(&record).expect("record bytes"));
+            lease.write(&record).expect("tampered durable record");
+            drop(lease);
+            let replay = RecordingOperator::default();
+            assert!(matches!(
+                apply_once(&h, &replay, &store),
+                Err(ReleaseError::OperationConflict)
+            ));
+            assert!(replay.calls().is_empty());
+        }
+    }
 }
 fn valid_mcp_name(value: &str) -> bool {
     !value.is_empty()
