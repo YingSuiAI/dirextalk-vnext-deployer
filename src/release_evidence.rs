@@ -433,18 +433,6 @@ impl ReleaseEvidenceV1 {
         }
         let server_expected: BTreeSet<_> =
             manifest.manifest.server.platforms.iter().cloned().collect();
-        for platform in &server_expected {
-            if !manifest
-                .manifest
-                .targets
-                .iter()
-                .any(|target| platform == &format!("{}/{}", target.goos, target.goarch))
-            {
-                return Err(contract(
-                    "manifest server platform has no mapped release target",
-                ));
-            }
-        }
         if covered_server_platforms != server_expected {
             return Err(contract(
                 "release evidence server does not cover every server platform target",
@@ -962,6 +950,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn manifest_cross_check_covers_epoch_target_and_toolchain() {
         let (evidence_root, mut evidence) = fixture();
         let manifest_root = TempDir::new().expect("manifest root");
@@ -1024,6 +1013,45 @@ mod tests {
         evidence
             .cross_check_manifest(&manifest)
             .expect("overlapping facts match");
+        let mut unmapped_manifest_json: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest bytes"))
+                .expect("manifest value");
+        unmapped_manifest_json["targets"] = json!([{
+            "id": "linux-x64",
+            "rust_target": "x86_64-unknown-linux-gnu",
+            "rust_toolchain": "rust-linux",
+            "goos": "linux",
+            "goarch": "amd64",
+            "node_platform": "linux",
+            "node_arch": "x64",
+            "archive": "tar_gz"
+        }]);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&unmapped_manifest_json).expect("unmapped manifest"),
+        )
+        .expect("unmapped manifest write");
+        let unmapped_manifest = LoadedManifest::load(&manifest_path).expect("unmapped load");
+        let mut direct_server = evidence.clone();
+        for component in &mut direct_server.components {
+            if component.component != "server" {
+                component.targets = vec!["linux-amd64".into()];
+            }
+        }
+        direct_server
+            .cross_check_manifest(&unmapped_manifest)
+            .expect("direct unmapped server platform coverage");
+        direct_server
+            .components
+            .iter_mut()
+            .find(|component| component.component == "server")
+            .expect("server")
+            .targets = vec!["linux-amd64".into()];
+        assert!(
+            direct_server
+                .cross_check_manifest(&unmapped_manifest)
+                .is_err()
+        );
         let mut contradictory = evidence.clone();
         contradictory.components[0].targets = vec!["linux-arm64".into()];
         assert!(contradictory.validate().is_err());
