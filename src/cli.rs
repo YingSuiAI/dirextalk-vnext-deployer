@@ -72,6 +72,9 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Read-only verify one finalized, self-contained release-materials directory.
+    #[command(name = "release-materials-validate")]
+    ReleaseMaterialsValidate { directory: PathBuf },
     /// Print the immutable local build plan without executing it.
     Plan {
         #[arg(long)]
@@ -361,6 +364,19 @@ pub fn run(cli: Cli) -> Result<()> {
                     "schema_version": evidence.schema_version,
                     "components": evidence.components.iter().map(|component| &component.component).collect::<Vec<_>>(),
                 }))?;
+            }
+        }
+        Commands::ReleaseMaterialsValidate { directory } => {
+            #[cfg(not(unix))]
+            {
+                let _ = directory;
+                return Err(crate::error::ReleaseError::UnsupportedPlatform(
+                    "release-materials-validate requires a Unix release host",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                release_materials::ReleaseMaterialsV1::validate_dir(&directory)?;
             }
         }
         Commands::Plan {

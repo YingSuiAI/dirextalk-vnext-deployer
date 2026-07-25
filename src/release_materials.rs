@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     digest::{FileIdentity, read_regular_file_descriptor, read_regular_file_relative_descriptor},
     error::{ReleaseError, Result, io_error},
-    manifest::LoadedManifest,
+    manifest::{LoadedManifest, ReleaseManifest},
     release_evidence::{
         ArtifactEvidence, AttestationKind, AttestationReference, EvidenceComponent,
         EvidenceRelease, FileEvidence, REQUIRED_RELEASE_COMPONENTS, ReleaseEvidenceV1,
@@ -433,7 +433,7 @@ pub struct InputFile {
     pub path: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LocalProvenanceV1 {
     schema: String,
@@ -452,6 +452,14 @@ struct LocalProvenanceV1 {
 }
 
 impl ReleaseInputsV1 {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let inputs: Self = serde_json::from_value(strict_json::parse_value(bytes)?)?;
+        inputs.validate()?;
+        if inputs.canonical_bytes()? != bytes {
+            return Err(contract("release inputs JSON is not canonical"));
+        }
+        Ok(inputs)
+    }
     /// Load one canonical release-inputs document.
     ///
     /// # Errors
@@ -460,13 +468,7 @@ impl ReleaseInputsV1 {
     /// a contract that does not name exactly the required components.
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = read_regular_file_descriptor(path, MAX_INPUT_BYTES)?;
-        let value = strict_json::parse_value(&bytes)?;
-        let inputs: Self = serde_json::from_value(value)?;
-        inputs.validate()?;
-        if inputs.canonical_bytes()? != bytes {
-            return Err(contract("release inputs JSON is not canonical"));
-        }
-        Ok(inputs)
+        Self::from_bytes(&bytes)
     }
 
     fn canonical_bytes(&self) -> Result<Vec<u8>> {
@@ -547,8 +549,15 @@ pub fn assemble(
         ));
     }
     let manifest_bytes = read_regular_file_descriptor(manifest_path, MAX_INPUT_BYTES)?;
-    let manifest = LoadedManifest::load_from_bytes(manifest_path, &manifest_bytes)?;
-    let manifest_digest = hex::encode(Sha256::digest(&manifest_bytes));
+    // The external file is an input only.  Publish a strict, canonical snapshot
+    // so validation never depends on the original path or its formatting.
+    let manifest_value = strict_json::parse_value(&manifest_bytes)?;
+    let manifest_contract: ReleaseManifest = serde_json::from_value(manifest_value)?;
+    manifest_contract.validate()?;
+    let manifest_snapshot =
+        strict_json::canonical_bytes(&serde_json::to_value(&manifest_contract)?, true)?;
+    let manifest = LoadedManifest::load_from_bytes(manifest_path, &manifest_snapshot)?;
+    let manifest_digest = digest(&manifest_snapshot);
     let mut guards = Vec::new();
     for component in &inputs.components {
         let root = roots
@@ -586,6 +595,9 @@ pub fn assemble(
         .parent()
         .ok_or_else(|| ReleaseError::InvalidPath(inputs_path.to_path_buf()))?;
     ensure_directory(input_root)?;
+    let inputs_snapshot = inputs.canonical_bytes()?;
+    stage.write_new(Path::new("release-inputs.json"), &inputs_snapshot)?;
+    stage.write_new(Path::new("release-manifest.json"), &manifest_snapshot)?;
     let mut identities = BTreeSet::new();
     let mut components = Vec::new();
     let mut attestations = Vec::new();
@@ -710,6 +722,172 @@ pub fn assemble(
     Ok(evidence)
 }
 
+/// Strict read-only verifier for one finalized, self-contained v1 directory.
+pub struct ReleaseMaterialsV1;
+impl ReleaseMaterialsV1 {
+    /// Verify a finalized directory without modifying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe, incomplete, non-canonical, tampered,
+    /// or concurrently changing finalized directory.
+    #[allow(clippy::too_many_lines)]
+    pub fn validate_dir(directory: &Path) -> Result<()> {
+        let (fd, chain) = open_trusted_parent(directory)?;
+        let initial = validated_inventory_fd(fd.as_fd())?;
+        let mut files = BTreeMap::new();
+        for entry in &initial.files {
+            files.insert(entry.relative.clone(), entry.bytes.as_slice());
+        }
+        let take = |name: &str| -> Result<&[u8]> {
+            files
+                .get(Path::new(name))
+                .copied()
+                .ok_or_else(|| contract("finalized directory member is missing"))
+        };
+        let inputs_bytes = take("release-inputs.json")?;
+        let inputs = ReleaseInputsV1::from_bytes(inputs_bytes)?;
+        let manifest_bytes = take("release-manifest.json")?;
+        let manifest_value = strict_json::parse_value(manifest_bytes)?;
+        let manifest_contract: ReleaseManifest = serde_json::from_value(manifest_value)?;
+        manifest_contract.validate()?;
+        if strict_json::canonical_bytes(&serde_json::to_value(&manifest_contract)?, true)?
+            != manifest_bytes
+        {
+            return Err(contract("release manifest JSON is not canonical"));
+        }
+        let evidence = ReleaseEvidenceV1::from_bytes(take("release-evidence.json")?)?;
+        evidence.validate_files_fd(fd.as_fd())?;
+        let loaded = LoadedManifest {
+            manifest: manifest_contract,
+            manifest_path: directory.join("release-manifest.json"),
+            root: directory.to_path_buf(),
+        };
+        evidence.cross_check_manifest(&loaded)?;
+        if evidence.release != inputs.release {
+            return Err(contract("release inputs and evidence differ"));
+        }
+        let manifest_digest = digest(manifest_bytes);
+        let mut expected = BTreeSet::from([
+            PathBuf::from("release-inputs.json"),
+            PathBuf::from("release-manifest.json"),
+            PathBuf::from("release-evidence.json"),
+            PathBuf::from("SHA256SUMS"),
+        ]);
+        let mut input_by_component = BTreeMap::new();
+        for component in &inputs.components {
+            input_by_component.insert(component.component.as_str(), component);
+        }
+        for component in &evidence.components {
+            let input = input_by_component
+                .get(component.component.as_str())
+                .ok_or_else(|| contract("evidence component is absent from inputs"))?;
+            if component.source_commit != input.source_commit
+                || component.toolchain != input.toolchain
+                || !input.targets.contains(&component.target)
+            {
+                return Err(contract("evidence component mismatches inputs"));
+            }
+            for path in [
+                &component.artifact.path,
+                &component.sbom.path,
+                &component.third_party_notice.path,
+                &component.license.path,
+            ] {
+                expected.insert(path.clone());
+            }
+            expected.insert(PathBuf::from(format!(
+                "components/{}/build-recipe",
+                component.component
+            )));
+            let provenance_path = PathBuf::from(format!("provenance/{}.json", component.component));
+            let provenance: LocalProvenanceV1 = serde_json::from_value(strict_json::parse_value(
+                files
+                    .get(&provenance_path)
+                    .copied()
+                    .ok_or_else(|| contract("provenance is missing"))?,
+            )?)?;
+            let provenance_bytes = files[&provenance_path];
+            if strict_json::canonical_bytes(&serde_json::to_value(&provenance)?, true)?
+                != provenance_bytes
+                || provenance.component != component.component
+                || provenance.source_commit != component.source_commit
+                || provenance.toolchain != component.toolchain
+                || provenance.release_manifest_sha256 != manifest_digest
+                || provenance.artifact != component.artifact
+                || provenance.sbom != component.sbom
+                || provenance.third_party_notice != component.third_party_notice
+                || provenance.license != component.license
+                || component.build_recipe != format!("sha256:{}", provenance.build_recipe.sha256)
+            {
+                return Err(contract("provenance mismatches finalized evidence"));
+            }
+            expected.insert(provenance_path);
+        }
+        for attestation in &evidence.attestations {
+            expected.insert(attestation.path.clone());
+        }
+        let actual: BTreeSet<_> = initial
+            .files
+            .iter()
+            .map(|entry| entry.relative.clone())
+            .collect();
+        if actual != expected {
+            return Err(contract("finalized directory layout is not exact"));
+        }
+        let expected_directories: BTreeSet<PathBuf> = expected
+            .iter()
+            .flat_map(|path| path.ancestors().skip(1))
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect();
+        let actual_directories: BTreeSet<PathBuf> = initial
+            .directories
+            .iter()
+            .map(|entry| entry.relative.clone())
+            .collect();
+        if actual_directories != expected_directories {
+            return Err(contract(
+                "finalized directory aliases or extra directories are present",
+            ));
+        }
+        let sums = take("SHA256SUMS")?;
+        let covered: Vec<_> = initial
+            .files
+            .iter()
+            .filter(|entry| entry.relative != Path::new("SHA256SUMS"))
+            .cloned()
+            .collect();
+        if checksum_manifest(&covered) != sums {
+            return Err(contract(
+                "SHA256SUMS is not canonical or does not cover final files",
+            ));
+        }
+        let final_scan = validated_inventory_fd(fd.as_fd())?;
+        if initial.directories != final_scan.directories
+            || initial.files.len() != final_scan.files.len()
+            || initial.files.iter().zip(&final_scan.files).any(|(a, b)| {
+                a.relative != b.relative
+                    || a.identity != b.identity
+                    || a.nlink != b.nlink
+                    || a.mode != b.mode
+                    || a.size != b.size
+                    || a.mtime != b.mtime
+                    || a.mtime_nsec != b.mtime_nsec
+                    || digest(&a.bytes) != digest(&b.bytes)
+            })
+        {
+            return Err(contract("finalized directory changed during validation"));
+        }
+        if !trusted_parent_matches(directory, &chain)? {
+            return Err(contract(
+                "finalized directory path changed during validation",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn copy_material(
     stage: &Stage,
     input_root: &Path,
@@ -739,6 +917,7 @@ fn copy_material(
     })
 }
 
+#[derive(Clone)]
 struct InventoryEntry {
     relative: PathBuf,
     bytes: Vec<u8>,
@@ -1406,7 +1585,7 @@ mod tests {
         let entries: Vec<_> = checksums.lines().collect();
         assert_eq!(
             entries.len(),
-            31,
+            33,
             "every material, provenance file, and evidence file is covered once"
         );
         let paths: Vec<_> = entries
@@ -1424,6 +1603,7 @@ mod tests {
             assert_eq!(hash, digest(&bytes));
             assert_eq!(size, bytes.len() as u64);
         }
+        ReleaseMaterialsV1::validate_dir(&first).expect("validate finalized directory");
         assert!(assemble(&inputs_path, &manifest_path, &roots, &first).is_err());
     }
     #[test]
@@ -1445,6 +1625,16 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn finalized_snapshot_missing_or_tampered_is_rejected() {
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let output = root.path().join("output");
+        assemble(&inputs_path, &manifest_path, &roots, &output).expect("assemble");
+        fs::remove_file(output.join("release-inputs.json")).expect("remove snapshot");
+        assert!(ReleaseMaterialsV1::validate_dir(&output).is_err());
     }
 
     #[test]
