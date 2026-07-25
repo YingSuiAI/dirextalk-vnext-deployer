@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     digest::{
-        FileIdentity, read_regular_file_descriptor, read_regular_file_fd_relative_descriptor,
+        FileIdentity, StableFileMetadata, read_regular_file_descriptor,
+        read_regular_file_fd_relative_descriptor_with_metadata,
         read_regular_file_relative_descriptor,
     },
     error::{ReleaseError, Result, io_error},
@@ -54,6 +55,7 @@ mod test_seams {
         static BEFORE_FRAGMENT_COPY: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
         static BEFORE_FRAGMENT_OPEN: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
         static BEFORE_ROLE_OPEN: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+        static AFTER_ROLE_READ: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
         static BEFORE_RENAME: std::cell::RefCell<Option<(Sender<()>, Receiver<()>)>> = const { std::cell::RefCell::new(None) };
         static FAIL_STAGE_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -94,6 +96,7 @@ mod test_seams {
         let barrier = BEFORE_FRAGMENT_OPEN.with(|slot| slot.borrow_mut().take());
         if let Some(barrier) = barrier {
             barrier.wait();
+            barrier.wait();
         }
     }
     pub(super) fn set_before_role_open(barrier: Option<Arc<Barrier>>) {
@@ -102,6 +105,17 @@ mod test_seams {
     pub(super) fn before_role_open() {
         let barrier = BEFORE_ROLE_OPEN.with(|slot| slot.borrow_mut().take());
         if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+    pub(super) fn set_after_role_read(barrier: Option<Arc<Barrier>>) {
+        AFTER_ROLE_READ.with(|slot| *slot.borrow_mut() = barrier);
+    }
+    pub(super) fn after_role_read() {
+        let barrier = AFTER_ROLE_READ.with(|slot| slot.borrow_mut().take());
+        if let Some(barrier) = barrier {
+            barrier.wait();
             barrier.wait();
         }
     }
@@ -132,7 +146,8 @@ struct Stage {
     root_fd: OwnedFd,
     root_dev: u64,
     root_ino: u64,
-    _lock_file: File,
+    lock_file: File,
+    lock_held: bool,
     published: bool,
 }
 
@@ -331,7 +346,8 @@ impl Stage {
                         root_fd,
                         root_dev: root_stat.st_dev,
                         root_ino: root_stat.st_ino,
-                        _lock_file: lock_fd,
+                        lock_file: lock_fd,
+                        lock_held: true,
                         published: false,
                     });
                 }
@@ -403,6 +419,16 @@ impl Stage {
             return Err(contract("output parent changed after publication"));
         }
         fsync(&self.parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        self.unlock()?;
+        Ok(())
+    }
+    fn unlock(&mut self) -> Result<()> {
+        if self.lock_held {
+            self.lock_file
+                .unlock()
+                .map_err(io_error(&self.parent_path))?;
+            self.lock_held = false;
+        }
         Ok(())
     }
     fn stage_matches_root(&self) -> Result<bool> {
@@ -438,6 +464,7 @@ impl Stage {
 }
 impl Drop for Stage {
     fn drop(&mut self) {
+        let _ = self.unlock();
         if !self.published && self.stage_matches_root().unwrap_or(false) {
             let _ = clear_dir_fd(&self.root_fd);
             let _ = unlinkat(&self.parent_fd, &self.stage_name, AtFlags::REMOVEDIR);
@@ -514,6 +541,7 @@ struct FragmentSourceGuard {
     parent_chain: Vec<NamespaceIdentity>,
     name: String,
     stat: FragmentStat,
+    baseline: StableFileMetadata,
     fragment: ReleaseInputFragmentV1,
 }
 
@@ -534,7 +562,7 @@ impl FragmentSourceGuard {
         let stat = fragment_stat(&raw, path)?;
         #[cfg(test)]
         test_seams::before_fragment_open();
-        let (bytes, identity) = read_regular_file_fd_relative_descriptor(
+        let (bytes, identity, baseline) = read_regular_file_fd_relative_descriptor_with_metadata(
             parent_fd.as_fd(),
             Path::new(&name),
             stat.size,
@@ -543,7 +571,10 @@ impl FragmentSourceGuard {
         )?;
         let after = statat(&parent_fd, &name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| io_error(path)(std::io::Error::from(error)))?;
-        if !identity_matches_stat(&identity, &raw) || !same_raw_stat(&raw, &after) {
+        if !identity_matches_stat(&identity, &raw)
+            || !stable_matches_raw(&baseline, &raw)
+            || !same_raw_stat(&raw, &after)
+        {
             return Err(ReleaseError::SourceMismatch(path.to_path_buf()));
         }
         let fragment = ReleaseInputFragmentV1::from_bytes(&bytes)?;
@@ -554,6 +585,7 @@ impl FragmentSourceGuard {
             parent_chain,
             name,
             stat,
+            baseline,
             fragment,
         })
     }
@@ -567,7 +599,11 @@ impl FragmentSourceGuard {
             .map_err(|error| io_error(&self.path)(std::io::Error::from(error)))?;
         let retained = statat(&self.parent_fd, &self.name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| io_error(&self.path)(std::io::Error::from(error)))?;
-        if !same_fragment_stat(&self.stat, &current) || !same_fragment_stat(&self.stat, &retained) {
+        if !same_fragment_stat(&self.stat, &current)
+            || !same_fragment_stat(&self.stat, &retained)
+            || !stable_matches_raw(&self.baseline, &current)
+            || !stable_matches_raw(&self.baseline, &retained)
+        {
             return Err(contract("fragment file changed during composition"));
         }
         Ok(())
@@ -607,6 +643,18 @@ fn identity_matches_stat(identity: &FileIdentity, stat: &rustix::fs::Stat) -> bo
     identity.device == stat.st_dev && identity.inode == stat.st_ino
 }
 
+fn stable_matches_raw(stable: &StableFileMetadata, stat: &rustix::fs::Stat) -> bool {
+    stable.device == stat.st_dev
+        && stable.inode == stat.st_ino
+        && stable.mode == stat.st_mode
+        && stable.nlink == stat.st_nlink
+        && stable.size == stat.st_size.cast_unsigned()
+        && stable.mtime == stat.st_mtime
+        && stable.mtime_nsec == stat.st_mtime_nsec
+        && stable.ctime == stat.st_ctime
+        && stable.ctime_nsec == stat.st_ctime_nsec
+}
+
 fn same_raw_stat(expected: &rustix::fs::Stat, actual: &rustix::fs::Stat) -> bool {
     expected.st_dev == actual.st_dev
         && expected.st_ino == actual.st_ino
@@ -615,6 +663,8 @@ fn same_raw_stat(expected: &rustix::fs::Stat, actual: &rustix::fs::Stat) -> bool
         && expected.st_size == actual.st_size
         && expected.st_mtime == actual.st_mtime
         && expected.st_mtime_nsec == actual.st_mtime_nsec
+        && expected.st_ctime == actual.st_ctime
+        && expected.st_ctime_nsec == actual.st_ctime_nsec
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1386,16 +1436,21 @@ fn copy_material_fd(
     }
     #[cfg(test)]
     test_seams::before_role_open();
-    let (bytes, identity) = read_regular_file_fd_relative_descriptor(
+    let (bytes, identity, baseline) = read_regular_file_fd_relative_descriptor_with_metadata(
         input_root,
         source,
         stat.st_size.cast_unsigned(),
         None,
         MAX_MATERIAL_BYTES,
     )?;
+    #[cfg(test)]
+    test_seams::after_role_read();
     let after = statat(input_root, source, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io_error(source)(std::io::Error::from(error)))?;
-    if !identity_matches_stat(&identity, &stat) || !same_raw_stat(&stat, &after) {
+    if !identity_matches_stat(&identity, &stat)
+        || !stable_matches_raw(&baseline, &stat)
+        || !same_raw_stat(&stat, &after)
+    {
         return Err(ReleaseError::SourceMismatch(source.to_path_buf()));
     }
     if !identities.insert(identity) {
@@ -1889,7 +1944,7 @@ fn contract(message: &str) -> ReleaseError {
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::Command;
 
     /// Tests exercise the production namespace policy, so their roots must
@@ -2139,6 +2194,7 @@ mod tests {
             let mut bytes = fs::read(&worker_backup).expect("fragment bytes");
             bytes[0] = if bytes[0] == b'{' { b'[' } else { b'{' };
             fs::write(&worker_replacement, bytes).expect("same-size replacement");
+            barrier.wait();
         });
         let output = root.path().join("composed");
         assert!(compose(&fragments, &output).is_err());
@@ -2168,6 +2224,7 @@ mod tests {
             barrier.wait();
             fs::rename(&worker_replacement, &worker_backup).expect("backup role");
             fs::write(&worker_replacement, b"CHANGE").expect("same-size replacement");
+            barrier.wait();
         });
         let output = root.path().join("composed");
         assert!(compose(&fragments, &output).is_err());
@@ -2177,6 +2234,89 @@ mod tests {
         assert_eq!(staging_count(root.path()), 0);
         fs::remove_file(&replacement).expect("replacement role");
         fs::rename(backup, original).expect("restore role");
+    }
+
+    #[test]
+    fn fragment_same_inode_overwrite_between_stat_and_open_is_rejected() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (_inputs_path, _manifest, _roots, fixture) = assembly_fixture(root.path());
+        let fragment_parent = root.path().join("fragments");
+        let fragments = fragment_fixture(root.path(), &fragment_parent, &fixture);
+        let original = fragment_parent.join("server.json");
+        let original_bytes = fs::read(&original).expect("fragment bytes");
+        let restore_bytes = original_bytes.clone();
+        let metadata = fs::metadata(&original).expect("fragment metadata");
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_before_fragment_open(Some(Arc::clone(&barrier)));
+        let worker = std::thread::spawn({
+            let original = original.clone();
+            move || {
+                barrier.wait();
+                let mut changed = original_bytes;
+                changed[0] = if changed[0] == b'{' { b'[' } else { b'{' };
+                fs::write(&original, changed).expect("same-inode overwrite");
+                restore_mtime(&original, metadata.mtime(), metadata.mtime_nsec());
+                barrier.wait();
+            }
+        });
+        let output = root.path().join("composed");
+        assert!(compose(&fragments, &output).is_err());
+        worker.join().expect("worker");
+        test_seams::set_before_fragment_open(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
+        fs::write(&original, restore_bytes).expect("restore bytes");
+    }
+
+    #[test]
+    fn role_same_inode_overwrite_after_read_is_rejected() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (_inputs_path, _manifest, _roots, fixture) = assembly_fixture(root.path());
+        let fragment_parent = root.path().join("fragments");
+        let fragments = fragment_fixture(root.path(), &fragment_parent, &fixture);
+        let original = fragment_parent.join("server/recipe");
+        let original_bytes = fs::read(&original).expect("role bytes");
+        let metadata = fs::metadata(&original).expect("role metadata");
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_after_role_read(Some(Arc::clone(&barrier)));
+        let worker = std::thread::spawn({
+            let original = original.clone();
+            move || {
+                barrier.wait();
+                fs::write(&original, b"CHANGE").expect("same-inode overwrite");
+                restore_mtime(&original, metadata.mtime(), metadata.mtime_nsec());
+                barrier.wait();
+            }
+        });
+        let output = root.path().join("composed");
+        assert!(compose(&fragments, &output).is_err());
+        worker.join().expect("worker");
+        test_seams::set_after_role_read(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
+        fs::write(&original, original_bytes).expect("restore bytes");
+    }
+
+    fn restore_mtime(path: &Path, seconds: i64, nanos: i64) {
+        use rustix::fs::{CWD, Timespec, Timestamps, utimensat};
+        utimensat(
+            CWD,
+            path,
+            &Timestamps {
+                last_access: Timespec {
+                    tv_sec: seconds,
+                    tv_nsec: nanos,
+                },
+                last_modification: Timespec {
+                    tv_sec: seconds,
+                    tv_nsec: nanos,
+                },
+            },
+            AtFlags::empty(),
+        )
+        .expect("restore mtime");
     }
 
     fn copy_tree(source: &Path, destination: &Path) {
@@ -2748,8 +2888,9 @@ mod tests {
     #[test]
     fn namespace_lock_rejects_second_assembler() {
         let root = TempDir::new().expect("temp");
-        let first = Stage::create(root.path()).expect("first lock");
+        let mut first = Stage::create(root.path()).expect("first lock");
         assert!(Stage::create(root.path()).is_err());
+        first.unlock().expect("unlock first");
         drop(first);
         assert!(Stage::create(root.path()).is_ok());
     }

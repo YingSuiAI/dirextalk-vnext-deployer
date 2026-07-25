@@ -89,6 +89,35 @@ pub(crate) struct FileIdentity {
     pub path: std::path::PathBuf,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StableFileMetadata {
+    pub device: u64,
+    pub inode: u64,
+    pub mode: u32,
+    pub nlink: u64,
+    pub size: u64,
+    pub mtime: i64,
+    pub mtime_nsec: u64,
+    pub ctime: i64,
+    pub ctime_nsec: u64,
+}
+
+#[cfg(unix)]
+fn stable_metadata(metadata: &std::fs::Metadata) -> StableFileMetadata {
+    StableFileMetadata {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        nlink: metadata.nlink(),
+        size: metadata.len(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec().cast_unsigned(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec().cast_unsigned(),
+    }
+}
+
 /// Verify one bounded regular file through a no-follow descriptor.
 ///
 /// On Unix this opens every path component relative to an `O_NOFOLLOW` root
@@ -171,6 +200,26 @@ pub(crate) fn read_regular_file_fd_relative_descriptor(
     expected_sha256: Option<&str>,
     maximum_size: u64,
 ) -> Result<(Vec<u8>, FileIdentity)> {
+    read_regular_file_fd_relative_descriptor_with_metadata(
+        root,
+        relative,
+        expected_size,
+        expected_sha256,
+        maximum_size,
+    )
+    .map(|(bytes, identity, _)| (bytes, identity))
+}
+
+/// Read a bounded regular file and retain the descriptor's authoritative
+/// metadata baseline alongside the bytes and inode identity.
+#[cfg(unix)]
+pub(crate) fn read_regular_file_fd_relative_descriptor_with_metadata(
+    root: BorrowedFd<'_>,
+    relative: &Path,
+    expected_size: u64,
+    expected_sha256: Option<&str>,
+    maximum_size: u64,
+) -> Result<(Vec<u8>, FileIdentity, StableFileMetadata)> {
     let mut opened = open_fd_relative_nofollow(root, relative)?;
     let before = opened.file.metadata().map_err(io_error(relative))?;
     validate_open_metadata(&before, maximum_size, relative)?;
@@ -203,6 +252,7 @@ pub(crate) fn read_regular_file_fd_relative_descriptor(
             device: before.dev(),
             inode: before.ino(),
         },
+        stable_metadata(&before),
     ))
 }
 
@@ -396,6 +446,8 @@ fn same_open_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> 
         && before.len() == after.len()
         && before.mtime() == after.mtime()
         && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
 }
 
 #[cfg(unix)]
@@ -408,4 +460,6 @@ fn same_path_stat(before: &std::fs::Metadata, path_stat: &rustix::fs::Stat) -> b
         && path_stat.st_size.cast_unsigned() == before.len()
         && path_stat.st_mtime == before.mtime()
         && path_stat.st_mtime_nsec == before.mtime_nsec().cast_unsigned()
+        && path_stat.st_ctime == before.ctime()
+        && path_stat.st_ctime_nsec == before.ctime_nsec().cast_unsigned()
 }
