@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{ReleaseError, Result};
+use crate::{ReleaseError, Result, strict_json};
 
 const MAX_COMPONENT_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
@@ -79,7 +79,7 @@ impl AgentBundle {
         if bytes.is_empty() || bytes.len() > MAX_BUNDLE_BYTES {
             return Err(contract("agent bundle bytes are invalid"));
         }
-        let bundle: Self = serde_json::from_slice(bytes)?;
+        let bundle: Self = serde_json::from_value(strict_json::parse_value(bytes)?)?;
         bundle.validate()?;
         if bundle.canonical_bytes()? != bytes {
             return Err(contract("agent bundle JSON is not canonical"));
@@ -379,5 +379,35 @@ mod tests {
         assert!(AgentBundle::from_bytes(&bytes).is_err());
         bytes.extend_from_slice(b" ");
         assert!(AgentBundle::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn raw_duplicate_and_reordered_nested_bundle_json_fails_before_collapse() {
+        let fixture = include_bytes!("../tests/fixtures/agent-bundle-v1-canonical.json");
+        let fixture = String::from_utf8(fixture.to_vec()).expect("utf8");
+        for changed in [
+            fixture.replacen(
+                "\"backend\":\"app_server\"",
+                "\"backend\":\"app_server\",\"backend\":\"app_server\"",
+                1,
+            ),
+            fixture.replacen(
+                "\"role\":\"connector\"",
+                "\"role\":\"connector\",\"role\":\"connector\"",
+                1,
+            ),
+            fixture.replacen(
+                "\"bundle_digest\":\"14daade12ac140eb29529dd60b5af73c3bd5f7364159c93a63b9bc7bae27fbc6\"",
+                "\"bundle_digest\":\"14daade12ac140eb29529dd60b5af73c3bd5f7364159c93a63b9bc7bae27fbc6\",\"bundle_digest\":\"14daade12ac140eb29529dd60b5af73c3bd5f7364159c93a63b9bc7bae27fbc6\"",
+                1,
+            ),
+            fixture.replacen(
+                "\"runtime\":{\"adapter\":\"codex-app-server\",\"kind\":\"codex\"",
+                "\"runtime\":{\"kind\":\"codex\",\"adapter\":\"codex-app-server\"",
+                1,
+            ),
+        ] {
+            assert!(AgentBundle::from_bytes(changed.as_bytes()).is_err());
+        }
     }
 }

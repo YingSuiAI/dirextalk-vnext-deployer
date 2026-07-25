@@ -1380,7 +1380,8 @@ const fn connector_phase_rank(phase: OperationPhase) -> Option<u8> {
 }
 
 fn parse_plan(bytes: &[u8]) -> Result<BootstrapPlan> {
-    let plan: BootstrapPlan = decode_strict(bytes)?;
+    let value = crate::strict_json::parse_value(bytes)?;
+    let plan: BootstrapPlan = serde_json::from_value(value.clone())?;
     let canonical = serde_json::to_vec(&plan)?;
     if canonical != bytes {
         return Err(deployment(

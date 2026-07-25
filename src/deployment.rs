@@ -21,8 +21,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::agent_bundle::AgentBundle;
 use crate::error::{ReleaseError, Result, io_error};
+use crate::{agent_bundle::AgentBundle, strict_json};
 
 const MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(unix)]
@@ -90,7 +90,13 @@ impl DeploymentManifest {
         if bytes.is_empty() || bytes.len() as u64 > MAX_BYTES {
             return Err(contract("deployment manifest bytes are invalid"));
         }
-        let manifest: DeploymentContract = serde_json::from_slice(bytes)?;
+        let value = strict_json::parse_value(bytes)?;
+        let manifest: DeploymentContract = serde_json::from_value(value.clone())?;
+        if manifest.schema_version == 2 && strict_json::canonical_bytes(&value, false)? != bytes {
+            return Err(contract(
+                "schema v2 deployment manifest is not canonical JSON",
+            ));
+        }
         manifest.validate()?;
         Ok(Self {
             manifest,
@@ -2990,6 +2996,38 @@ mod tests {
     #[test]
     fn manifest_v1_accepts_repeated_host_tuple_and_two_connectors() {
         assert!(manifest().validate().is_ok());
+    }
+
+    #[test]
+    fn schema_v2_manifest_requires_canonical_nested_bundle_bytes() {
+        let bundle: AgentBundle = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/agent-bundle-v1-canonical.json"
+        ))
+        .expect("bundle fixture");
+        let mut contract = manifest();
+        contract.schema_version = 2;
+        if let DeploymentTarget::ConnectorHost { connectors, .. } = &mut contract.targets[1] {
+            connectors.truncate(1);
+            connectors[0].agent_bundle = Some(bundle);
+        }
+        let bytes = strict_json::canonical_bytes(
+            &serde_json::to_value(&contract).expect("manifest value"),
+            false,
+        )
+        .expect("canonical manifest");
+        assert!(DeploymentManifest::from_bytes(&bytes).is_ok());
+        let duplicate = String::from_utf8(bytes.clone()).expect("utf8").replacen(
+            "\"backend\":\"app_server\"",
+            "\"backend\":\"app_server\",\"backend\":\"app_server\"",
+            1,
+        );
+        assert!(DeploymentManifest::from_bytes(duplicate.as_bytes()).is_err());
+        let reordered = String::from_utf8(bytes).expect("utf8").replacen(
+            "\"runtime\":{\"adapter\":\"codex-app-server\",\"kind\":\"codex\"",
+            "\"runtime\":{\"kind\":\"codex\",\"adapter\":\"codex-app-server\"",
+            1,
+        );
+        assert!(DeploymentManifest::from_bytes(reordered.as_bytes()).is_err());
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod plan;
 pub mod publish;
 pub mod receipt;
 pub mod source;
+mod strict_json;
 
 pub use cli::{Cli, run};
 pub use error::{ReleaseError, Result};
