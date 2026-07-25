@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod plan;
 pub mod publish;
 pub mod receipt;
+pub mod release_evidence;
 pub mod source;
 mod strict_json;
 

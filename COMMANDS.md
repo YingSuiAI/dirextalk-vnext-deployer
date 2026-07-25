@@ -9,6 +9,7 @@ Run from the repository root.
 | test | `cargo test --locked` |
 | lint | `cargo clippy --locked --all-targets -- -D warnings` |
 | validate example | `cargo run --locked -- validate --manifest release.example.json` |
+| release evidence validation | `cargo run --locked -- release-evidence-validate --evidence release-evidence.json [--manifest release.example.json] [--source-root component=path]` |
 | dry-run plan | `cargo run --locked -- plan --manifest release.example.json --artifacts-dir artifacts --output-dir dist` |
 | native build plan | `cargo run --locked -- build --manifest release.example.json --target windows-x64` |
 | deployment contract validation | `cargo run --locked -- deployment-validate --manifest deployment.example.json` |
@@ -27,6 +28,14 @@ Run from the repository root.
 
 `build` only executes commands when `--execute` is supplied. `publish` also
 requires `--execute` plus one or more destination flags.
+
+`release-evidence-validate` is read-only. It accepts only canonical,
+duplicate-key-free `dirextalk.release-evidence` JSON, verifies local artifact,
+SBOM, notice/license and optional attestation-reference digests, and can check
+supplied Git roots for the pinned commit and a clean worktree. It never
+contacts a network or invokes a publication command. Attestation references
+are DSSE, in-toto, SLSA, or detached-signature evidence files bound by local
+digest; cryptographic signatures are not claimed or verified here.
 
 `deployment-connector-claim` is the root-only, local prerequisite for
 `deployment-connector-apply`. It accepts only a root-owned `0600` deployment

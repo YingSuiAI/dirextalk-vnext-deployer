@@ -83,3 +83,23 @@ These are presence checks, not permission proofs. After an authorized execute,
 verify the pushed image digest, npm version, and GitHub asset hashes. Signed npm
 provenance remains a later release-hardening gate and is not claimed by this
 slice.
+
+## Release evidence v1
+
+`release-evidence-validate` validates a separate canonical JSON contract with
+`schema: "dirextalk.release-evidence"` and `schema_version: 1`. One SemVer
+release records `source_date_epoch` and exactly these components:
+`server`, `client-android`, `connector`, `agent-device-sidecar`, and
+`deployer`. Each component carries a lowercase 40-hex source commit, target,
+toolchain and build-recipe identities, one digest-bound regular-file artifact,
+SBOM, third-party notice, and license evidence. Paths are local, relative to
+the evidence file, bounded, non-empty, non-symlink regular files; recorded
+sizes and SHA-256 digests must match.
+
+Optional DSSE, in-toto, SLSA, and detached-signature references are likewise
+local regular files bound to the component artifact digest. The validator only
+checks their path, size and digest and makes no cryptographic-verification or
+network-access claim. `--manifest` cross-checks release version and any source
+commits pinned by the existing release manifest. Repeated `--source-root
+component=path` arguments additionally require an exact clean Git root. The
+command is read-only and does not publish or invoke remote commands.

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -15,6 +15,7 @@ use crate::{
     manifest::LoadedManifest,
     plan::ReleasePlan,
     publish::{PublicationPlan, PublicationSelection},
+    release_evidence::ReleaseEvidenceV1,
 };
 
 #[derive(Debug, Parser)]
@@ -35,6 +36,20 @@ enum Commands {
     Validate {
         #[arg(long)]
         manifest: PathBuf,
+    },
+    /// Read-only validate a canonical local release-evidence contract.
+    #[command(
+        name = "release-evidence-validate",
+        aliases = ["evidence-validate", "validate-evidence"]
+    )]
+    ReleaseEvidenceValidate {
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Optional `component=repository` roots for clean/source checks.
+        #[arg(long = "source-root", alias = "root")]
+        source_roots: Vec<String>,
     },
     /// Print the immutable local build plan without executing it.
     Plan {
@@ -261,6 +276,31 @@ pub fn run(cli: Cli) -> Result<()> {
                 "version": loaded.manifest.release.version,
                 "image": loaded.manifest.server.image,
                 "targets": loaded.manifest.targets.iter().map(|target| &target.id).collect::<Vec<_>>()
+            }))?;
+        }
+        Commands::ReleaseEvidenceValidate {
+            evidence,
+            manifest,
+            source_roots,
+        } => {
+            let loaded = ReleaseEvidenceV1::load(&evidence)?;
+            let roots = parse_source_roots(&source_roots)?;
+            loaded.validate_source_roots(&roots)?;
+            if let Some(manifest_path) = manifest.as_deref() {
+                let release_manifest = LoadedManifest::load(manifest_path)?;
+                loaded.cross_check_manifest(&release_manifest)?;
+            }
+            print_json(&json!({
+                "valid": true,
+                "schema": &loaded.schema,
+                "schema_version": loaded.schema_version,
+                "version": &loaded.release.version,
+                "source_date_epoch": loaded.release.source_date_epoch,
+                "components": loaded.components.iter().map(|component| &component.component).collect::<Vec<_>>(),
+                "source_roots_checked": roots.keys().collect::<Vec<_>>(),
+                "manifest_checked": manifest.is_some(),
+                "attestations": loaded.attestations.len()
+                    + loaded.components.iter().map(|component| component.attestations.len()).sum::<usize>(),
             }))?;
         }
         Commands::Plan {
@@ -533,6 +573,28 @@ pub fn run(cli: Cli) -> Result<()> {
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn parse_source_roots(values: &[String]) -> Result<BTreeMap<String, PathBuf>> {
+    let mut roots = BTreeMap::new();
+    for value in values {
+        let Some((component, path)) = value.split_once('=') else {
+            return Err(crate::error::ReleaseError::Manifest(
+                "release evidence source root must be component=path".into(),
+            ));
+        };
+        if component.is_empty()
+            || path.is_empty()
+            || roots
+                .insert(component.to_owned(), PathBuf::from(path))
+                .is_some()
+        {
+            return Err(crate::error::ReleaseError::Manifest(
+                "release evidence source root is empty or duplicated".into(),
+            ));
+        }
+    }
+    Ok(roots)
 }
 
 #[cfg(test)]

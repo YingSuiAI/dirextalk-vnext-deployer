@@ -83,6 +83,30 @@ impl SourceRevisions {
     }
 }
 
+/// Verify one externally supplied source root against an exact release commit.
+///
+/// This is deliberately read-only: it only invokes `git rev-parse` and
+/// `git status`, and never fetches, checks out, or mutates the repository.
+pub(crate) fn verify_source_root(repository: &Path, expected: &str) -> Result<()> {
+    let metadata =
+        std::fs::symlink_metadata(repository).map_err(crate::error::io_error(repository))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ReleaseError::InvalidPath(repository.to_path_buf()));
+    }
+    let actual = git_output(repository, &["rev-parse", "HEAD"])?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(ReleaseError::SourceMismatch(repository.to_path_buf()));
+    }
+    let status = git_output(
+        repository,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    )?;
+    if !status.is_empty() {
+        return Err(ReleaseError::DirtyRepository(repository.to_path_buf()));
+    }
+    Ok(())
+}
+
 fn resolve_one(repository: &Path, configured: Option<&str>) -> Result<String> {
     validate_optional_source_commit(configured)?;
     if let Some(configured) = configured {
