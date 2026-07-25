@@ -41,10 +41,12 @@ const MAX_MATERIAL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod test_seams {
+    use std::sync::mpsc::{Receiver, Sender};
     use std::sync::{Arc, Barrier};
+    use std::time::Duration;
     thread_local! {
         static BEFORE_PARENT_RERESOLVE: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
-        static BEFORE_RENAME: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+        static BEFORE_RENAME: std::cell::RefCell<Option<(Sender<()>, Receiver<()>)>> = const { std::cell::RefCell::new(None) };
         static FAIL_STAGE_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     pub(super) fn set_before_parent_reresolve(barrier: Option<Arc<Barrier>>) {
@@ -57,8 +59,8 @@ mod test_seams {
         FAIL_STAGE_INIT.with(|flag| flag.replace(false))
     }
     #[allow(dead_code)]
-    pub(super) fn set_before_rename(barrier: Option<Arc<Barrier>>) {
-        BEFORE_RENAME.with(|slot| *slot.borrow_mut() = barrier);
+    pub(super) fn set_before_rename(seam: Option<(Sender<()>, Receiver<()>)>) {
+        BEFORE_RENAME.with(|slot| *slot.borrow_mut() = seam);
     }
     pub(super) fn before_parent_reresolve() {
         let barrier = BEFORE_PARENT_RERESOLVE.with(|slot| slot.borrow_mut().take());
@@ -68,10 +70,16 @@ mod test_seams {
         }
     }
     pub(super) fn before_rename() {
-        let barrier = BEFORE_RENAME.with(|slot| slot.borrow_mut().take());
-        if let Some(barrier) = barrier {
-            barrier.wait();
-            barrier.wait();
+        let seam = BEFORE_RENAME.with(|slot| slot.borrow_mut().take());
+        if let Some((entered, resume)) = seam {
+            assert!(
+                entered.send(()).is_ok(),
+                "post-SHA seam receiver disappeared"
+            );
+            assert!(
+                resume.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "post-SHA seam timed out"
+            );
         }
     }
 }
@@ -83,13 +91,21 @@ mod test_seams {
 struct Stage {
     parent_path: PathBuf,
     parent_fd: OwnedFd,
-    parent_chain: Vec<DirectoryIdentity>,
+    parent_chain: Vec<NamespaceIdentity>,
     stage_name: String,
     root_fd: OwnedFd,
     root_dev: u64,
     root_ino: u64,
     _lock_file: File,
     published: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NamespaceIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -130,7 +146,22 @@ impl Drop for InitStage<'_> {
     }
 }
 
-fn open_trusted_parent(parent: &Path) -> Result<(OwnedFd, Vec<DirectoryIdentity>)> {
+fn namespace_identity(stat: &rustix::fs::Stat) -> Result<NamespaceIdentity> {
+    let uid = rustix::process::geteuid().as_raw();
+    if stat.st_mode & 0o022 != 0 || (stat.st_uid != uid && stat.st_uid != 0) {
+        return Err(contract(
+            "output path components must be root/current-user owned and not group/other writable",
+        ));
+    }
+    Ok(NamespaceIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        uid: stat.st_uid,
+        mode: stat.st_mode,
+    })
+}
+
+fn open_trusted_parent(parent: &Path) -> Result<(OwnedFd, Vec<NamespaceIdentity>)> {
     let absolute = if parent.is_absolute() {
         parent.to_path_buf()
     } else {
@@ -144,9 +175,9 @@ fn open_trusted_parent(parent: &Path) -> Result<(OwnedFd, Vec<DirectoryIdentity>
         Mode::empty(),
     )
     .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+    let root_stat = fstat(&root).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
     let mut directory = root;
-    let mut relative = PathBuf::from("/");
-    let mut chain = Vec::new();
+    let mut chain = vec![namespace_identity(&root_stat)?];
     for component in absolute.components() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
@@ -167,24 +198,12 @@ fn open_trusted_parent(parent: &Path) -> Result<(OwnedFd, Vec<DirectoryIdentity>
         .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
         let stat =
             fstat(&directory).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
-        if stat.st_mode & 0o022 != 0 {
-            return Err(contract(
-                "output path components must not be group/other writable",
-            ));
-        }
-        relative.push(name);
-        chain.push(DirectoryIdentity {
-            relative: relative.clone(),
-            device: stat.st_dev,
-            inode: stat.st_ino,
-            mode: stat.st_mode,
-            nlink: stat.st_nlink,
-        });
+        chain.push(namespace_identity(&stat)?);
     }
     Ok((directory, chain))
 }
 
-fn trusted_parent_matches(parent: &Path, expected: &[DirectoryIdentity]) -> Result<bool> {
+fn trusted_parent_matches(parent: &Path, expected: &[NamespaceIdentity]) -> Result<bool> {
     let (fd, actual) = open_trusted_parent(parent)?;
     let _ = fd;
     Ok(actual == expected)
@@ -1198,8 +1217,28 @@ fn contract(message: &str) -> ReleaseError {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    use tempfile::TempDir;
+
+    /// Tests exercise the production namespace policy, so their roots must
+    /// not inherit `/tmp`'s sticky world-writable component.
+    struct TempDir(tempfile::TempDir);
+    impl TempDir {
+        fn new() -> std::io::Result<Self> {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("release-materials-tests");
+            fs::create_dir_all(&base)?;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700))?;
+            tempfile::Builder::new()
+                .prefix("case-")
+                .tempdir_in(base)
+                .map(Self)
+        }
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+    }
 
     fn inputs() -> ReleaseInputsV1 {
         ReleaseInputsV1 {
@@ -1459,14 +1498,18 @@ mod tests {
     where
         F: FnOnce(PathBuf) + Send + 'static,
     {
-        use std::sync::{Arc, Barrier};
+        use std::sync::mpsc;
+        use std::time::Duration;
         let root = TempDir::new().expect("temp");
         let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
         let parent = root.path().to_path_buf();
-        let barrier = Arc::new(Barrier::new(2));
-        test_seams::set_before_rename(Some(Arc::clone(&barrier)));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        test_seams::set_before_rename(Some((entered_tx, resume_rx)));
         let worker = std::thread::spawn(move || {
-            barrier.wait();
+            if entered_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                return false;
+            }
             let stage = fs::read_dir(&parent)
                 .expect("parent")
                 .filter_map(std::result::Result::ok)
@@ -1478,11 +1521,15 @@ mod tests {
                 })
                 .expect("stage");
             mutate(stage);
-            barrier.wait();
+            resume_tx.send(()).expect("resume assembly");
+            true
         });
         let output = root.path().join("output");
         assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
-        worker.join().expect("worker");
+        assert!(
+            worker.join().expect("worker"),
+            "post-SHA seam was not reached"
+        );
         test_seams::set_before_rename(None);
         assert!(!output.exists());
         assert_eq!(staging_count(root.path()), 0);
@@ -1612,24 +1659,32 @@ mod tests {
 
     #[test]
     fn competing_output_created_before_rename_is_preserved() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::mpsc;
+        use std::time::Duration;
         let root = TempDir::new().expect("temp");
         let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
         let output = root.path().join("output");
         let worker_output = output.clone();
-        let barrier = Arc::new(Barrier::new(2));
-        test_seams::set_before_rename(Some(Arc::clone(&barrier)));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        test_seams::set_before_rename(Some((entered_tx, resume_rx)));
         let worker = std::thread::spawn(move || {
-            barrier.wait();
+            if entered_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                return false;
+            }
             fs::create_dir(&worker_output).expect("output");
             fs::write(worker_output.join("competitor"), b"preserve").expect("competitor");
-            barrier.wait();
+            resume_tx.send(()).expect("resume assembly");
+            true
         });
         assert!(matches!(
             assemble(&inputs_path, &manifest_path, &roots, &output),
             Err(ReleaseError::OutputNotEmpty(_))
         ));
-        worker.join().expect("worker");
+        assert!(
+            worker.join().expect("worker"),
+            "post-SHA seam was not reached"
+        );
         test_seams::set_before_rename(None);
         assert_eq!(
             fs::read(output.join("competitor")).expect("competitor"),
