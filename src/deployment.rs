@@ -214,6 +214,7 @@ impl DeploymentContract {
                                     ));
                                 }
                                 bundle.validate()?;
+                                bundle.verify_digest()?;
                             }
                             (2, None) => {
                                 return Err(contract(

@@ -84,9 +84,7 @@ impl AgentBundle {
         if bundle.canonical_bytes()? != bytes {
             return Err(contract("agent bundle JSON is not canonical"));
         }
-        if bundle.computed_digest()? != bundle.bundle_digest {
-            return Err(contract("agent bundle digest mismatch"));
-        }
+        bundle.verify_digest()?;
         Ok(bundle)
     }
 
@@ -134,8 +132,21 @@ impl AgentBundle {
             ));
         }
         self.runtime.validate()?;
+        Ok(())
+    }
+
+    /// Verify the self-excluding canonical digest after structural validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the digest is malformed or does not match the
+    /// canonical bundle body.
+    pub fn verify_digest(&self) -> Result<()> {
         if !is_digest(&self.bundle_digest) {
             return Err(contract("agent bundle digest is not lowercase SHA-256"));
+        }
+        if self.computed_digest()? != self.bundle_digest {
+            return Err(contract("agent bundle digest mismatch"));
         }
         Ok(())
     }
@@ -356,5 +367,17 @@ mod tests {
                 "{needle}"
             );
         }
+    }
+
+    #[test]
+    fn stale_digest_rejects_well_shaped_component_tamper() {
+        let mut bundle = positive();
+        bundle.components[0].size = 2;
+        assert!(bundle.validate().is_ok());
+        assert!(bundle.verify_digest().is_err());
+        let mut bytes = bundle.canonical_bytes().expect("canonical");
+        assert!(AgentBundle::from_bytes(&bytes).is_err());
+        bytes.extend_from_slice(b" ");
+        assert!(AgentBundle::from_bytes(&bytes).is_err());
     }
 }

@@ -451,7 +451,9 @@ fn apply_with(
         record.running_revision = Some(revision);
         record.phase = Phase::Running;
         persist_record(&lease, &record)?;
-        advance_to(store, &mut operation, OperationPhase::ReadinessVerified)?;
+        if !bundle_requires_host_readiness(&record) {
+            advance_to(store, &mut operation, OperationPhase::ReadinessVerified)?;
+        }
     }
     if record.phase == Phase::Running {
         ensure_v2_finalization_ready(&record)?;
@@ -516,7 +518,9 @@ fn converge_deployment_projection(
     if phase_rank(record.phase) >= phase_rank(Phase::Started) {
         advance_to(store, operation, OperationPhase::ServicesConverged)?;
     }
-    if phase_rank(record.phase) >= phase_rank(Phase::Running) {
+    if phase_rank(record.phase) >= phase_rank(Phase::Running)
+        && !bundle_requires_host_readiness(record)
+    {
         advance_to(store, operation, OperationPhase::ReadinessVerified)?;
     }
     if record.phase == Phase::Finalized {
@@ -524,6 +528,10 @@ fn converge_deployment_projection(
         advance_to(store, operation, OperationPhase::Completed)?;
     }
     Ok(())
+}
+
+fn bundle_requires_host_readiness(record: &ConnectorExecutionRecordV1) -> bool {
+    record.agent_bundle_digest.is_some()
 }
 
 const fn phase_rank(phase: Phase) -> u8 {
@@ -1527,7 +1535,16 @@ fn validate_plan_bundle(
             "schema v1 Connector operations cannot accept the production Agent Bundle profile",
         ));
     }
+    if plan.target != bundle.target
+        || plan.connector.runtime_profile != bundle.runtime.profile
+        || plan.connector.runtime_profile != "safe"
+    {
+        return Err(deployment(
+            "Connector plan target/profile does not match the Agent Bundle",
+        ));
+    }
     bundle.validate()?;
+    bundle.verify_digest()?;
     if required {
         let configured = target_manifest
             .and_then(|candidate| match candidate {
@@ -2364,5 +2381,6 @@ mod tests {
         record.agent_bundle_digest = Some("a".repeat(64));
         let error = ensure_v2_finalization_ready(&record).expect_err("must fail closed");
         assert!(error.to_string().contains("NotReady"));
+        assert!(bundle_requires_host_readiness(&record));
     }
 }
