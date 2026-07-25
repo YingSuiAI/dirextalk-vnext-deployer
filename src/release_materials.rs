@@ -212,6 +212,7 @@ impl Stage {
         }
         #[cfg(test)]
         test_seams::before_rename();
+        validate_inventory_fd(self.root_fd.as_fd(), inventory)?;
         renameat_with(
             &self.parent_fd,
             &self.stage_name,
