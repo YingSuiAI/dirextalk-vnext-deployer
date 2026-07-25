@@ -6,10 +6,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
-    os::fd::{AsFd, OwnedFd},
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::fs::MetadataExt,
+    },
     path::{Component, Path, PathBuf},
 };
 
+use fs2::FileExt;
 use rustix::{
     fs::{
         AtFlags, FileType, Mode, OFlags, RawDir, RenameFlags, fchmod, fstat, fsync, mkdirat, open,
@@ -82,6 +86,7 @@ struct Stage {
     root_fd: OwnedFd,
     root_dev: u64,
     root_ino: u64,
+    _lock_file: File,
     published: bool,
 }
 impl Stage {
@@ -95,6 +100,38 @@ impl Stage {
         .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
         let parent_stat =
             fstat(&parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        if parent_stat.st_uid != rustix::process::geteuid().as_raw()
+            || parent_stat.st_mode & 0o022 != 0
+        {
+            return Err(contract(
+                "output parent must be owner-only and owned by the current user",
+            ));
+        }
+        let lock_fd = openat(
+            &parent_fd,
+            ".dirextalk-release.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(0o600),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            io_error(parent.join(".dirextalk-release.lock"))(std::io::Error::from(error))
+        })?;
+        let lock_meta = lock_fd.metadata().map_err(io_error(parent))?;
+        if !lock_meta.is_file()
+            || lock_meta.nlink() != 1
+            || lock_meta.uid() != rustix::process::geteuid().as_raw()
+            || lock_meta.mode() & 0o077 != 0
+        {
+            return Err(contract("release lock is unsafe"));
+        }
+        lock_fd.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                contract("another release assembly holds the namespace lock")
+            } else {
+                io_error(parent)(error)
+            }
+        })?;
         for _ in 0..8 {
             let stage_name = format!(".release-evidence-{}", uuid::Uuid::new_v4());
             match mkdirat(&parent_fd, &stage_name, Mode::from_raw_mode(0o700)) {
@@ -127,6 +164,10 @@ impl Stage {
                     let root_stat = fstat(&root_fd).map_err(|error| {
                         io_error(parent.join(&stage_name))(std::io::Error::from(error))
                     })?;
+                    if root_stat.st_dev != created.st_dev || root_stat.st_ino != created.st_ino {
+                        cleanup_created_stage(&parent_fd, &stage_name, &created);
+                        return Err(contract("staging inode changed during initialization"));
+                    }
                     return Ok(Self {
                         parent_path: parent.to_path_buf(),
                         parent_fd,
@@ -136,6 +177,7 @@ impl Stage {
                         root_fd,
                         root_dev: root_stat.st_dev,
                         root_ino: root_stat.st_ino,
+                        _lock_file: lock_fd,
                         published: false,
                     });
                 }
@@ -539,7 +581,8 @@ pub fn assemble(
     // Re-open every staged member through the existing no-follow validator
     // before the checksums and atomic publication make the directory visible.
     evidence.validate_files_fd(stage.root_fd.as_fd())?;
-    let checksums = checksum_manifest_fd(stage.root_fd.as_fd())?;
+    let inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
+    let checksums = checksum_manifest(&inventory);
     stage.write_new(Path::new("SHA256SUMS"), &checksums)?;
     sync_tree_fd(stage.root_fd.as_fd())?;
     for (_, guard) in guards {
@@ -578,32 +621,50 @@ fn copy_material(
     })
 }
 
-fn checksum_manifest_fd(root: impl AsFd) -> Result<Vec<u8>> {
+struct InventoryEntry {
+    relative: PathBuf,
+    bytes: Vec<u8>,
+    identity: FileIdentity,
+}
+
+fn validated_inventory_fd(root: impl AsFd) -> Result<Vec<InventoryEntry>> {
     let mut files = Vec::new();
     collect_files_fd(root.as_fd(), PathBuf::new(), &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files
+        .into_iter()
+        .map(|(relative, bytes, identity)| InventoryEntry {
+            relative,
+            bytes,
+            identity,
+        })
+        .collect())
+}
+
+fn checksum_manifest(files: &[InventoryEntry]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    for (relative, value) in files {
+    for file in files {
+        let _ = &file.identity;
         // SHA256SUMS is deliberately the only excluded member: including its
         // own digest would be recursive. Every other regular final member is
         // represented once as `sha256 size path`, sorted by its relative path.
         bytes.extend_from_slice(
             format!(
                 "{} {} {}\n",
-                digest(&value),
-                value.len(),
-                relative.display()
+                digest(&file.bytes),
+                file.bytes.len(),
+                file.relative.display()
             )
             .as_bytes(),
         );
     }
-    Ok(bytes)
+    bytes
 }
 #[allow(clippy::needless_pass_by_value)]
 fn collect_files_fd(
     root: impl AsFd,
     current: PathBuf,
-    result: &mut Vec<(PathBuf, Vec<u8>)>,
+    result: &mut Vec<(PathBuf, Vec<u8>, FileIdentity)>,
 ) -> Result<()> {
     let mut buffer = Vec::with_capacity(8192);
     let mut names = Vec::new();
@@ -639,14 +700,14 @@ fn collect_files_fd(
                 collect_files_fd(&child, relative, result)?;
             }
             FileType::RegularFile => {
-                let (bytes, _) = crate::digest::read_regular_file_fd_relative_descriptor(
+                let (bytes, identity) = crate::digest::read_regular_file_fd_relative_descriptor(
                     root.as_fd(),
                     Path::new(name_str),
                     stat.st_size.cast_unsigned(),
                     None,
                     MAX_MATERIAL_BYTES,
                 )?;
-                result.push((relative, bytes));
+                result.push((relative, bytes, identity));
             }
             _ => return Err(ReleaseError::UnsafeFile(relative)),
         }
@@ -1220,6 +1281,15 @@ mod tests {
         test_seams::fail_stage_init_once();
         assert!(Stage::create(root.path()).is_err());
         assert_eq!(staging_count(root.path()), 0);
+    }
+
+    #[test]
+    fn namespace_lock_rejects_second_assembler() {
+        let root = TempDir::new().expect("temp");
+        let first = Stage::create(root.path()).expect("first lock");
+        assert!(Stage::create(root.path()).is_err());
+        drop(first);
+        assert!(Stage::create(root.path()).is_ok());
     }
 
     fn staging_count(root: &Path) -> usize {
