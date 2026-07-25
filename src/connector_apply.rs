@@ -1812,7 +1812,7 @@ mod durable_replay_tests {
         root: PathBuf,
         inputs: ConnectorApplyInputs,
         manifest: Vec<u8>,
-        plan: Vec<u8>,
+        plan_typed: BootstrapPlan,
         bundle: AgentBundle,
     }
 
@@ -2130,7 +2130,7 @@ mod durable_replay_tests {
                 issuer_ca: issuer_path,
             },
             manifest,
-            plan,
+            plan_typed: p,
             bundle: b,
         }
     }
@@ -2238,13 +2238,22 @@ mod durable_replay_tests {
         ));
 
         let h = harness();
-        let mut plan_value: serde_json::Value =
-            serde_json::from_slice(&h.plan).expect("plan value");
-        plan_value["connector"]["agent_bundle"]["components"][0]["size"] = 2.into();
-        let tampered_plan = serde_json::to_vec(&plan_value).expect("plan canonical");
+        let mut stale_plan = h.plan_typed.clone();
+        stale_plan
+            .connector
+            .agent_bundle
+            .as_mut()
+            .expect("bundle")
+            .components[0]
+            .size = 2;
+        let tampered_plan = serde_json::to_vec(&stale_plan).expect("plan canonical");
         write_protected(&h.inputs.plan, &tampered_plan, 0o400);
         let store = DeploymentStateStore::for_test(h.root.join("plan-tamper-state"));
-        assert!(apply_with(&h.inputs, &operator, &store).is_err());
+        assert!(matches!(
+            apply_with(&h.inputs, &operator, &store),
+            Err(ReleaseError::Deployment(message))
+                if message == "agent bundle digest mismatch"
+        ));
         assert!(operator.calls().is_empty());
     }
 
@@ -2257,13 +2266,26 @@ mod durable_replay_tests {
         let bytes = crate::strict_json::canonical_bytes(&manifest_value, false).expect("canonical");
         assert!(DeploymentManifest::from_bytes(&bytes).is_err());
 
-        let manifest = DeploymentManifest::from_bytes(&h.manifest).expect("manifest");
-        let schema_v1 = DeploymentManifest::from_bytes(&serde_json::to_vec(&serde_json::json!({
-            "schema_version":1,"server":manifest.contract().server,"connector":manifest.contract().connector,
-            "targets":[{"kind":"connector_host","id":TARGET,"host":host(),"connectors":[{"instance_id":INSTANCE_ID,"adapter_kind":"codex","handoff_digest":digest(HANDOFF)}]}]
-        })).expect("v1 bytes")).expect("schema v1");
-        let plan = parse_plan(&h.plan).expect("plan");
-        assert!(validate_plan_bundle(&schema_v1, &plan, TARGET).is_err());
+        manifest_value["targets"][0]["connectors"][0]
+            .as_object_mut()
+            .expect("connector object")
+            .remove("agent_bundle");
+        let schema_v1_bytes = serde_json::to_vec(&manifest_value).expect("v1 bytes");
+        assert!(DeploymentManifest::from_bytes(&schema_v1_bytes).is_ok());
+        let inputs = h.inputs.clone();
+        write_protected(&inputs.manifest, &schema_v1_bytes, 0o400);
+        let operator = RecordingOperator::default();
+        let store = DeploymentStateStore::for_test(h.root.join("schema-v1-state"));
+        assert!(matches!(
+            apply_with(&inputs, &operator, &store),
+            Err(ReleaseError::Deployment(message))
+                if message == "schema v1 Connector operations cannot accept the production Agent Bundle profile"
+        ));
+        assert!(operator.calls().is_empty());
+        assert!(matches!(
+            store.read(OPERATION_ID),
+            Err(ReleaseError::Io { .. })
+        ));
     }
 
     #[test]
