@@ -4,13 +4,19 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::fd::{AsFd, OwnedFd},
     path::{Component, Path, PathBuf},
 };
 
-use rustix::fs::{RenameFlags, renameat_with};
+use rustix::{
+    fs::{
+        AtFlags, FileType, Mode, OFlags, RawDir, RenameFlags, fchmod, fstat, fsync, mkdirat, open,
+        openat, renameat_with, statat, unlinkat,
+    },
+    io::Errno,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -29,48 +35,144 @@ use crate::{
 const MAX_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_MATERIAL_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(test)]
+mod test_seams {
+    use std::sync::{Arc, Barrier};
+    thread_local! {
+        static BEFORE_PARENT_RERESOLVE: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+        static BEFORE_RENAME: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn set_before_parent_reresolve(barrier: Option<Arc<Barrier>>) {
+        BEFORE_PARENT_RERESOLVE.with(|slot| *slot.borrow_mut() = barrier);
+    }
+    #[allow(dead_code)]
+    pub(super) fn set_before_rename(barrier: Option<Arc<Barrier>>) {
+        BEFORE_RENAME.with(|slot| *slot.borrow_mut() = barrier);
+    }
+    pub(super) fn before_parent_reresolve() {
+        let barrier = BEFORE_PARENT_RERESOLVE.with(|slot| slot.borrow_mut().take());
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+    pub(super) fn before_rename() {
+        let barrier = BEFORE_RENAME.with(|slot| slot.borrow_mut().take());
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+}
+
+#[allow(clippy::struct_field_names)]
 struct Stage {
-    path: PathBuf,
+    parent_path: PathBuf,
+    parent_fd: OwnedFd,
+    parent_dev: u64,
+    parent_ino: u64,
+    stage_name: String,
+    root_fd: OwnedFd,
     published: bool,
 }
 impl Stage {
+    #[allow(clippy::needless_continue)]
     fn create(parent: &Path) -> Result<Self> {
-        let path = parent.join(format!(".release-evidence-{}", uuid::Uuid::now_v7()));
-        fs::create_dir(&path).map_err(io_error(&path))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(io_error(&path))?;
-        Ok(Self {
-            path,
-            published: false,
-        })
+        let parent_fd = open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        let parent_stat =
+            fstat(&parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        for _ in 0..8 {
+            let stage_name = format!(".release-evidence-{}", uuid::Uuid::now_v7());
+            match mkdirat(&parent_fd, &stage_name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {
+                    let root_fd = openat(
+                        &parent_fd,
+                        &stage_name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| {
+                        io_error(parent.join(&stage_name))(std::io::Error::from(error))
+                    })?;
+                    fchmod(&root_fd, Mode::from_raw_mode(0o700)).map_err(|error| {
+                        io_error(parent.join(&stage_name))(std::io::Error::from(error))
+                    })?;
+                    return Ok(Self {
+                        parent_path: parent.to_path_buf(),
+                        parent_fd,
+                        parent_dev: parent_stat.st_dev,
+                        parent_ino: parent_stat.st_ino,
+                        stage_name,
+                        root_fd,
+                        published: false,
+                    });
+                }
+                Err(Errno::EXIST) => continue,
+                Err(error) => return Err(io_error(parent)(std::io::Error::from(error))),
+            }
+        }
+        Err(contract("staging-name collision limit exceeded"))
     }
     fn publish(mut self, output: &Path) -> Result<()> {
         let parent = output
             .parent()
             .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?;
-        let stage_name = self
-            .path
-            .file_name()
-            .ok_or_else(|| ReleaseError::InvalidPath(self.path.clone()))?;
         let output_name = output
             .file_name()
             .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?;
-        let directory = File::open(parent).map_err(io_error(parent))?;
+        #[cfg(test)]
+        test_seams::before_parent_reresolve();
+        let reopened = open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        let reopened_stat =
+            fstat(&reopened).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        if reopened_stat.st_dev != self.parent_dev || reopened_stat.st_ino != self.parent_ino {
+            return Err(contract("output parent changed during assembly"));
+        }
+        #[cfg(test)]
+        test_seams::before_rename();
         renameat_with(
-            &directory,
-            stage_name,
-            &directory,
+            &self.parent_fd,
+            &self.stage_name,
+            &self.parent_fd,
             output_name,
             RenameFlags::NOREPLACE,
         )
-        .map_err(|error| io_error(output)(std::io::Error::from(error)))?;
+        .map_err(|error| {
+            if error == Errno::EXIST {
+                ReleaseError::OutputNotEmpty(output.to_path_buf())
+            } else {
+                io_error(output)(std::io::Error::from(error))
+            }
+        })?;
         self.published = true;
+        fsync(&self.parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
         Ok(())
+    }
+    fn output_exists(&self, output: &Path) -> Result<bool> {
+        let name = output
+            .file_name()
+            .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?;
+        match statat(&self.parent_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(error) => Err(io_error(output)(std::io::Error::from(error))),
+        }
     }
 }
 impl Drop for Stage {
     fn drop(&mut self) {
         if !self.published {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = remove_tree_at(&self.parent_fd, &self.stage_name);
         }
     }
 }
@@ -214,9 +316,6 @@ pub fn assemble(
     roots: &BTreeMap<String, PathBuf>,
     output: &Path,
 ) -> Result<ReleaseEvidenceV1> {
-    if output.exists() {
-        return Err(ReleaseError::OutputNotEmpty(output.to_path_buf()));
-    }
     let inputs = ReleaseInputsV1::load(inputs_path)?;
     if roots.len() != REQUIRED_RELEASE_COMPONENTS.len()
         || roots
@@ -260,6 +359,9 @@ pub fn assemble(
         }
     }
     let stage = Stage::create(parent)?;
+    if stage.output_exists(output)? {
+        return Err(ReleaseError::OutputNotEmpty(output.to_path_buf()));
+    }
     let input_root = inputs_path
         .parent()
         .ok_or_else(|| ReleaseError::InvalidPath(inputs_path.to_path_buf()))?;
@@ -276,35 +378,35 @@ pub fn assemble(
             .head_tree()
             .to_owned();
         let recipe = copy_material(
-            &stage.path,
+            &stage,
             input_root,
             &component.build_recipe.path,
             &format!("components/{}/build-recipe", component.component),
             &mut identities,
         )?;
         let artifact_file = copy_material(
-            &stage.path,
+            &stage,
             input_root,
             &component.artifact.path,
             &format!("components/{}/artifact", component.component),
             &mut identities,
         )?;
         let sbom = copy_material(
-            &stage.path,
+            &stage,
             input_root,
             &component.sbom.path,
             &format!("components/{}/sbom", component.component),
             &mut identities,
         )?;
         let notice = copy_material(
-            &stage.path,
+            &stage,
             input_root,
             &component.third_party_notice.path,
             &format!("components/{}/third-party-notice", component.component),
             &mut identities,
         )?;
         let license = copy_material(
-            &stage.path,
+            &stage,
             input_root,
             &component.license.path,
             &format!("components/{}/license", component.component),
@@ -334,7 +436,7 @@ pub fn assemble(
         let provenance_path = PathBuf::from(format!("provenance/{}.json", component.component));
         let provenance_bytes =
             strict_json::canonical_bytes(&serde_json::to_value(&provenance)?, true)?;
-        write_new(&stage.path, &provenance_path, &provenance_bytes)?;
+        stage.write_new(&provenance_path, &provenance_bytes)?;
         let provenance_digest = digest(&provenance_bytes);
         attestations.push(AttestationReference {
             kind: AttestationKind::InToto,
@@ -370,27 +472,22 @@ pub fn assemble(
     };
     evidence.cross_check_manifest(&manifest)?;
     let evidence_bytes = evidence.canonical_bytes()?;
-    write_new(
-        &stage.path,
-        Path::new("release-evidence.json"),
-        &evidence_bytes,
-    )?;
+    stage.write_new(Path::new("release-evidence.json"), &evidence_bytes)?;
     // Re-open every staged member through the existing no-follow validator
     // before the checksums and atomic publication make the directory visible.
-    evidence.validate_files(&stage.path)?;
-    let checksums = checksum_manifest(&stage.path)?;
-    write_new(&stage.path, Path::new("SHA256SUMS"), &checksums)?;
-    sync_tree(&stage.path)?;
+    evidence.validate_files_fd(stage.root_fd.as_fd())?;
+    let checksums = checksum_manifest_fd(stage.root_fd.as_fd())?;
+    stage.write_new(Path::new("SHA256SUMS"), &checksums)?;
+    sync_tree_fd(stage.root_fd.as_fd())?;
     for (_, guard) in guards {
         guard.finish()?;
     }
     stage.publish(output)?;
-    sync_dir(parent)?;
     Ok(evidence)
 }
 
 fn copy_material(
-    stage: &Path,
+    stage: &Stage,
     input_root: &Path,
     source: &Path,
     destination: &str,
@@ -410,7 +507,7 @@ fn copy_material(
         return Err(contract("input roles must not share an inode"));
     }
     let path = PathBuf::from(destination);
-    write_new(stage, &path, &bytes)?;
+    stage.write_new(&path, &bytes)?;
     Ok(FileEvidence {
         path,
         size: bytes.len() as u64,
@@ -418,16 +515,12 @@ fn copy_material(
     })
 }
 
-fn checksum_manifest(root: &Path) -> Result<Vec<u8>> {
+fn checksum_manifest_fd(root: impl AsFd) -> Result<Vec<u8>> {
     let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
-    files.sort();
+    collect_files_fd(root.as_fd(), PathBuf::new(), &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut bytes = Vec::new();
-    for path in files {
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| ReleaseError::InvalidPath(path.clone()))?;
-        let value = fs::read(&path).map_err(io_error(&path))?;
+    for (relative, value) in files {
         // SHA256SUMS is deliberately the only excluded member: including its
         // own digest would be recursive. Every other regular final member is
         // represented once as `sha256 size path`, sorted by its relative path.
@@ -443,57 +536,197 @@ fn checksum_manifest(root: &Path) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn collect_files(root: &Path, current: &Path, result: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(current).map_err(io_error(current))? {
-        let path = entry.map_err(io_error(current))?.path();
-        let meta = fs::symlink_metadata(&path).map_err(io_error(&path))?;
-        if meta.file_type().is_symlink() {
-            return Err(ReleaseError::UnsafeFile(path));
+#[allow(clippy::needless_pass_by_value)]
+fn collect_files_fd(
+    root: impl AsFd,
+    current: PathBuf,
+    result: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result<()> {
+    let mut buffer = Vec::with_capacity(8192);
+    let mut names = Vec::new();
+    {
+        let mut dir = RawDir::new(root.as_fd(), buffer.spare_capacity_mut());
+        while let Some(entry) = dir.next() {
+            let entry = entry.map_err(|error| io_error(&current)(std::io::Error::from(error)))?;
+            let name = entry.file_name().to_bytes();
+            if name != b"." && name != b".." {
+                names.push(name.to_vec());
+            }
         }
-        if meta.is_dir() {
-            collect_files(root, &path, result)?;
-        } else if meta.is_file() {
-            result.push(path);
+    }
+    for name in names {
+        let name_str =
+            std::str::from_utf8(&name).map_err(|_| ReleaseError::UnsafeFile(current.clone()))?;
+        let stat = statat(&root, name_str, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| io_error(&current)(std::io::Error::from(error)))?;
+        let relative = if current.as_os_str().is_empty() {
+            PathBuf::from(name_str)
         } else {
-            return Err(ReleaseError::UnsafeFile(path));
+            current.join(name_str)
+        };
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let child = openat(
+                    &root,
+                    name_str,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
+                collect_files_fd(&child, relative, result)?;
+            }
+            FileType::RegularFile => {
+                let mut file = openat(
+                    &root,
+                    name_str,
+                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes).map_err(io_error(&relative))?;
+                result.push((relative, bytes));
+            }
+            _ => return Err(ReleaseError::UnsafeFile(relative)),
         }
     }
-    let _ = root;
     Ok(())
 }
-fn write_new(root: &Path, relative: &Path, bytes: &[u8]) -> Result<()> {
-    safe_relative(relative)?;
-    let path = root.join(relative);
-    let parent = path
-        .parent()
-        .ok_or_else(|| ReleaseError::InvalidPath(path.clone()))?;
-    fs::create_dir_all(parent).map_err(io_error(parent))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(io_error(&path))?;
-    file.write_all(bytes).map_err(io_error(&path))?;
-    file.sync_all().map_err(io_error(&path))?;
-    sync_dir(parent)?;
-    Ok(())
+
+impl Stage {
+    fn write_new(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
+        safe_relative(relative)?;
+        let (parent_fd, name) = self.open_parent(relative)?;
+        let path = self.parent_path.join(&self.stage_name).join(relative);
+        let mut file = openat(
+            &parent_fd,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(0o600),
+        )
+        .map(File::from)
+        .map_err(|error| io_error(&path)(std::io::Error::from(error)))?;
+        file.write_all(bytes).map_err(io_error(&path))?;
+        file.sync_all().map_err(io_error(&path))?;
+        fsync(&parent_fd).map_err(|error| io_error(&path)(std::io::Error::from(error)))?;
+        Ok(())
+    }
+
+    fn open_parent(&self, relative: &Path) -> Result<(OwnedFd, String)> {
+        let components: Vec<_> = relative.components().collect();
+        let (last, parents) = components
+            .split_last()
+            .ok_or_else(|| ReleaseError::InvalidPath(relative.to_path_buf()))?;
+        let mut directory = openat(
+            &self.root_fd,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
+        for component in parents {
+            let Component::Normal(name) = component else {
+                return Err(ReleaseError::InvalidPath(relative.to_path_buf()));
+            };
+            let name = name
+                .to_str()
+                .ok_or_else(|| ReleaseError::InvalidPath(relative.to_path_buf()))?;
+            match mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(error) => return Err(io_error(relative)(std::io::Error::from(error))),
+            }
+            directory = openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
+        }
+        let Component::Normal(name) = last else {
+            return Err(ReleaseError::InvalidPath(relative.to_path_buf()));
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| ReleaseError::InvalidPath(relative.to_path_buf()))?;
+        Ok((directory, name.to_owned()))
+    }
 }
-fn sync_tree(path: &Path) -> Result<()> {
-    for entry in fs::read_dir(path).map_err(io_error(path))? {
-        let path = entry.map_err(io_error(path))?.path();
-        if path.is_dir() {
-            sync_tree(&path)?;
-            sync_dir(&path)?;
+
+fn sync_tree_fd(root: impl AsFd) -> Result<()> {
+    let mut buffer = Vec::with_capacity(8192);
+    let mut names = Vec::new();
+    {
+        let mut dir = RawDir::new(root.as_fd(), buffer.spare_capacity_mut());
+        while let Some(entry) = dir.next() {
+            let entry =
+                entry.map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+            let name = entry.file_name().to_bytes();
+            if name != b"." && name != b".." {
+                names.push(name.to_vec());
+            }
         }
     }
-    sync_dir(path)
+    for name in names {
+        let name = std::str::from_utf8(&name).map_err(|_| contract("invalid staging entry"))?;
+        let stat = statat(&root, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            let child = openat(
+                &root,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+            sync_tree_fd(&child)?;
+        } else if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(ReleaseError::UnsafeFile(PathBuf::from(name)));
+        }
+    }
+    fsync(&root).map_err(|error| io_error("staging fd")(std::io::Error::from(error)))
 }
-fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)
-        .map_err(io_error(path))?
-        .sync_all()
-        .map_err(io_error(path))
+
+fn remove_tree_at(parent: impl AsFd, name: &str) -> Result<()> {
+    let child = match openat(
+        &parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(io_error(name)(std::io::Error::from(error))),
+    };
+    let mut buffer = Vec::with_capacity(8192);
+    let mut names = Vec::new();
+    {
+        let mut dir = RawDir::new(&child, buffer.spare_capacity_mut());
+        while let Some(entry) = dir.next() {
+            let entry = entry.map_err(|error| io_error(name)(std::io::Error::from(error)))?;
+            let child_name = entry.file_name().to_bytes();
+            if child_name != b"." && child_name != b".." {
+                names.push(child_name.to_vec());
+            }
+        }
+    }
+    for child_name in names {
+        let child_name =
+            std::str::from_utf8(&child_name).map_err(|_| contract("invalid staging entry"))?;
+        match statat(&child, child_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
+                remove_tree_at(&child, child_name)?;
+            }
+            Ok(_) => {
+                let _ = unlinkat(&child, child_name, AtFlags::empty());
+            }
+            Err(_) => {}
+        }
+    }
+    unlinkat(&parent, name, AtFlags::REMOVEDIR)
+        .map_err(|error| io_error(name)(std::io::Error::from(error)))?;
+    Ok(())
 }
 fn ensure_directory(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path).map_err(io_error(path))?;
@@ -607,26 +840,12 @@ mod tests {
         let root = TempDir::new().expect("temp");
         let source = root.path().join("one");
         fs::write(&source, b"material").expect("write");
+        let stage = Stage::create(root.path()).expect("stage");
         let mut seen = BTreeSet::new();
-        let first = copy_material(
-            root.path(),
-            root.path(),
-            Path::new("one"),
-            "out/a",
-            &mut seen,
-        )
-        .expect("first");
+        let first = copy_material(&stage, root.path(), Path::new("one"), "out/a", &mut seen)
+            .expect("first");
         assert_eq!(first.size, 8);
-        assert!(
-            copy_material(
-                root.path(),
-                root.path(),
-                Path::new("one"),
-                "out/b",
-                &mut seen
-            )
-            .is_err()
-        );
+        assert!(copy_material(&stage, root.path(), Path::new("one"), "out/b", &mut seen).is_err());
     }
 
     fn git(repository: &Path, arguments: &[&str]) {
@@ -770,6 +989,138 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn material_replacement_after_read_is_rejected_without_residue() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, fixture) = assembly_fixture(root.path());
+        let target = root.path().join(&fixture.components[0].build_recipe.path);
+        let barrier = Arc::new(Barrier::new(2));
+        crate::digest::set_after_material_read_barrier(Some(Arc::clone(&barrier)));
+        let replacement = target.clone();
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            fs::write(replacement, b"replacement").expect("replace");
+            barrier.wait();
+        });
+        let output = root.path().join("output");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        worker.join().expect("worker");
+        crate::digest::set_after_material_read_barrier(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
+    }
+
+    #[test]
+    fn material_truncation_after_read_is_rejected_without_residue() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, fixture) = assembly_fixture(root.path());
+        let target = root.path().join(&fixture.components[0].build_recipe.path);
+        let barrier = Arc::new(Barrier::new(2));
+        crate::digest::set_after_material_read_barrier(Some(Arc::clone(&barrier)));
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(target)
+                .expect("truncate");
+            barrier.wait();
+        });
+        let output = root.path().join("output");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        worker.join().expect("worker");
+        crate::digest::set_after_material_read_barrier(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
+    }
+
+    #[test]
+    fn parent_replacement_is_rejected_and_retained_fd_cleanup_is_scoped() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let parent = root.path().to_path_buf();
+        let renamed = root.path().with_extension("renamed");
+        let worker_parent = parent.clone();
+        let worker_renamed = renamed.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_before_parent_reresolve(Some(Arc::clone(&barrier)));
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            fs::rename(&worker_parent, &worker_renamed).expect("rename parent");
+            fs::create_dir(&worker_parent).expect("replacement parent");
+            barrier.wait();
+        });
+        let output = root.path().join("output");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        worker.join().expect("worker");
+        test_seams::set_before_parent_reresolve(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(&renamed), 0);
+        fs::remove_dir(&parent).expect("remove replacement");
+        fs::rename(renamed, parent).expect("restore parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_symlink_replacement_is_rejected_and_cleanup_stays_on_original() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let parent = root.path().to_path_buf();
+        let renamed = root.path().with_extension("symlink-renamed");
+        let target = root.path().with_extension("symlink-target");
+        fs::create_dir(&target).expect("target");
+        let worker_parent = parent.clone();
+        let worker_renamed = renamed.clone();
+        let worker_target = target.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_before_parent_reresolve(Some(Arc::clone(&barrier)));
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            fs::rename(&worker_parent, &worker_renamed).expect("rename parent");
+            symlink(&worker_target, &worker_parent).expect("symlink parent");
+            barrier.wait();
+        });
+        let output = parent.join("output");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        worker.join().expect("worker");
+        test_seams::set_before_parent_reresolve(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(&renamed), 0);
+        fs::remove_file(&parent).expect("remove symlink");
+        fs::rename(renamed, parent).expect("restore parent");
+        fs::remove_dir(target).expect("remove target");
+    }
+
+    #[test]
+    fn competing_output_is_preserved_and_stage_removed() {
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let output = root.path().join("output");
+        fs::create_dir(&output).expect("output");
+        fs::write(output.join("keep"), b"keep").expect("keep");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        assert_eq!(fs::read(output.join("keep")).expect("keep"), b"keep");
+        assert_eq!(staging_count(root.path()), 0);
+    }
+
+    fn staging_count(root: &Path) -> usize {
+        fs::read_dir(root)
+            .expect("dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".release-evidence-")
+            })
+            .count()
     }
 
     #[test]

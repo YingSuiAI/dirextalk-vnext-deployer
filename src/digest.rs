@@ -5,7 +5,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{os::fd::OwnedFd, os::unix::fs::MetadataExt};
+use std::{
+    os::fd::{BorrowedFd, OwnedFd},
+    os::unix::fs::MetadataExt,
+};
 
 #[cfg(unix)]
 use rustix::fs::{AtFlags, Mode, OFlags, open, openat, statat};
@@ -14,6 +17,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{ReleaseError, Result, io_error};
+
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_MATERIAL_READ: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_material_read_barrier(barrier: Option<Arc<Barrier>>) {
+    AFTER_MATERIAL_READ.with(|slot| *slot.borrow_mut() = barrier);
+}
+
+#[cfg(test)]
+fn after_material_read() {
+    let barrier = AFTER_MATERIAL_READ.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +139,54 @@ pub(crate) fn read_regular_file_relative_descriptor(
         .read_to_end(&mut bytes)
         .map_err(io_error(relative))?;
     let bytes_read = bytes.len() as u64;
+    #[cfg(test)]
+    after_material_read();
+    let after = opened.file.metadata().map_err(io_error(relative))?;
+    let path_stat = statat(&opened.directory, &opened.name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
+    if !same_open_metadata(&before, &after)
+        || !same_path_stat(&before, &path_stat)
+        || bytes_read != expected_size
+        || expected_sha256.is_some_and(|expected| hex::encode(Sha256::digest(&bytes)) != expected)
+    {
+        return Err(ReleaseError::SourceMismatch(relative.to_path_buf()));
+    }
+    Ok((
+        bytes,
+        FileIdentity {
+            device: before.dev(),
+            inode: before.ino(),
+        },
+    ))
+}
+
+/// Read a bounded regular file relative to an already-retained directory fd.
+/// This is the fd-root counterpart to `read_regular_file_relative_descriptor`;
+/// it never re-resolves the root path.
+#[cfg(unix)]
+pub(crate) fn read_regular_file_fd_relative_descriptor(
+    root: BorrowedFd<'_>,
+    relative: &Path,
+    expected_size: u64,
+    expected_sha256: Option<&str>,
+    maximum_size: u64,
+) -> Result<(Vec<u8>, FileIdentity)> {
+    let mut opened = open_fd_relative_nofollow(root, relative)?;
+    let before = opened.file.metadata().map_err(io_error(relative))?;
+    validate_open_metadata(&before, maximum_size, relative)?;
+    if before.len() != expected_size {
+        return Err(ReleaseError::SourceMismatch(relative.to_path_buf()));
+    }
+    let mut bytes = Vec::new();
+    opened
+        .file
+        .by_ref()
+        .take(maximum_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_error(relative))?;
+    let bytes_read = bytes.len() as u64;
+    #[cfg(test)]
+    after_material_read();
     let after = opened.file.metadata().map_err(io_error(relative))?;
     let path_stat = statat(&opened.directory, &opened.name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
@@ -212,6 +285,55 @@ fn open_relative_nofollow(root: &Path, relative: &Path) -> Result<OpenedFile> {
     )
     .map_err(|error| io_error(root)(std::io::Error::from(error)))?;
     let mut directory = root_fd;
+    for component in parents {
+        let std::path::Component::Normal(name) = component else {
+            return Err(ReleaseError::InvalidPath(relative.to_path_buf()));
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| ReleaseError::InvalidPath(relative.to_path_buf()))?;
+        directory = openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
+    }
+    let std::path::Component::Normal(name) = last else {
+        return Err(ReleaseError::InvalidPath(relative.to_path_buf()));
+    };
+    let name = name
+        .to_str()
+        .ok_or_else(|| ReleaseError::InvalidPath(relative.to_path_buf()))?;
+    let file = openat(
+        &directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
+    Ok(OpenedFile {
+        file,
+        directory,
+        name: name.to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn open_fd_relative_nofollow(root: BorrowedFd<'_>, relative: &Path) -> Result<OpenedFile> {
+    let components: Vec<_> = relative.components().collect();
+    let (last, parents) = components
+        .split_last()
+        .ok_or_else(|| ReleaseError::InvalidPath(relative.to_path_buf()))?;
+    let mut directory = openat(
+        root,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
     for component in parents {
         let std::path::Component::Normal(name) = component else {
             return Err(ReleaseError::InvalidPath(relative.to_path_buf()));

@@ -6,6 +6,8 @@
 //! only; this module intentionally does not perform cryptographic verification
 //! or network access.
 
+#[cfg(unix)]
+use std::os::fd::BorrowedFd;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -17,7 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    digest::{FileIdentity, read_regular_file_descriptor, verify_regular_file_descriptor},
+    digest::{
+        FileIdentity, read_regular_file_descriptor, read_regular_file_fd_relative_descriptor,
+        verify_regular_file_descriptor,
+    },
     error::{ReleaseError, Result, io_error},
     manifest::{LoadedManifest, ReleaseTarget},
     source::verify_source_root,
@@ -286,6 +291,85 @@ impl ReleaseEvidenceV1 {
                 component,
                 attestation,
                 &mut attestation_paths,
+                &mut evidence_paths,
+                &mut evidence_identities,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Validate all referenced files relative to a retained directory fd.
+    /// This is crate-private so release assembly can remain anchored to its
+    /// fd-owned staging root even if the diagnostic path is renamed.
+    #[cfg(unix)]
+    pub(crate) fn validate_files_fd(&self, root: BorrowedFd<'_>) -> Result<()> {
+        let mut artifact_ids = BTreeSet::new();
+        let mut evidence_paths = BTreeSet::new();
+        let mut evidence_identities = BTreeSet::new();
+        let mut attestation_paths = BTreeSet::new();
+        for component in &self.components {
+            verify_file_fd(
+                root,
+                &component.artifact.path,
+                component.artifact.size,
+                &component.artifact.sha256,
+                "artifact",
+                &mut evidence_paths,
+                &mut evidence_identities,
+            )?;
+            if !artifact_ids.insert(component.artifact.identity.clone()) {
+                return Err(contract("duplicate artifact identity"));
+            }
+            for (label, file) in [
+                ("sbom", &component.sbom),
+                ("third_party_notice", &component.third_party_notice),
+                ("license", &component.license),
+            ] {
+                verify_file_fd(
+                    root,
+                    &file.path,
+                    file.size,
+                    &file.sha256,
+                    label,
+                    &mut evidence_paths,
+                    &mut evidence_identities,
+                )?;
+            }
+            for attestation in &component.attestations {
+                validate_attestation(attestation, component)?;
+                if !attestation_paths.insert(attestation.path.clone()) {
+                    return Err(contract("duplicate attestation path"));
+                }
+                verify_file_fd(
+                    root,
+                    &attestation.path,
+                    attestation.size,
+                    &attestation.sha256,
+                    "attestation",
+                    &mut evidence_paths,
+                    &mut evidence_identities,
+                )?;
+            }
+        }
+        for attestation in &self.attestations {
+            let component = self
+                .components
+                .iter()
+                .find(|component| {
+                    component.component == attestation.component
+                        && component_targets(component).contains(&attestation.target.as_str())
+                })
+                .ok_or_else(|| contract("attestation component/target is not present"))?;
+            validate_attestation(attestation, component)?;
+            if !attestation_paths.insert(attestation.path.clone()) {
+                return Err(contract("duplicate attestation path"));
+            }
+            verify_file_fd(
+                root,
+                &attestation.path,
+                attestation.size,
+                &attestation.sha256,
+                "attestation",
                 &mut evidence_paths,
                 &mut evidence_identities,
             )?;
@@ -707,6 +791,37 @@ fn verify_file(
     let identity =
         verify_regular_file_descriptor(root, relative, size, digest, MAX_REFERENCED_FILE_BYTES)
             .map_err(|_| contract(&format!("{label} is missing, unsafe, or changed")))?;
+    if !evidence_identities.insert(identity) {
+        return Err(contract(&format!(
+            "duplicate opened evidence file for {label}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_file_fd(
+    root: BorrowedFd<'_>,
+    relative: &Path,
+    size: u64,
+    digest: &str,
+    label: &str,
+    evidence_paths: &mut BTreeSet<PathBuf>,
+    evidence_identities: &mut BTreeSet<FileIdentity>,
+) -> Result<()> {
+    validate_path(relative, "file.path")?;
+    if !evidence_paths.insert(relative.to_path_buf()) {
+        return Err(contract(&format!("duplicate evidence path for {label}")));
+    }
+    let identity = read_regular_file_fd_relative_descriptor(
+        root,
+        relative,
+        size,
+        Some(digest),
+        MAX_REFERENCED_FILE_BYTES,
+    )
+    .map_err(|_| contract(&format!("{label} is missing, unsafe, or changed")))?
+    .1;
     if !evidence_identities.insert(identity) {
         return Err(contract(&format!(
             "duplicate opened evidence file for {label}"
