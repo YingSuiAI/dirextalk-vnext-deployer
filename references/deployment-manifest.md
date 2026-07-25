@@ -1,9 +1,20 @@
-# Deployment manifest v1 (offline foundation)
+# Deployment manifest v1/v2 (offline foundation)
 
 `deployment.example.json` is a separate strict contract from release manifest v1.
 It names immutable server and Connector artifacts by version plus SHA-256 digest,
 and binds each logical target to one HTTPS origin, role, and exact host tuple.
 It contains no credentials, paths, commands, environment, or mutable tags.
+
+Schema v1 remains readable for legacy operations and has no Agent Bundle. A
+schema-v2 `connector_host` target must carry an `agent_bundle` on every
+Connector binding. The bundle is the canonical
+`dirextalk.agent-bundle`/`schema_version: 1` contract for `linux-amd64` and
+`codex-app-server-safe-v1`; it contains exactly the sorted `connector`,
+`agent_device`, and `runtime_launcher` component metadata, the bounded Agent
+Control protocol and sidecar route requirements, and the closed Codex runtime
+profile. Its SHA-256 `bundle_digest` covers canonical JSON with the digest
+field omitted. Other adapter kinds remain supported peers elsewhere but are
+rejected by this production profile rather than treated as a fallback.
 
 Host `owner_id` is the stable product IdentityId (`dtxi1` followed by exactly
 52 lowercase base32 characters), not a UUID. Tenant, Host, Host credential,

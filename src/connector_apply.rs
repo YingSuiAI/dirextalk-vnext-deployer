@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    agent_bundle::{AgentBundle, AgentBundleComponent},
     deployment::{
         AdapterKind, BindingWorkload, ConnectorClaimPhase, DeploymentManifest,
         DeploymentStateStore, OperationPhase, OperationRecord, require_canonical_uuid7,
@@ -81,6 +82,10 @@ struct ConnectorExecutionRecordV1 {
     control_ca_sha256: String,
     issuer_ca_sha256: String,
     lifecycle_material_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_bundle_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_bundle_components: Option<Vec<AgentBundleComponent>>,
     initial_revision: Revision,
     prepare_host_operation_id: String,
     start_host_operation_id: String,
@@ -185,6 +190,8 @@ struct PlanConnector {
     server_origin: String,
     trust: PlanTrust,
     runtime_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_bundle: Option<AgentBundle>,
     remote_mcp: RemoteMcp,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -310,6 +317,7 @@ fn apply_with(
     let plan_file = ProtectedBytes::read(&inputs.plan, MAX_PLAN, ProtectedKind::NonSecret)?;
     let plan = parse_plan(&plan_file.bytes)?;
     validate_plan_platform(&plan)?;
+    validate_plan_bundle(&manifest, &plan, &inputs.target)?;
 
     let mut operation = store.read(&inputs.operation_id)?;
     validate_operation(&operation, &manifest, &plan, &inputs.target)?;
@@ -446,6 +454,7 @@ fn apply_with(
         advance_to(store, &mut operation, OperationPhase::ReadinessVerified)?;
     }
     if record.phase == Phase::Running {
+        ensure_v2_finalization_ready(&record)?;
         let running = record
             .running_revision
             .ok_or_else(|| deployment("missing Running revision"))?;
@@ -484,6 +493,15 @@ fn apply_with(
         lifecycle_operation_id: record.lifecycle_operation_id,
         state: "finalized".into(),
     })
+}
+
+fn ensure_v2_finalization_ready(record: &ConnectorExecutionRecordV1) -> Result<()> {
+    if record.agent_bundle_digest.is_some() {
+        return Err(deployment(
+            "NotReady: v2 finalization requires the unsupported Host/server readiness gate",
+        ));
+    }
+    Ok(())
 }
 
 fn converge_deployment_projection(
@@ -696,6 +714,8 @@ struct V2Header {
     control_ca_sha256: String,
     issuer_ca_sha256: String,
     lifecycle_material_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_bundle_digest: Option<String>,
     payload_sha256: String,
     prepared_receipt_sha256: Option<String>,
     operation: V2Operation,
@@ -826,6 +846,16 @@ fn new_record(
         control_ca_sha256: files.control.digest.clone(),
         issuer_ca_sha256: files.issuer.digest.clone(),
         lifecycle_material_sha256: digest(&files.prepare_material),
+        agent_bundle_digest: plan
+            .connector
+            .agent_bundle
+            .as_ref()
+            .map(|bundle| bundle.bundle_digest.clone()),
+        agent_bundle_components: plan
+            .connector
+            .agent_bundle
+            .as_ref()
+            .map(AgentBundle::component_metadata),
         initial_revision,
         prepare_host_operation_id: Uuid::now_v7().to_string(),
         start_host_operation_id: Uuid::now_v7().to_string(),
@@ -982,6 +1012,7 @@ fn v2_header(
         control_ca_sha256: record.control_ca_sha256.clone(),
         issuer_ca_sha256: record.issuer_ca_sha256.clone(),
         lifecycle_material_sha256: record.lifecycle_material_sha256.clone(),
+        agent_bundle_digest: record.agent_bundle_digest.clone(),
         payload_sha256: digest(payload),
         prepared_receipt_sha256: match operation {
             V2Operation::PrepareConnectorMaterial => None,
@@ -1444,6 +1475,14 @@ fn validate_record_identity(
     {
         return Err(ReleaseError::OperationConflict);
     }
+    let expected_bundle = plan.connector.agent_bundle.as_ref();
+    if record.agent_bundle_digest.as_deref()
+        != expected_bundle.map(|bundle| bundle.bundle_digest.as_str())
+        || record.agent_bundle_components.as_deref()
+            != expected_bundle.map(|bundle| bundle.components.as_slice())
+    {
+        return Err(ReleaseError::OperationConflict);
+    }
     for id in [
         &record.prepare_host_operation_id,
         &record.start_host_operation_id,
@@ -1456,6 +1495,54 @@ fn validate_record_identity(
         || record.start_host_operation_id == record.finalize_host_operation_id
     {
         return Err(ReleaseError::OperationConflict);
+    }
+    Ok(())
+}
+
+fn validate_plan_bundle(
+    manifest: &DeploymentManifest,
+    plan: &BootstrapPlan,
+    target: &str,
+) -> Result<()> {
+    let target_manifest = manifest
+        .contract()
+        .targets
+        .iter()
+        .find(|candidate| candidate.id() == target);
+    let required = manifest.contract().schema_version == 2
+        && target_manifest.is_some_and(|candidate| {
+            matches!(
+                candidate,
+                crate::deployment::DeploymentTarget::ConnectorHost { .. }
+            )
+        });
+    let Some(bundle) = plan.connector.agent_bundle.as_ref() else {
+        if required {
+            return Err(deployment("v2 Connector plan is missing agent_bundle"));
+        }
+        return Ok(());
+    };
+    if !required {
+        return Err(deployment(
+            "schema v1 Connector operations cannot accept the production Agent Bundle profile",
+        ));
+    }
+    bundle.validate()?;
+    if required {
+        let configured = target_manifest
+            .and_then(|candidate| match candidate {
+                crate::deployment::DeploymentTarget::ConnectorHost { connectors, .. } => connectors
+                    .iter()
+                    .find(|binding| binding.instance_id == plan.connector.instance_id),
+                crate::deployment::DeploymentTarget::Node { .. } => None,
+            })
+            .and_then(|binding| binding.agent_bundle.as_ref())
+            .ok_or_else(|| deployment("v2 Connector target has no configured agent_bundle"))?;
+        if configured.bundle_digest != bundle.bundle_digest
+            || configured.components != bundle.components
+        {
+            return Err(ReleaseError::OperationConflict);
+        }
     }
     Ok(())
 }
@@ -2249,6 +2336,8 @@ mod tests {
             control_ca_sha256: plan.connector.trust.control_server_root_ca_sha256.clone(),
             issuer_ca_sha256: plan.connector.trust.connector_issuer_root_ca_sha256.clone(),
             lifecycle_material_sha256: "3".repeat(64),
+            agent_bundle_digest: None,
+            agent_bundle_components: None,
             initial_revision: Revision {
                 desired: 1,
                 observed: Some(1),
@@ -2265,5 +2354,15 @@ mod tests {
             finalize_result: None,
             integrity_sha256: String::new(),
         }
+    }
+
+    #[test]
+    fn v2_bundle_finalization_is_explicitly_not_ready_until_host_gate_exists() {
+        let plan = parse_plan(PLAN).expect("plan");
+        let mut record = record(&plan);
+        assert!(ensure_v2_finalization_ready(&record).is_ok());
+        record.agent_bundle_digest = Some("a".repeat(64));
+        let error = ensure_v2_finalization_ready(&record).expect_err("must fail closed");
+        assert!(error.to_string().contains("NotReady"));
     }
 }

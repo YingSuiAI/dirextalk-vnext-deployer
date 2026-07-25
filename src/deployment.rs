@@ -21,6 +21,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::agent_bundle::AgentBundle;
 use crate::error::{ReleaseError, Result, io_error};
 
 const MAX_BYTES: u64 = 1024 * 1024;
@@ -126,9 +127,10 @@ pub struct DeploymentContract {
 }
 
 impl DeploymentContract {
+    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 {
-            return Err(contract("schema_version must be exactly 1"));
+        if !matches!(self.schema_version, 1 | 2) {
+            return Err(contract("schema_version must be exactly 1 or 2"));
         }
         self.server.validate("server")?;
         self.connector.validate("connector")?;
@@ -198,6 +200,28 @@ impl DeploymentContract {
                     }
                     for connector in bindings {
                         connector.validate()?;
+                        match (self.schema_version, &connector.agent_bundle) {
+                            (1, None) => {}
+                            (1, Some(_)) => {
+                                return Err(contract(
+                                    "schema v1 Connector targets cannot carry an Agent Bundle",
+                                ));
+                            }
+                            (2, Some(bundle)) => {
+                                if connector.adapter_kind != AdapterKind::Codex {
+                                    return Err(contract(
+                                        "the production Agent Bundle profile accepts only codex",
+                                    ));
+                                }
+                                bundle.validate()?;
+                            }
+                            (2, None) => {
+                                return Err(contract(
+                                    "schema v2 Connector targets require agent_bundle",
+                                ));
+                            }
+                            _ => unreachable!(),
+                        }
                         if !connectors.insert(&connector.instance_id) {
                             return Err(contract("duplicate connector instance"));
                         }
@@ -356,6 +380,8 @@ pub struct ConnectorBinding {
     pub instance_id: String,
     pub adapter_kind: AdapterKind,
     pub handoff_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_bundle: Option<AgentBundle>,
 }
 impl ConnectorBinding {
     fn validate(&self) -> Result<()> {
@@ -2661,6 +2687,7 @@ mod tests {
                         instance_id: binding.instance_id.clone(),
                         adapter_kind: binding.adapter_kind,
                         handoff_digest: binding.handoff_digest.clone(),
+                        agent_bundle: None,
                     })
                     .collect(),
             },
@@ -2705,6 +2732,7 @@ mod tests {
                                 AdapterKind::Rig
                             },
                             handoff_digest: DIGEST.into(),
+                            agent_bundle: None,
                         })
                         .collect(),
                 }],
@@ -2914,6 +2942,7 @@ mod tests {
                             handoff_digest:
                                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                                     .into(),
+                            agent_bundle: None,
                         },
                         ConnectorBinding {
                             instance_id: "018f856e-e0bd-76d2-9428-58d50cf77eaf".into(),
@@ -2921,6 +2950,7 @@ mod tests {
                             handoff_digest:
                                 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
                                     .into(),
+                            agent_bundle: None,
                         },
                     ],
                 },

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod agent_bundle;
 pub mod archive;
 pub mod aws_ec2;
 pub mod cli;
