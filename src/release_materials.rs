@@ -536,6 +536,8 @@ fn contract(message: &str) -> ReleaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn inputs() -> ReleaseInputsV1 {
@@ -614,5 +616,162 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn git(repository: &Path, arguments: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(arguments)
+                .status()
+                .expect("git")
+                .success()
+        );
+    }
+    fn repository(root: &Path, name: &str) -> (PathBuf, String) {
+        let path = root.join(name);
+        fs::create_dir(&path).expect("repo");
+        git(&path, &["init", "-q"]);
+        git(&path, &["config", "user.email", "test@example.invalid"]);
+        git(&path, &["config", "user.name", "test"]);
+        fs::write(path.join("README"), name).expect("readme");
+        for file in ["Cargo.toml", "LICENSE", "NOTICE", "Dockerfile", "go.mod"] {
+            fs::write(path.join(file), "fixture").expect("fixture file");
+        }
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-qm", "fixture"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("head");
+        (
+            path,
+            String::from_utf8(output.stdout)
+                .expect("utf8")
+                .trim()
+                .to_owned(),
+        )
+    }
+    fn assembly_fixture(
+        root: &Path,
+    ) -> (PathBuf, PathBuf, BTreeMap<String, PathBuf>, ReleaseInputsV1) {
+        let mut roots = BTreeMap::new();
+        let mut commits = BTreeMap::new();
+        for component in REQUIRED_RELEASE_COMPONENTS {
+            let (path, commit) = repository(root, &format!("repo-{component}"));
+            roots.insert((*component).into(), path);
+            commits.insert(*component, commit);
+        }
+        let mut fixture = inputs();
+        for component in &mut fixture.components {
+            component.source_commit = commits[component.component.as_str()].clone();
+            component.targets = if component.component == "server" {
+                vec!["linux-amd64".into()]
+            } else {
+                vec!["linux-x64".into()]
+            };
+            for (path, bytes) in [
+                (&component.build_recipe.path, b"recipe".as_slice()),
+                (&component.artifact.path, b"artifact".as_slice()),
+                (&component.sbom.path, b"sbom".as_slice()),
+                (&component.third_party_notice.path, b"notice".as_slice()),
+                (&component.license.path, b"license".as_slice()),
+            ] {
+                let full = root.join(path);
+                fs::create_dir_all(full.parent().expect("parent")).expect("dir");
+                fs::write(full, bytes).expect("material");
+            }
+        }
+        let inputs_path = root.join("release-inputs.json");
+        fs::write(&inputs_path, fixture.canonical_bytes().expect("inputs")).expect("inputs write");
+        let manifest = serde_json::json!({"schema_version":1,"release":{"version":"1.2.3","source_date_epoch":1},"server":{"repository":"repo-server","dockerfile":"Dockerfile","image":"example/server","platforms":["linux/amd64"],"source_commit":commits["server"]},"deployer":{"repository":"repo-deployer","package":"deployer","binary":"deployer","source_commit":commits["deployer"]},"connector":{"repository":"repo-connector","module":"./cmd","binary":"connector","source_commit":commits["connector"]},"targets":[{"id":"linux-x64","rust_target":"x86_64-unknown-linux-gnu","rust_native":true,"goos":"linux","goarch":"amd64","node_platform":"linux","node_arch":"x64","archive":"tar_gz"}],"npm":{"package":"@example/release","access":"public"},"github":{"repository":"example/repo","tag_prefix":"v"}});
+        let manifest_path = root.join("release.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("manifest write");
+        (inputs_path, manifest_path, roots, fixture)
+    }
+    #[test]
+    fn deterministic_assembly_round_trips_and_refuses_existing_output() {
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        assemble(&inputs_path, &manifest_path, &roots, &first).expect("first");
+        assemble(&inputs_path, &manifest_path, &roots, &second).expect("second");
+        for name in [
+            "release-evidence.json",
+            "SHA256SUMS",
+            "provenance/server.json",
+        ] {
+            assert_eq!(
+                fs::read(first.join(name)).expect("first bytes"),
+                fs::read(second.join(name)).expect("second bytes")
+            );
+        }
+        ReleaseEvidenceV1::load(&first.join("release-evidence.json")).expect("reopen");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &first).is_err());
+    }
+    #[test]
+    fn failed_copy_cleans_stage_and_does_not_publish() {
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, fixture) = assembly_fixture(root.path());
+        fs::remove_file(root.path().join(&fixture.components[0].artifact.path)).expect("remove");
+        let output = root.path().join("output");
+        assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
+        assert!(!output.exists());
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("dir")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".release-evidence-"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cli_assemble_then_validate_fixture() {
+        let root = TempDir::new().expect("temp");
+        let (inputs, manifest, roots, _) = assembly_fixture(root.path());
+        let output = root.path().join("cli-output");
+        let mut assemble = vec![
+            "dirextalk-vnext-deployer".to_owned(),
+            "release-evidence-assemble".to_owned(),
+            "--inputs".to_owned(),
+            inputs.display().to_string(),
+            "--manifest".to_owned(),
+            manifest.display().to_string(),
+            "--output".to_owned(),
+            output.display().to_string(),
+        ];
+        for (component, path) in &roots {
+            assemble.push("--source-root".to_owned());
+            assemble.push(format!("{component}={}", path.display()));
+        }
+        crate::run(crate::Cli::try_parse_from(assemble).expect("assemble args"))
+            .expect("assemble cli");
+        let mut validate = vec![
+            "dirextalk-vnext-deployer".to_owned(),
+            "release-evidence-validate".to_owned(),
+            "--evidence".to_owned(),
+            output.join("release-evidence.json").display().to_string(),
+            "--manifest".to_owned(),
+            manifest.display().to_string(),
+        ];
+        for (component, path) in roots {
+            validate.push("--source-root".to_owned());
+            validate.push(format!("{component}={}", path.display()));
+        }
+        crate::run(crate::Cli::try_parse_from(validate).expect("validate args"))
+            .expect("validate cli");
     }
 }
