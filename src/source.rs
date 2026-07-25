@@ -93,6 +93,7 @@ pub(crate) fn verify_source_root(repository: &Path, expected: &str) -> Result<()
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(ReleaseError::InvalidPath(repository.to_path_buf()));
     }
+    let identity = source_root_identity(&metadata);
     let actual = git_output(repository, &["rev-parse", "HEAD"])?;
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(ReleaseError::SourceMismatch(repository.to_path_buf()));
@@ -104,7 +105,35 @@ pub(crate) fn verify_source_root(repository: &Path, expected: &str) -> Result<()
     if !status.is_empty() {
         return Err(ReleaseError::DirtyRepository(repository.to_path_buf()));
     }
+    let after =
+        std::fs::symlink_metadata(repository).map_err(crate::error::io_error(repository))?;
+    if after.file_type().is_symlink() || !after.is_dir() || source_root_identity(&after) != identity
+    {
+        return Err(ReleaseError::SourceMismatch(repository.to_path_buf()));
+    }
     Ok(())
+}
+
+fn source_root_identity(metadata: &std::fs::Metadata) -> (u64, u64, u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mtime().cast_unsigned(),
+            metadata.mtime_nsec().cast_unsigned(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |value| value.as_nanos() as u64);
+        (0, 0, metadata.len(), modified)
+    }
 }
 
 fn resolve_one(repository: &Path, configured: Option<&str>) -> Result<String> {

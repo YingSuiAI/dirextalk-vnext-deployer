@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    digest::digest_regular_file,
+    digest::{FileIdentity, verify_regular_file_descriptor},
     error::{ReleaseError, Result, io_error},
     manifest::LoadedManifest,
     source::verify_source_root,
@@ -182,6 +182,8 @@ impl ReleaseEvidenceV1 {
     pub fn validate_files(&self, root: &Path) -> Result<()> {
         require_directory_root(root)?;
         let mut artifact_ids = BTreeSet::new();
+        let mut evidence_paths = BTreeSet::new();
+        let mut evidence_identities = BTreeSet::new();
         let mut attestation_paths = BTreeSet::new();
         for component in &self.components {
             verify_file(
@@ -190,6 +192,8 @@ impl ReleaseEvidenceV1 {
                 component.artifact.size,
                 &component.artifact.sha256,
                 "artifact",
+                &mut evidence_paths,
+                &mut evidence_identities,
             )?;
             if !artifact_ids.insert(component.artifact.identity.clone()) {
                 return Err(contract("duplicate artifact identity"));
@@ -199,10 +203,25 @@ impl ReleaseEvidenceV1 {
                 ("third_party_notice", &component.third_party_notice),
                 ("license", &component.license),
             ] {
-                verify_file(root, &file.path, file.size, &file.sha256, label)?;
+                verify_file(
+                    root,
+                    &file.path,
+                    file.size,
+                    &file.sha256,
+                    label,
+                    &mut evidence_paths,
+                    &mut evidence_identities,
+                )?;
             }
             for attestation in &component.attestations {
-                verify_attestation(root, component, attestation, &mut attestation_paths)?;
+                verify_attestation(
+                    root,
+                    component,
+                    attestation,
+                    &mut attestation_paths,
+                    &mut evidence_paths,
+                    &mut evidence_identities,
+                )?;
             }
         }
         for attestation in &self.attestations {
@@ -214,7 +233,14 @@ impl ReleaseEvidenceV1 {
                         && component.target == attestation.target
                 })
                 .ok_or_else(|| contract("attestation component/target is not present"))?;
-            verify_attestation(root, component, attestation, &mut attestation_paths)?;
+            verify_attestation(
+                root,
+                component,
+                attestation,
+                &mut attestation_paths,
+                &mut evidence_paths,
+                &mut evidence_identities,
+            )?;
         }
         Ok(())
     }
@@ -260,6 +286,11 @@ impl ReleaseEvidenceV1 {
         if self.release.version != manifest.manifest.release.version {
             return Err(contract("release evidence version mismatches manifest"));
         }
+        if self.release.source_date_epoch != manifest.manifest.release.source_date_epoch {
+            return Err(contract(
+                "release evidence source_date_epoch mismatches manifest",
+            ));
+        }
         for (component, configured) in [
             ("server", manifest.manifest.server.source_commit.as_deref()),
             (
@@ -286,6 +317,44 @@ impl ReleaseEvidenceV1 {
                     ));
                 }
             }
+        }
+        let mut covered_targets = BTreeSet::new();
+        for component in &self.components {
+            let target = manifest.manifest.targets.iter().find(|target| {
+                target.id == component.target
+                    || format!("{}-{}", target.goos, target.goarch) == component.target
+                    || format!("{}-{}", target.node_platform, target.node_arch) == component.target
+                    || target.rust_target == component.target
+            });
+            if let Some(target) = target {
+                if let Some(toolchain) = &target.rust_toolchain
+                    && component.toolchain != *toolchain
+                {
+                    return Err(contract(
+                        "release evidence toolchain mismatches manifest target",
+                    ));
+                }
+                covered_targets.insert(target.id.as_str());
+                continue;
+            }
+            if component.component == "server"
+                && manifest
+                    .manifest
+                    .server
+                    .platforms
+                    .iter()
+                    .any(|platform| platform.replace('/', "-") == component.target)
+            {
+                continue;
+            }
+            return Err(contract(
+                "release evidence target is not a manifest member or server platform",
+            ));
+        }
+        if covered_targets.len() < manifest.manifest.targets.len() {
+            return Err(contract(
+                "release evidence does not cover every manifest target",
+            ));
         }
         Ok(())
     }
@@ -319,7 +388,7 @@ impl ReleaseEvidenceV1 {
         let mut components = BTreeSet::new();
         let mut targets = BTreeSet::new();
         let mut artifacts = BTreeSet::new();
-        let mut artifact_paths = BTreeSet::new();
+        let mut evidence_paths = BTreeSet::new();
         let mut attestation_paths = BTreeSet::new();
         for component in &self.components {
             if !REQUIRED_COMPONENTS.contains(&component.component.as_str())
@@ -339,9 +408,7 @@ impl ReleaseEvidenceV1 {
             if !artifacts.insert(component.artifact.identity.clone()) {
                 return Err(contract("duplicate artifact identity"));
             }
-            if !artifact_paths.insert(component.artifact.path.clone()) {
-                return Err(contract("duplicate artifact path"));
-            }
+            insert_contract_path(&mut evidence_paths, &component.artifact.path, "artifact")?;
             if !is_commit(&component.source_commit) {
                 return Err(contract("source_commit must be lowercase 40-hex"));
             }
@@ -350,8 +417,16 @@ impl ReleaseEvidenceV1 {
             validate_file_shape(&component.sbom, "sbom")?;
             validate_file_shape(&component.third_party_notice, "third_party_notice")?;
             validate_file_shape(&component.license, "license")?;
+            insert_contract_path(&mut evidence_paths, &component.sbom.path, "sbom")?;
+            insert_contract_path(
+                &mut evidence_paths,
+                &component.third_party_notice.path,
+                "third_party_notice",
+            )?;
+            insert_contract_path(&mut evidence_paths, &component.license.path, "license")?;
             validate_attestations(&component.attestations, component)?;
             for attestation in &component.attestations {
+                insert_contract_path(&mut evidence_paths, &attestation.path, "attestation")?;
                 if !attestation_paths.insert(attestation.path.clone()) {
                     return Err(contract("duplicate attestation path"));
                 }
@@ -370,6 +445,7 @@ impl ReleaseEvidenceV1 {
         }
         validate_attestation_list(&self.attestations, self)?;
         for attestation in &self.attestations {
+            insert_contract_path(&mut evidence_paths, &attestation.path, "attestation")?;
             if !attestation_paths.insert(attestation.path.clone()) {
                 return Err(contract("duplicate attestation path"));
             }
@@ -449,6 +525,8 @@ fn verify_attestation(
     component: &EvidenceComponent,
     attestation: &AttestationReference,
     paths: &mut BTreeSet<PathBuf>,
+    evidence_paths: &mut BTreeSet<PathBuf>,
+    evidence_identities: &mut BTreeSet<FileIdentity>,
 ) -> Result<()> {
     validate_attestation(attestation, component)?;
     if !paths.insert(attestation.path.clone()) {
@@ -460,6 +538,8 @@ fn verify_attestation(
         attestation.size,
         &attestation.sha256,
         "attestation",
+        evidence_paths,
+        evidence_identities,
     )
 }
 
@@ -480,15 +560,26 @@ fn validate_artifact_shape(file: &ArtifactEvidence) -> Result<()> {
     validate_file_shape(&file.as_file(), "artifact")
 }
 
-fn verify_file(root: &Path, relative: &Path, size: u64, digest: &str, label: &str) -> Result<()> {
-    let path = safe_join(root, relative)?;
-    let actual = digest_regular_file(&path, MAX_REFERENCED_FILE_BYTES)
-        .map_err(|_| contract(&format!("{label} is missing, unsafe, or oversize")))?;
-    if actual.size != size {
-        return Err(contract(&format!("{label} size mismatch")));
+fn verify_file(
+    root: &Path,
+    relative: &Path,
+    size: u64,
+    digest: &str,
+    label: &str,
+    evidence_paths: &mut BTreeSet<PathBuf>,
+    evidence_identities: &mut BTreeSet<FileIdentity>,
+) -> Result<()> {
+    validate_path(relative, "file.path")?;
+    if !evidence_paths.insert(relative.to_path_buf()) {
+        return Err(contract(&format!("duplicate evidence path for {label}")));
     }
-    if actual.sha256 != digest {
-        return Err(contract(&format!("{label} digest mismatch")));
+    let identity =
+        verify_regular_file_descriptor(root, relative, size, digest, MAX_REFERENCED_FILE_BYTES)
+            .map_err(|_| contract(&format!("{label} is missing, unsafe, or changed")))?;
+    if !evidence_identities.insert(identity) {
+        return Err(contract(&format!(
+            "duplicate opened evidence file for {label}"
+        )));
     }
     Ok(())
 }
@@ -512,22 +603,6 @@ fn validate_path(path: &Path, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn safe_join(root: &Path, relative: &Path) -> Result<PathBuf> {
-    validate_path(relative, "file.path")?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(contract("file.path contains an unsafe component"));
-        };
-        current.push(name);
-        let metadata = fs::symlink_metadata(&current).map_err(io_error(&current))?;
-        if metadata.file_type().is_symlink() {
-            return Err(contract("file.path traverses a symlink"));
-        }
-    }
-    Ok(current)
-}
-
 fn require_directory_root(root: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(root).map_err(io_error(root))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -538,6 +613,13 @@ fn require_directory_root(root: &Path) -> Result<()> {
 
 fn validate_artifact_identity(value: &str) -> Result<()> {
     validate_identity(value, "artifact.identity")
+}
+
+fn insert_contract_path(paths: &mut BTreeSet<PathBuf>, path: &Path, label: &str) -> Result<()> {
+    if !paths.insert(path.to_path_buf()) {
+        return Err(contract(&format!("duplicate evidence path for {label}")));
+    }
+    Ok(())
 }
 
 fn validate_lower_token(value: &str, label: &str) -> Result<()> {
@@ -607,6 +689,7 @@ fn contract(message: &str) -> ReleaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::fs;
     use tempfile::TempDir;
@@ -697,5 +780,103 @@ mod tests {
         evidence
             .validate_files(root.path())
             .expect("fixture remains valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_aliases_are_rejected_across_evidence_roles() {
+        let (root, mut evidence) = fixture();
+        let component = evidence
+            .components
+            .iter_mut()
+            .find(|component| component.component == "server")
+            .expect("server");
+        let artifact = root.path().join(&component.artifact.path);
+        let license = root.path().join(&component.license.path);
+        fs::remove_file(&license).expect("remove license");
+        fs::hard_link(&artifact, &license).expect("hardlink");
+        component.license.size = component.artifact.size;
+        component.license.sha256 = component.artifact.sha256.clone();
+        assert!(evidence.validate_files(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_replacement_is_rejected_without_following() {
+        let (root, evidence) = fixture();
+        let component = evidence
+            .components
+            .iter()
+            .find(|component| component.component == "server")
+            .expect("server");
+        let artifact = root.path().join(&component.artifact.path);
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"artifact").expect("replacement");
+        fs::remove_file(&artifact).expect("remove artifact");
+        std::os::unix::fs::symlink(&replacement, &artifact).expect("symlink");
+        assert!(evidence.validate_files(root.path()).is_err());
+    }
+
+    #[test]
+    fn manifest_cross_check_covers_epoch_target_and_toolchain() {
+        let (evidence_root, mut evidence) = fixture();
+        let manifest_root = TempDir::new().expect("manifest root");
+        for directory in ["server/docker/release", "deployer", "connector"] {
+            fs::create_dir_all(manifest_root.path().join(directory)).expect("manifest directory");
+        }
+        fs::write(
+            manifest_root.path().join("server/Cargo.toml"),
+            b"[workspace]\n",
+        )
+        .expect("server cargo");
+        fs::write(
+            manifest_root
+                .path()
+                .join("server/docker/release/Dockerfile"),
+            b"FROM scratch\n",
+        )
+        .expect("dockerfile");
+        fs::write(
+            manifest_root.path().join("deployer/Cargo.toml"),
+            b"[package]\n",
+        )
+        .expect("deployer cargo");
+        fs::write(manifest_root.path().join("deployer/LICENSE"), b"MIT\n")
+            .expect("deployer license");
+        fs::write(
+            manifest_root.path().join("connector/go.mod"),
+            b"module example.invalid/connector\n",
+        )
+        .expect("go mod");
+        fs::write(manifest_root.path().join("connector/LICENSE"), b"MIT\n")
+            .expect("connector license");
+        fs::write(manifest_root.path().join("connector/NOTICE"), b"NOTICE\n")
+            .expect("connector notice");
+        let manifest_path = manifest_root.path().join("release.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "release": {"version": "1.2.3", "source_date_epoch": 1},
+                "server": {"repository": "server", "dockerfile": "docker/release/Dockerfile", "image": "dirextalk/vent", "platforms": ["linux/amd64"]},
+                "deployer": {"repository": "deployer", "package": "dirextalk-vnext-deployer", "binary": "dirextalk-vnext-deployer"},
+                "connector": {"repository": "connector", "module": "./cmd/dirextalk-agent-connector", "binary": "dirextalk-agent-connector"},
+                "targets": [{"id": "linux-x64", "rust_target": "x86_64-unknown-linux-gnu", "goos": "linux", "goarch": "amd64", "node_platform": "linux", "node_arch": "x64", "archive": "tar_gz"}],
+                "npm": {"package": "@dirextalk/vnext-deployer", "access": "public"},
+                "github": {"repository": "YingSuiAI/dirextalk-vnext-deployer", "tag_prefix": "v"}
+            }))
+            .expect("manifest json"),
+        )
+        .expect("manifest");
+        let manifest = LoadedManifest::load(&manifest_path).expect("manifest load");
+        evidence
+            .cross_check_manifest(&manifest)
+            .expect("overlapping facts match");
+        evidence.release.source_date_epoch = 2;
+        assert!(evidence.cross_check_manifest(&manifest).is_err());
+        evidence.release.source_date_epoch = 1;
+        evidence.components[0].target = "windows-x64".into();
+        assert!(evidence.cross_check_manifest(&manifest).is_err());
+        drop(evidence_root);
     }
 }
