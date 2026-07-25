@@ -56,6 +56,7 @@ mod test_seams {
         static BEFORE_FRAGMENT_OPEN: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
         static BEFORE_ROLE_OPEN: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
         static AFTER_ROLE_READ: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+        static BEFORE_STAGE_UNLOCK: std::cell::RefCell<Option<(Sender<()>, Receiver<()>)>> = const { std::cell::RefCell::new(None) };
         static BEFORE_RENAME: std::cell::RefCell<Option<(Sender<()>, Receiver<()>)>> = const { std::cell::RefCell::new(None) };
         static FAIL_STAGE_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -117,6 +118,16 @@ mod test_seams {
         if let Some(barrier) = barrier {
             barrier.wait();
             barrier.wait();
+        }
+    }
+    pub(super) fn set_before_stage_unlock(seam: Option<(Sender<()>, Receiver<()>)>) {
+        BEFORE_STAGE_UNLOCK.with(|slot| *slot.borrow_mut() = seam);
+    }
+    pub(super) fn before_stage_unlock() {
+        let seam = BEFORE_STAGE_UNLOCK.with(|slot| slot.borrow_mut().take());
+        if let Some((entered, resume)) = seam {
+            entered.send(()).expect("stage unlock seam entered");
+            resume.recv().expect("stage unlock seam resumed");
         }
     }
     pub(super) fn before_rename() {
@@ -464,11 +475,13 @@ impl Stage {
 }
 impl Drop for Stage {
     fn drop(&mut self) {
-        let _ = self.unlock();
         if !self.published && self.stage_matches_root().unwrap_or(false) {
             let _ = clear_dir_fd(&self.root_fd);
             let _ = unlinkat(&self.parent_fd, &self.stage_name, AtFlags::REMOVEDIR);
         }
+        #[cfg(test)]
+        test_seams::before_stage_unlock();
+        let _ = self.unlock();
     }
 }
 
@@ -2893,6 +2906,30 @@ mod tests {
         first.unlock().expect("unlock first");
         drop(first);
         assert!(Stage::create(root.path()).is_ok());
+    }
+
+    #[test]
+    fn stage_drop_keeps_lock_until_cleanup_finishes() {
+        use std::sync::mpsc;
+        let root = TempDir::new().expect("temp");
+        let stage = Stage::create(root.path()).expect("stage");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        test_seams::set_before_stage_unlock(Some((entered_tx, resume_rx)));
+        let worker_root = root.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            entered_rx.recv().expect("unlock seam entered");
+            let blocked = Stage::create(&worker_root).is_err();
+            result_tx.send(blocked).expect("lock result");
+            resume_tx.send(()).expect("resume unlock");
+        });
+        drop(stage);
+        assert!(result_rx.recv().expect("lock result"));
+        worker.join().expect("worker");
+        test_seams::set_before_stage_unlock(None);
+        let mut next = Stage::create(root.path()).expect("next stage");
+        next.unlock().expect("unlock next");
     }
 
     fn staging_count(root: &Path) -> usize {
