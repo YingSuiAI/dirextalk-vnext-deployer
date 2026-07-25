@@ -78,6 +78,11 @@ impl SourceEvidenceGuard {
         &self.repository
     }
 
+    /// The immutable tree object observed while the cooperative guard is held.
+    pub(crate) fn head_tree(&self) -> &str {
+        &self.before.tree
+    }
+
     pub(crate) fn finish(self) -> Result<()> {
         let (git_dir, _) = resolve_git_dirs(&self.repository)?;
         let after = snapshot(&self.repository, &git_dir)?;

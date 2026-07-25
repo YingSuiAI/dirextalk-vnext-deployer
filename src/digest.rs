@@ -79,40 +79,58 @@ pub(crate) fn verify_regular_file_descriptor(
     expected_sha256: &str,
     maximum_size: u64,
 ) -> Result<FileIdentity> {
+    read_regular_file_relative_descriptor(
+        root,
+        relative,
+        expected_size,
+        Some(expected_sha256),
+        maximum_size,
+    )
+    .map(|(_, identity)| identity)
+}
+
+/// Read a bounded regular file through a descriptor-relative no-follow path.
+/// The bytes and identity come from the same stable opened descriptor, so
+/// callers can safely copy pre-generated release material after validating it.
+#[cfg(unix)]
+pub(crate) fn read_regular_file_relative_descriptor(
+    root: &Path,
+    relative: &Path,
+    expected_size: u64,
+    expected_sha256: Option<&str>,
+    maximum_size: u64,
+) -> Result<(Vec<u8>, FileIdentity)> {
     let mut opened = open_relative_nofollow(root, relative)?;
     let before = opened.file.metadata().map_err(io_error(relative))?;
     validate_open_metadata(&before, maximum_size, relative)?;
     if before.len() != expected_size {
         return Err(ReleaseError::SourceMismatch(relative.to_path_buf()));
     }
-    let mut hasher = Sha256::new();
-    let mut bytes_read = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let count = opened.file.read(&mut buffer).map_err(io_error(relative))?;
-        if count == 0 {
-            break;
-        }
-        bytes_read = bytes_read.saturating_add(count as u64);
-        if bytes_read > maximum_size {
-            return Err(ReleaseError::MissingArtifact(relative.to_path_buf()));
-        }
-        hasher.update(&buffer[..count]);
-    }
+    let mut bytes = Vec::new();
+    opened
+        .file
+        .by_ref()
+        .take(maximum_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_error(relative))?;
+    let bytes_read = bytes.len() as u64;
     let after = opened.file.metadata().map_err(io_error(relative))?;
     let path_stat = statat(&opened.directory, &opened.name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io_error(relative)(std::io::Error::from(error)))?;
     if !same_open_metadata(&before, &after)
         || !same_path_stat(&before, &path_stat)
         || bytes_read != expected_size
-        || hex::encode(hasher.finalize()) != expected_sha256
+        || expected_sha256.is_some_and(|expected| hex::encode(Sha256::digest(&bytes)) != expected)
     {
         return Err(ReleaseError::SourceMismatch(relative.to_path_buf()));
     }
-    Ok(FileIdentity {
-        device: before.dev(),
-        inode: before.ino(),
-    })
+    Ok((
+        bytes,
+        FileIdentity {
+            device: before.dev(),
+            inode: before.ino(),
+        },
+    ))
 }
 
 /// Read one bounded regular file through the same stable descriptor path used

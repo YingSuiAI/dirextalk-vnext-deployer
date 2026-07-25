@@ -22,6 +22,8 @@ use crate::{
 
 #[cfg(unix)]
 use crate::release_evidence::ReleaseEvidenceV1;
+#[cfg(unix)]
+use crate::release_materials;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,6 +57,18 @@ enum Commands {
         /// Optional `component=repository` roots for clean/source checks.
         #[arg(long = "source-root", alias = "root")]
         source_roots: Vec<String>,
+    },
+    /// Atomically bind pre-generated local release material into immutable evidence.
+    #[command(name = "release-evidence-assemble")]
+    ReleaseEvidenceAssemble {
+        #[arg(long)]
+        inputs: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long = "source-root")]
+        source_roots: Vec<String>,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Print the immutable local build plan without executing it.
     Plan {
@@ -318,6 +332,32 @@ pub fn run(cli: Cli) -> Result<()> {
                     "manifest_checked": manifest.is_some(),
                     "attestations": loaded.attestations.len()
                         + loaded.components.iter().map(|component| component.attestations.len()).sum::<usize>(),
+                }))?;
+            }
+        }
+        Commands::ReleaseEvidenceAssemble {
+            inputs,
+            manifest,
+            source_roots,
+            output,
+        } => {
+            #[cfg(not(unix))]
+            {
+                let _ = (inputs, manifest, source_roots, output);
+                return Err(crate::error::ReleaseError::UnsupportedPlatform(
+                    "release-evidence-assemble requires a Unix release host",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                let roots = parse_source_roots(&source_roots)?;
+                let evidence = release_materials::assemble(&inputs, &manifest, &roots, &output)?;
+                print_json(&json!({
+                    "assembled": true,
+                    "output": output,
+                    "schema": evidence.schema,
+                    "schema_version": evidence.schema_version,
+                    "components": evidence.components.iter().map(|component| &component.component).collect::<Vec<_>>(),
                 }))?;
             }
         }
