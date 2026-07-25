@@ -35,7 +35,11 @@ impl LoadedManifest {
             return Err(ReleaseError::UnsafeFile(path.to_path_buf()));
         }
         let bytes = fs::read(path).map_err(io_error(path))?;
-        let manifest: ReleaseManifest = serde_json::from_slice(&bytes)?;
+        Self::load_from_bytes(path, &bytes)
+    }
+
+    pub(crate) fn load_from_bytes(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let manifest: ReleaseManifest = serde_json::from_slice(bytes)?;
         manifest.validate()?;
         let absolute = absolute_path(path)?;
         let root = absolute

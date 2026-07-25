@@ -41,9 +41,16 @@ mod test_seams {
     thread_local! {
         static BEFORE_PARENT_RERESOLVE: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
         static BEFORE_RENAME: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+        static FAIL_STAGE_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     pub(super) fn set_before_parent_reresolve(barrier: Option<Arc<Barrier>>) {
         BEFORE_PARENT_RERESOLVE.with(|slot| *slot.borrow_mut() = barrier);
+    }
+    pub(super) fn fail_stage_init_once() {
+        FAIL_STAGE_INIT.with(|flag| flag.set(true));
+    }
+    pub(super) fn should_fail_stage_init() -> bool {
+        FAIL_STAGE_INIT.with(|flag| flag.replace(false))
     }
     #[allow(dead_code)]
     pub(super) fn set_before_rename(barrier: Option<Arc<Barrier>>) {
@@ -73,6 +80,8 @@ struct Stage {
     parent_ino: u64,
     stage_name: String,
     root_fd: OwnedFd,
+    root_dev: u64,
+    root_ino: u64,
     published: bool,
 }
 impl Stage {
@@ -87,9 +96,18 @@ impl Stage {
         let parent_stat =
             fstat(&parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
         for _ in 0..8 {
-            let stage_name = format!(".release-evidence-{}", uuid::Uuid::now_v7());
+            let stage_name = format!(".release-evidence-{}", uuid::Uuid::new_v4());
             match mkdirat(&parent_fd, &stage_name, Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
+                    let created = statat(&parent_fd, &stage_name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|error| {
+                            io_error(parent.join(&stage_name))(std::io::Error::from(error))
+                        })?;
+                    #[cfg(test)]
+                    if test_seams::should_fail_stage_init() {
+                        cleanup_created_stage(&parent_fd, &stage_name, &created);
+                        return Err(contract("injected staging initialization failure"));
+                    }
                     let root_fd = openat(
                         &parent_fd,
                         &stage_name,
@@ -97,9 +115,16 @@ impl Stage {
                         Mode::empty(),
                     )
                     .map_err(|error| {
+                        cleanup_created_stage(&parent_fd, &stage_name, &created);
                         io_error(parent.join(&stage_name))(std::io::Error::from(error))
                     })?;
-                    fchmod(&root_fd, Mode::from_raw_mode(0o700)).map_err(|error| {
+                    if let Err(error) = fchmod(&root_fd, Mode::from_raw_mode(0o700)) {
+                        cleanup_created_stage(&parent_fd, &stage_name, &created);
+                        return Err(io_error(parent.join(&stage_name))(std::io::Error::from(
+                            error,
+                        )));
+                    }
+                    let root_stat = fstat(&root_fd).map_err(|error| {
                         io_error(parent.join(&stage_name))(std::io::Error::from(error))
                     })?;
                     return Ok(Self {
@@ -109,6 +134,8 @@ impl Stage {
                         parent_ino: parent_stat.st_ino,
                         stage_name,
                         root_fd,
+                        root_dev: root_stat.st_dev,
+                        root_ino: root_stat.st_ino,
                         published: false,
                     });
                 }
@@ -138,6 +165,9 @@ impl Stage {
         if reopened_stat.st_dev != self.parent_dev || reopened_stat.st_ino != self.parent_ino {
             return Err(contract("output parent changed during assembly"));
         }
+        if !self.stage_matches_root()? {
+            return Err(contract("staging entry changed before publication"));
+        }
         #[cfg(test)]
         test_seams::before_rename();
         renameat_with(
@@ -154,9 +184,41 @@ impl Stage {
                 io_error(output)(std::io::Error::from(error))
             }
         })?;
+        let output_fd = openat(
+            &self.parent_fd,
+            output_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(output)(std::io::Error::from(error)))?;
+        let output_stat =
+            fstat(&output_fd).map_err(|error| io_error(output)(std::io::Error::from(error)))?;
         self.published = true;
+        if output_stat.st_dev != self.root_dev || output_stat.st_ino != self.root_ino {
+            return Err(contract("published output does not match staged root"));
+        }
         fsync(&self.parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
         Ok(())
+    }
+    fn stage_matches_root(&self) -> Result<bool> {
+        let stat = match statat(&self.parent_fd, &self.stage_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(false),
+            Err(error) => return Err(io_error(&self.stage_name)(std::io::Error::from(error))),
+        };
+        if stat.st_dev != self.root_dev || stat.st_ino != self.root_ino {
+            return Ok(false);
+        }
+        let fd = openat(
+            &self.parent_fd,
+            &self.stage_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(&self.stage_name)(std::io::Error::from(error)))?;
+        let opened =
+            fstat(&fd).map_err(|error| io_error(&self.stage_name)(std::io::Error::from(error)))?;
+        Ok(opened.st_dev == self.root_dev && opened.st_ino == self.root_ino)
     }
     fn output_exists(&self, output: &Path) -> Result<bool> {
         let name = output
@@ -171,8 +233,9 @@ impl Stage {
 }
 impl Drop for Stage {
     fn drop(&mut self) {
-        if !self.published {
-            let _ = remove_tree_at(&self.parent_fd, &self.stage_name);
+        if !self.published && self.stage_matches_root().unwrap_or(false) {
+            let _ = clear_dir_fd(&self.root_fd);
+            let _ = unlinkat(&self.parent_fd, &self.stage_name, AtFlags::REMOVEDIR);
         }
     }
 }
@@ -327,7 +390,7 @@ pub fn assemble(
         ));
     }
     let manifest_bytes = read_regular_file_descriptor(manifest_path, MAX_INPUT_BYTES)?;
-    let manifest = LoadedManifest::load(manifest_path)?;
+    let manifest = LoadedManifest::load_from_bytes(manifest_path, &manifest_bytes)?;
     let manifest_digest = hex::encode(Sha256::digest(&manifest_bytes));
     let mut guards = Vec::new();
     for component in &inputs.components {
@@ -576,16 +639,13 @@ fn collect_files_fd(
                 collect_files_fd(&child, relative, result)?;
             }
             FileType::RegularFile => {
-                let mut file = openat(
-                    &root,
-                    name_str,
-                    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                )
-                .map(File::from)
-                .map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut file, &mut bytes).map_err(io_error(&relative))?;
+                let (bytes, _) = crate::digest::read_regular_file_fd_relative_descriptor(
+                    root.as_fd(),
+                    Path::new(name_str),
+                    stat.st_size.cast_unsigned(),
+                    None,
+                    MAX_MATERIAL_BYTES,
+                )?;
                 result.push((relative, bytes));
             }
             _ => return Err(ReleaseError::UnsafeFile(relative)),
@@ -688,23 +748,22 @@ fn sync_tree_fd(root: impl AsFd) -> Result<()> {
     fsync(&root).map_err(|error| io_error("staging fd")(std::io::Error::from(error)))
 }
 
-fn remove_tree_at(parent: impl AsFd, name: &str) -> Result<()> {
-    let child = match openat(
-        &parent,
-        name,
+fn clear_dir_fd(root: impl AsFd) -> Result<()> {
+    let scan_root = openat(
+        root.as_fd(),
+        ".",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(error) => return Err(io_error(name)(std::io::Error::from(error))),
-    };
+    )
+    .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+    let root = &scan_root;
     let mut buffer = Vec::with_capacity(8192);
     let mut names = Vec::new();
     {
-        let mut dir = RawDir::new(&child, buffer.spare_capacity_mut());
+        let mut dir = RawDir::new(root.as_fd(), buffer.spare_capacity_mut());
         while let Some(entry) = dir.next() {
-            let entry = entry.map_err(|error| io_error(name)(std::io::Error::from(error)))?;
+            let entry =
+                entry.map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
             let child_name = entry.file_name().to_bytes();
             if child_name != b"." && child_name != b".." {
                 names.push(child_name.to_vec());
@@ -714,19 +773,36 @@ fn remove_tree_at(parent: impl AsFd, name: &str) -> Result<()> {
     for child_name in names {
         let child_name =
             std::str::from_utf8(&child_name).map_err(|_| contract("invalid staging entry"))?;
-        match statat(&child, child_name, AtFlags::SYMLINK_NOFOLLOW) {
+        match statat(root, child_name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
-                remove_tree_at(&child, child_name)?;
+                let child = openat(
+                    root,
+                    child_name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|error| io_error(child_name)(std::io::Error::from(error)))?;
+                clear_dir_fd(&child)?;
+                unlinkat(root, child_name, AtFlags::REMOVEDIR)
+                    .map_err(|error| io_error(child_name)(std::io::Error::from(error)))?;
             }
             Ok(_) => {
-                let _ = unlinkat(&child, child_name, AtFlags::empty());
+                unlinkat(root, child_name, AtFlags::empty())
+                    .map_err(|error| io_error(child_name)(std::io::Error::from(error)))?;
             }
             Err(_) => {}
         }
     }
-    unlinkat(&parent, name, AtFlags::REMOVEDIR)
-        .map_err(|error| io_error(name)(std::io::Error::from(error)))?;
     Ok(())
+}
+
+fn cleanup_created_stage(parent: &impl AsFd, name: &str, created: &rustix::fs::Stat) {
+    if let Ok(current) = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        && current.st_dev == created.st_dev
+        && current.st_ino == created.st_ino
+    {
+        let _ = unlinkat(parent, name, AtFlags::REMOVEDIR);
+    }
 }
 fn ensure_directory(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path).map_err(io_error(path))?;
@@ -1107,6 +1183,42 @@ mod tests {
         fs::write(output.join("keep"), b"keep").expect("keep");
         assert!(assemble(&inputs_path, &manifest_path, &roots, &output).is_err());
         assert_eq!(fs::read(output.join("keep")).expect("keep"), b"keep");
+        assert_eq!(staging_count(root.path()), 0);
+    }
+
+    #[test]
+    fn competing_output_created_before_rename_is_preserved() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (inputs_path, manifest_path, roots, _) = assembly_fixture(root.path());
+        let output = root.path().join("output");
+        let worker_output = output.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_before_rename(Some(Arc::clone(&barrier)));
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            fs::create_dir(&worker_output).expect("output");
+            fs::write(worker_output.join("competitor"), b"preserve").expect("competitor");
+            barrier.wait();
+        });
+        assert!(matches!(
+            assemble(&inputs_path, &manifest_path, &roots, &output),
+            Err(ReleaseError::OutputNotEmpty(_))
+        ));
+        worker.join().expect("worker");
+        test_seams::set_before_rename(None);
+        assert_eq!(
+            fs::read(output.join("competitor")).expect("competitor"),
+            b"preserve"
+        );
+        assert_eq!(staging_count(root.path()), 0);
+    }
+
+    #[test]
+    fn injected_stage_initialization_failure_removes_only_created_stage() {
+        let root = TempDir::new().expect("temp");
+        test_seams::fail_stage_init_once();
+        assert!(Stage::create(root.path()).is_err());
         assert_eq!(staging_count(root.path()), 0);
     }
 
