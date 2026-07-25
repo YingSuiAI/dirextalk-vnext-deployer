@@ -782,24 +782,54 @@ impl ReleaseMaterialsV1 {
             let input = input_by_component
                 .get(component.component.as_str())
                 .ok_or_else(|| contract("evidence component is absent from inputs"))?;
+            let base = PathBuf::from(format!("components/{}", component.component));
+            let recipe_path = base.join("build-recipe");
+            let artifact_path = base.join("artifact");
+            let sbom_path = base.join("sbom");
+            let notice_path = base.join("third-party-notice");
+            let license_path = base.join("license");
+            let check_file = |file: &FileEvidence, path: &Path| -> Result<()> {
+                let bytes = files
+                    .get(path)
+                    .copied()
+                    .ok_or_else(|| contract("fixed role file is missing"))?;
+                if file.path != path
+                    || file.size != bytes.len() as u64
+                    || file.sha256 != digest(bytes)
+                {
+                    return Err(contract("fixed role file mismatches evidence"));
+                }
+                Ok(())
+            };
             if component.source_commit != input.source_commit
                 || component.toolchain != input.toolchain
-                || !input.targets.contains(&component.target)
+                || component.targets != input.targets
+                || component.target != input.targets[0]
+                || component.artifact.identity != input.artifact.identity
+                || component.artifact.path != artifact_path
             {
                 return Err(contract("evidence component mismatches inputs"));
             }
+            check_file(
+                &FileEvidence {
+                    path: component.artifact.path.clone(),
+                    size: component.artifact.size,
+                    sha256: component.artifact.sha256.clone(),
+                },
+                &artifact_path,
+            )?;
+            check_file(&component.sbom, &sbom_path)?;
+            check_file(&component.third_party_notice, &notice_path)?;
+            check_file(&component.license, &license_path)?;
             for path in [
-                &component.artifact.path,
-                &component.sbom.path,
-                &component.third_party_notice.path,
-                &component.license.path,
+                &recipe_path,
+                &artifact_path,
+                &sbom_path,
+                &notice_path,
+                &license_path,
             ] {
                 expected.insert(path.clone());
             }
-            expected.insert(PathBuf::from(format!(
-                "components/{}/build-recipe",
-                component.component
-            )));
             let provenance_path = PathBuf::from(format!("provenance/{}.json", component.component));
             let provenance: LocalProvenanceV1 = serde_json::from_value(strict_json::parse_value(
                 files
@@ -812,6 +842,8 @@ impl ReleaseMaterialsV1 {
                 != provenance_bytes
                 || provenance.component != component.component
                 || provenance.source_commit != component.source_commit
+                || !commit(&provenance.source_tree)
+                || provenance.targets != input.targets
                 || provenance.toolchain != component.toolchain
                 || provenance.release_manifest_sha256 != manifest_digest
                 || provenance.artifact != component.artifact
@@ -821,6 +853,29 @@ impl ReleaseMaterialsV1 {
                 || component.build_recipe != format!("sha256:{}", provenance.build_recipe.sha256)
             {
                 return Err(contract("provenance mismatches finalized evidence"));
+            }
+            check_file(&provenance.build_recipe, &recipe_path)?;
+            let expected_attestation = AttestationReference {
+                kind: AttestationKind::InToto,
+                component: component.component.clone(),
+                target: input.targets[0].clone(),
+                path: provenance_path.clone(),
+                size: provenance_bytes.len() as u64,
+                sha256: digest(provenance_bytes),
+                artifact_sha256: component.artifact.sha256.clone(),
+            };
+            if !component.attestations.is_empty()
+                || evidence
+                    .attestations
+                    .iter()
+                    .filter(|entry| entry.component == component.component)
+                    .count()
+                    != 1
+                || !evidence.attestations.contains(&expected_attestation)
+            {
+                return Err(contract(
+                    "global attestation does not bind component provenance",
+                ));
             }
             expected.insert(provenance_path);
         }
