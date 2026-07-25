@@ -187,7 +187,7 @@ impl Stage {
         }
         Err(contract("staging-name collision limit exceeded"))
     }
-    fn publish(mut self, output: &Path) -> Result<()> {
+    fn publish(mut self, output: &Path, inventory: &ValidatedInventory) -> Result<()> {
         let parent = output
             .parent()
             .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?;
@@ -238,6 +238,20 @@ impl Stage {
         self.published = true;
         if output_stat.st_dev != self.root_dev || output_stat.st_ino != self.root_ino {
             return Err(contract("published output does not match staged root"));
+        }
+        validate_inventory_fd(output_fd.as_fd(), inventory)?;
+        let parent_after = open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        let parent_after_stat =
+            fstat(&parent_after).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
+        if parent_after_stat.st_dev != self.parent_dev
+            || parent_after_stat.st_ino != self.parent_ino
+        {
+            return Err(contract("output parent changed after publication"));
         }
         fsync(&self.parent_fd).map_err(|error| io_error(parent)(std::io::Error::from(error)))?;
         Ok(())
@@ -582,13 +596,15 @@ pub fn assemble(
     // before the checksums and atomic publication make the directory visible.
     evidence.validate_files_fd(stage.root_fd.as_fd())?;
     let inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
-    let checksums = checksum_manifest(&inventory);
+    let checksums = checksum_manifest(&inventory.files);
     stage.write_new(Path::new("SHA256SUMS"), &checksums)?;
+    let inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
+    validate_inventory_fd(stage.root_fd.as_fd(), &inventory)?;
     sync_tree_fd(stage.root_fd.as_fd())?;
     for (_, guard) in guards {
         guard.finish()?;
     }
-    stage.publish(output)?;
+    stage.publish(output, &inventory)?;
     Ok(evidence)
 }
 
@@ -625,20 +641,116 @@ struct InventoryEntry {
     relative: PathBuf,
     bytes: Vec<u8>,
     identity: FileIdentity,
+    nlink: u64,
+    mode: u32,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: u64,
 }
 
-fn validated_inventory_fd(root: impl AsFd) -> Result<Vec<InventoryEntry>> {
+struct ValidatedInventory {
+    files: Vec<InventoryEntry>,
+    directories: BTreeSet<PathBuf>,
+}
+
+fn validated_inventory_fd(root: impl AsFd) -> Result<ValidatedInventory> {
     let mut files = Vec::new();
     collect_files_fd(root.as_fd(), PathBuf::new(), &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files
+    let files: Vec<InventoryEntry> = files
         .into_iter()
-        .map(|(relative, bytes, identity)| InventoryEntry {
-            relative,
-            bytes,
-            identity,
+        .map(|(relative, bytes, identity)| {
+            let stat = statat(&root, &relative, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| io_error(&relative)(std::io::Error::from(error)))?;
+            Ok(InventoryEntry {
+                relative,
+                bytes,
+                identity,
+                nlink: stat.st_nlink,
+                mode: stat.st_mode,
+                size: stat.st_size.cast_unsigned(),
+                mtime: stat.st_mtime,
+                mtime_nsec: stat.st_mtime_nsec,
+            })
         })
-        .collect())
+        .collect::<Result<_>>()?;
+    let mut directories = BTreeSet::new();
+    collect_directories_fd(root.as_fd(), PathBuf::new(), &mut directories)?;
+    Ok(ValidatedInventory { files, directories })
+}
+
+fn validate_inventory_fd(root: impl AsFd, expected: &ValidatedInventory) -> Result<()> {
+    let actual = validated_inventory_fd(root.as_fd())?;
+    if actual.directories != expected.directories
+        || actual.files.len() != expected.files.len()
+        || actual
+            .files
+            .iter()
+            .zip(&expected.files)
+            .any(|(actual, expected)| {
+                actual.relative != expected.relative
+                    || actual.identity != expected.identity
+                    || actual.nlink != expected.nlink
+                    || actual.mode != expected.mode
+                    || actual.size != expected.size
+                    || actual.mtime != expected.mtime
+                    || actual.mtime_nsec != expected.mtime_nsec
+                    || digest(&actual.bytes) != digest(&expected.bytes)
+            })
+    {
+        return Err(contract("staged inventory changed during publication"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn collect_directories_fd(
+    root: impl AsFd,
+    current: PathBuf,
+    result: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let scan = openat(
+        root.as_fd(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+    let mut buffer = Vec::with_capacity(8192);
+    let mut names = Vec::new();
+    {
+        let mut dir = RawDir::new(&scan, buffer.spare_capacity_mut());
+        while let Some(entry) = dir.next() {
+            let entry =
+                entry.map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+            let name = entry.file_name().to_bytes();
+            if name != b"." && name != b".." {
+                names.push(name.to_vec());
+            }
+        }
+    }
+    for name in names {
+        let name = std::str::from_utf8(&name).map_err(|_| contract("invalid staging entry"))?;
+        let stat = statat(&scan, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            let relative = if current.as_os_str().is_empty() {
+                PathBuf::from(name)
+            } else {
+                current.join(name)
+            };
+            result.insert(relative.clone());
+            let child = openat(
+                &scan,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+            collect_directories_fd(&child, relative, result)?;
+        }
+    }
+    Ok(())
 }
 
 fn checksum_manifest(files: &[InventoryEntry]) -> Vec<u8> {
@@ -666,6 +778,14 @@ fn collect_files_fd(
     current: PathBuf,
     result: &mut Vec<(PathBuf, Vec<u8>, FileIdentity)>,
 ) -> Result<()> {
+    let scan_root = openat(
+        root.as_fd(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error("staging fd")(std::io::Error::from(error)))?;
+    let root = &scan_root;
     let mut buffer = Vec::with_capacity(8192);
     let mut names = Vec::new();
     {
@@ -681,7 +801,7 @@ fn collect_files_fd(
     for name in names {
         let name_str =
             std::str::from_utf8(&name).map_err(|_| ReleaseError::UnsafeFile(current.clone()))?;
-        let stat = statat(&root, name_str, AtFlags::SYMLINK_NOFOLLOW)
+        let stat = statat(root, name_str, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| io_error(&current)(std::io::Error::from(error)))?;
         let relative = if current.as_os_str().is_empty() {
             PathBuf::from(name_str)
@@ -691,7 +811,7 @@ fn collect_files_fd(
         match FileType::from_raw_mode(stat.st_mode) {
             FileType::Directory => {
                 let child = openat(
-                    &root,
+                    root,
                     name_str,
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                     Mode::empty(),
