@@ -7,7 +7,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     os::{
-        fd::{AsFd, OwnedFd},
+        fd::{AsFd, BorrowedFd, OwnedFd},
         unix::fs::MetadataExt,
     },
     path::{Component, Path, PathBuf},
@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    digest::{FileIdentity, read_regular_file_descriptor, read_regular_file_relative_descriptor},
+    digest::{
+        FileIdentity, read_regular_file_descriptor, read_regular_file_fd_relative_descriptor,
+        read_regular_file_relative_descriptor,
+    },
     error::{ReleaseError, Result, io_error},
     manifest::{LoadedManifest, ReleaseManifest},
     release_evidence::{
@@ -48,6 +51,7 @@ mod test_seams {
     use std::time::Duration;
     thread_local! {
         static BEFORE_PARENT_RERESOLVE: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
+        static BEFORE_FRAGMENT_COPY: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
         static BEFORE_RENAME: std::cell::RefCell<Option<(Sender<()>, Receiver<()>)>> = const { std::cell::RefCell::new(None) };
         static FAIL_STAGE_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -66,6 +70,16 @@ mod test_seams {
     }
     pub(super) fn before_parent_reresolve() {
         let barrier = BEFORE_PARENT_RERESOLVE.with(|slot| slot.borrow_mut().take());
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+    pub(super) fn set_before_fragment_copy(barrier: Option<Arc<Barrier>>) {
+        BEFORE_FRAGMENT_COPY.with(|slot| *slot.borrow_mut() = barrier);
+    }
+    pub(super) fn before_fragment_copy() {
+        let barrier = BEFORE_FRAGMENT_COPY.with(|slot| slot.borrow_mut().take());
         if let Some(barrier) = barrier {
             barrier.wait();
             barrier.wait();
@@ -307,7 +321,18 @@ impl Stage {
         }
         Err(contract("staging-name collision limit exceeded"))
     }
-    fn publish(mut self, output: &Path, inventory: &ValidatedInventory) -> Result<()> {
+    fn publish(self, output: &Path, inventory: &ValidatedInventory) -> Result<()> {
+        self.publish_with_check(output, inventory, || Ok(()))
+    }
+    fn publish_with_check<F>(
+        mut self,
+        output: &Path,
+        inventory: &ValidatedInventory,
+        mut pre_publish: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         let parent = output
             .parent()
             .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?;
@@ -324,6 +349,7 @@ impl Stage {
         }
         #[cfg(test)]
         test_seams::before_rename();
+        pre_publish()?;
         validate_inventory_fd(self.root_fd.as_fd(), inventory)?;
         renameat_with(
             &self.parent_fd,
@@ -424,7 +450,11 @@ impl ReleaseInputFragmentV1 {
     /// Returns an error for unsafe, non-canonical, or invalid fragments.
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = read_regular_file_descriptor(path, MAX_INPUT_BYTES)?;
-        let value = strict_json::parse_value(&bytes)?;
+        Self::from_bytes(&bytes)
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let value = strict_json::parse_value(bytes)?;
         let fragment: Self = serde_json::from_value(value)?;
         if fragment.schema != "dirextalk.release-input-fragment" || fragment.schema_version != 1 {
             return Err(contract("fragment schema/version is unsupported"));
@@ -444,6 +474,106 @@ impl ReleaseInputFragmentV1 {
         }
         validate_input_component(&self.component, &mut BTreeSet::new())
     }
+}
+
+#[derive(Clone, Debug)]
+struct FragmentStat {
+    device: u64,
+    inode: u64,
+    nlink: u64,
+    mode: u32,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: u64,
+}
+
+struct FragmentSourceGuard {
+    path: PathBuf,
+    parent_path: PathBuf,
+    parent_fd: OwnedFd,
+    parent_chain: Vec<NamespaceIdentity>,
+    name: String,
+    stat: FragmentStat,
+    fragment: ReleaseInputFragmentV1,
+}
+
+impl FragmentSourceGuard {
+    fn load(path: &Path) -> Result<Self> {
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| ReleaseError::InvalidPath(path.to_path_buf()))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ReleaseError::InvalidPath(path.to_path_buf()))?
+            .to_owned();
+        safe_relative(Path::new(&name))?;
+        let (parent_fd, parent_chain) = open_trusted_parent(parent_path)?;
+        let raw = statat(&parent_fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| io_error(path)(std::io::Error::from(error)))?;
+        let stat = fragment_stat(&raw, path)?;
+        let (bytes, _) = read_regular_file_fd_relative_descriptor(
+            parent_fd.as_fd(),
+            Path::new(&name),
+            stat.size,
+            None,
+            MAX_INPUT_BYTES,
+        )?;
+        let fragment = ReleaseInputFragmentV1::from_bytes(&bytes)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            parent_path: parent_path.to_path_buf(),
+            parent_fd,
+            parent_chain,
+            name,
+            stat,
+            fragment,
+        })
+    }
+
+    fn verify_path(&self) -> Result<()> {
+        let (current_parent, current_chain) = open_trusted_parent(&self.parent_path)?;
+        if current_chain != self.parent_chain {
+            return Err(contract("fragment parent changed during composition"));
+        }
+        let current = statat(&current_parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| io_error(&self.path)(std::io::Error::from(error)))?;
+        let retained = statat(&self.parent_fd, &self.name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| io_error(&self.path)(std::io::Error::from(error)))?;
+        if !same_fragment_stat(&self.stat, &current) || !same_fragment_stat(&self.stat, &retained) {
+            return Err(contract("fragment file changed during composition"));
+        }
+        Ok(())
+    }
+}
+
+fn fragment_stat(stat: &rustix::fs::Stat, path: &Path) -> Result<FragmentStat> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_nlink != 1
+        || stat.st_size <= 0
+        || stat.st_size.cast_unsigned() > MAX_INPUT_BYTES
+    {
+        return Err(ReleaseError::UnsafeFile(path.to_path_buf()));
+    }
+    Ok(FragmentStat {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        nlink: stat.st_nlink,
+        mode: stat.st_mode,
+        size: stat.st_size.cast_unsigned(),
+        mtime: stat.st_mtime,
+        mtime_nsec: stat.st_mtime_nsec,
+    })
+}
+
+fn same_fragment_stat(expected: &FragmentStat, actual: &rustix::fs::Stat) -> bool {
+    expected.device == actual.st_dev
+        && expected.inode == actual.st_ino
+        && expected.nlink == actual.st_nlink
+        && expected.mode == actual.st_mode
+        && expected.size == actual.st_size.cast_unsigned()
+        && expected.mtime == actual.st_mtime
+        && expected.mtime_nsec == actual.st_mtime_nsec
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -790,7 +920,8 @@ pub fn compose(fragments: &[PathBuf], output: &Path) -> Result<ReleaseInputsV1> 
     let mut names = BTreeSet::new();
     let mut release: Option<EvidenceRelease> = None;
     for path in fragments {
-        let fragment = ReleaseInputFragmentV1::load(path)?;
+        let guard = FragmentSourceGuard::load(path)?;
+        let fragment = &guard.fragment;
         if !names.insert(fragment.component.component.clone()) {
             return Err(contract("fragment components are duplicated"));
         }
@@ -801,7 +932,7 @@ pub fn compose(fragments: &[PathBuf], output: &Path) -> Result<ReleaseInputsV1> 
         } else {
             release = Some(fragment.release.clone());
         }
-        loaded.push((path.clone(), fragment));
+        loaded.push(guard);
     }
     if names.len() != REQUIRED_RELEASE_COMPONENTS.len()
         || REQUIRED_RELEASE_COMPONENTS
@@ -819,9 +950,9 @@ pub fn compose(fragments: &[PathBuf], output: &Path) -> Result<ReleaseInputsV1> 
             .file_name()
             .ok_or_else(|| ReleaseError::InvalidPath(output.to_path_buf()))?,
     );
-    for (path, _) in &loaded {
-        if fs::canonicalize(path)
-            .map_err(io_error(path))?
+    for guard in &loaded {
+        if fs::canonicalize(&guard.path)
+            .map_err(io_error(&guard.path))?
             .starts_with(&output_candidate)
         {
             return Err(contract("fragments must be outside output"));
@@ -833,48 +964,48 @@ pub fn compose(fragments: &[PathBuf], output: &Path) -> Result<ReleaseInputsV1> 
     }
     let mut identities = BTreeSet::new();
     let mut components = Vec::with_capacity(loaded.len());
-    for (fragment_path, fragment) in loaded {
-        let input_root = fragment_path
-            .parent()
-            .ok_or_else(|| ReleaseError::InvalidPath(fragment_path.clone()))?;
+    #[cfg(test)]
+    test_seams::before_fragment_copy();
+    for guard in &loaded {
+        let fragment = &guard.fragment;
         let name = fragment.component.component.clone();
         let base = format!("components/{name}");
-        let recipe = copy_material(
+        let recipe = copy_material_fd(
             &stage,
-            input_root,
+            guard.parent_fd.as_fd(),
             &fragment.component.build_recipe.path,
             &format!("{base}/build-recipe"),
             &mut identities,
         )?;
-        let artifact = copy_material(
+        let artifact = copy_material_fd(
             &stage,
-            input_root,
+            guard.parent_fd.as_fd(),
             &fragment.component.artifact.path,
             &format!("{base}/artifact"),
             &mut identities,
         )?;
-        let sbom = copy_material(
+        let sbom = copy_material_fd(
             &stage,
-            input_root,
+            guard.parent_fd.as_fd(),
             &fragment.component.sbom.path,
             &format!("{base}/sbom"),
             &mut identities,
         )?;
-        let notice = copy_material(
+        let notice = copy_material_fd(
             &stage,
-            input_root,
+            guard.parent_fd.as_fd(),
             &fragment.component.third_party_notice.path,
             &format!("{base}/third-party-notice"),
             &mut identities,
         )?;
-        let license = copy_material(
+        let license = copy_material_fd(
             &stage,
-            input_root,
+            guard.parent_fd.as_fd(),
             &fragment.component.license.path,
             &format!("{base}/license"),
             &mut identities,
         )?;
-        let mut component = fragment.component;
+        let mut component = fragment.component.clone();
         component.build_recipe.path = recipe.path;
         component.artifact.path = artifact.path;
         component.sbom.path = sbom.path;
@@ -894,7 +1025,12 @@ pub fn compose(fragments: &[PathBuf], output: &Path) -> Result<ReleaseInputsV1> 
     let inventory = validated_inventory_fd(stage.root_fd.as_fd())?;
     validate_composed_inventory(&inventory, &inputs)?;
     sync_tree_fd(stage.root_fd.as_fd())?;
-    stage.publish(output, &inventory)?;
+    stage.publish_with_check(output, &inventory, || {
+        for guard in &loaded {
+            guard.verify_path()?;
+        }
+        Ok(())
+    })?;
     Ok(inputs)
 }
 
@@ -1175,6 +1311,42 @@ fn copy_material(
         input_root,
         source,
         expected,
+        None,
+        MAX_MATERIAL_BYTES,
+    )?;
+    if !identities.insert(identity) {
+        return Err(contract("input roles must not share an inode"));
+    }
+    let path = PathBuf::from(destination);
+    stage.write_new(&path, &bytes)?;
+    Ok(FileEvidence {
+        path,
+        size: bytes.len() as u64,
+        sha256: digest(&bytes),
+    })
+}
+
+fn copy_material_fd(
+    stage: &Stage,
+    input_root: BorrowedFd<'_>,
+    source: &Path,
+    destination: &str,
+    identities: &mut BTreeSet<FileIdentity>,
+) -> Result<FileEvidence> {
+    safe_relative(source)?;
+    let stat = statat(input_root, source, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error(source)(std::io::Error::from(error)))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_nlink != 1
+        || stat.st_size <= 0
+        || stat.st_size.cast_unsigned() > MAX_MATERIAL_BYTES
+    {
+        return Err(ReleaseError::UnsafeFile(source.to_path_buf()));
+    }
+    let (bytes, identity) = read_regular_file_fd_relative_descriptor(
+        input_root,
+        source,
+        stat.st_size.cast_unsigned(),
         None,
         MAX_MATERIAL_BYTES,
     )?;
@@ -1836,6 +2008,83 @@ mod tests {
     }
 
     #[test]
+    fn fragment_parent_replacement_after_parse_is_rejected_without_residue() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (_inputs_path, _manifest, _roots, fixture) = assembly_fixture(root.path());
+        let fragment_parent = root.path().join("fragments");
+        let fragments = fragment_fixture(root.path(), &fragment_parent, &fixture);
+        let renamed = root.path().join("fragments-old");
+        let replacement = root.path().join("fragments-new");
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_before_fragment_copy(Some(Arc::clone(&barrier)));
+        let worker_parent = fragment_parent.clone();
+        let worker_renamed = renamed.clone();
+        let worker_replacement = replacement.clone();
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            fs::rename(&worker_parent, &worker_renamed).expect("rename fragments");
+            copy_tree(&worker_renamed, &worker_replacement);
+            fs::write(worker_replacement.join("server/recipe"), b"CHANGE")
+                .expect("same-size replacement");
+            barrier.wait();
+        });
+        let output = root.path().join("composed");
+        assert!(compose(&fragments, &output).is_err());
+        worker.join().expect("worker");
+        test_seams::set_before_fragment_copy(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
+        fs::remove_dir_all(&renamed).expect("old fragments");
+        fs::remove_dir_all(&replacement).expect("replacement fragments");
+    }
+
+    #[test]
+    fn fragment_parent_replacement_before_publish_is_rejected_without_residue() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().expect("temp");
+        let (_inputs_path, _manifest, _roots, fixture) = assembly_fixture(root.path());
+        let fragment_parent = root.path().join("fragments");
+        let fragments = fragment_fixture(root.path(), &fragment_parent, &fixture);
+        let renamed = root.path().join("fragments-old");
+        let replacement = root.path().join("fragments-new");
+        let barrier = Arc::new(Barrier::new(2));
+        test_seams::set_before_parent_reresolve(Some(Arc::clone(&barrier)));
+        let worker_parent = fragment_parent.clone();
+        let worker_renamed = renamed.clone();
+        let worker_replacement = replacement.clone();
+        let worker = std::thread::spawn(move || {
+            barrier.wait();
+            fs::rename(&worker_parent, &worker_renamed).expect("rename fragments");
+            copy_tree(&worker_renamed, &worker_replacement);
+            fs::write(worker_replacement.join("server/recipe"), b"CHANGE")
+                .expect("same-size replacement");
+            barrier.wait();
+        });
+        let output = root.path().join("composed");
+        assert!(compose(&fragments, &output).is_err());
+        worker.join().expect("worker");
+        test_seams::set_before_parent_reresolve(None);
+        assert!(!output.exists());
+        assert_eq!(staging_count(root.path()), 0);
+        fs::remove_dir_all(&renamed).expect("old fragments");
+        fs::remove_dir_all(&replacement).expect("replacement fragments");
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("directory");
+        for entry in fs::read_dir(source).expect("tree") {
+            let entry = entry.expect("entry");
+            let target = destination.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).expect("file");
+            }
+        }
+    }
+
+    #[test]
     fn aliases_between_roles_are_rejected_before_copy() {
         let root = TempDir::new().expect("temp");
         let source = root.path().join("one");
@@ -1940,6 +2189,44 @@ mod tests {
         .expect("manifest write");
         (inputs_path, manifest_path, roots, fixture)
     }
+
+    fn fragment_fixture(root: &Path, parent: &Path, fixture: &ReleaseInputsV1) -> Vec<PathBuf> {
+        fs::create_dir_all(parent).expect("fragment parent");
+        let mut fragments = Vec::new();
+        for component in &fixture.components {
+            for path in [
+                &component.build_recipe.path,
+                &component.artifact.path,
+                &component.sbom.path,
+                &component.third_party_notice.path,
+                &component.license.path,
+            ] {
+                let destination = parent.join(path);
+                fs::create_dir_all(destination.parent().expect("role parent")).expect("roles");
+                fs::write(
+                    &destination,
+                    fs::read(root.join(path)).expect("fixture material"),
+                )
+                .expect("role");
+            }
+            let fragment = ReleaseInputFragmentV1 {
+                schema: "dirextalk.release-input-fragment".into(),
+                schema_version: 1,
+                release: fixture.release.clone(),
+                component: component.clone(),
+            };
+            let path = parent.join(format!("{}.json", component.component));
+            fs::write(
+                &path,
+                strict_json::canonical_bytes(&serde_json::to_value(&fragment).expect("json"), true)
+                    .expect("canonical"),
+            )
+            .expect("fragment");
+            fragments.push(path);
+        }
+        fragments
+    }
+
     #[test]
     fn deterministic_assembly_round_trips_and_refuses_existing_output() {
         let root = TempDir::new().expect("temp");
