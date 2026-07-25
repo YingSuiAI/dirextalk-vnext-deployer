@@ -77,6 +77,9 @@ mod test_seams {
 }
 
 #[allow(clippy::struct_field_names)]
+// The parent directory and lock define a trusted release-operator namespace.
+// Processes with the same EUID are equally authoritative (they can alter
+// memory or descriptors); ordinary Unix paths cannot isolate against them.
 struct Stage {
     parent_path: PathBuf,
     parent_fd: OwnedFd,
