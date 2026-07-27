@@ -1,4 +1,6 @@
-# Deployment manifest v1/v2 (offline foundation)
+Deferred until Internal Test Alpha passes
+
+# Deployment manifest v1/v2 (deferred production foundation)
 
 `deployment.example.json` is a separate strict contract from release manifest v1.
 It names immutable server and Connector artifacts by version plus SHA-256 digest,
@@ -31,11 +33,11 @@ does not accept or activate any physical topology.
 
 `deployment-validate` and `deployment-plan` are offline. `deployment-status`
 only reads the fixed root-owned `/var/lib/dirextalk-vnext-deployer` directory on
-Unix and
-fails as unsupported on other platforms. Validation and planning remain
-cross-platform. The sole execution path is the closed local Connector-host
-lifecycle described in `COMMANDS.md`; there is no remote transport, production
-migrator, provider activation, or remote Connector enrollment implementation.
+Unix and fails as unsupported on other platforms. Validation and planning
+remain cross-platform. The sole execution path is the closed local
+Connector-host lifecycle described in the historical command map; there is no
+remote transport, production migrator, provider activation, or remote
+Connector enrollment implementation.
 
 Durable records are strict Unix-only JSON. Exact target plus host ownership is
 fenced independently of operation UUID, successor handoff names the current
@@ -47,5 +49,13 @@ Connector predecessor while older history remains retained. This evidence does
 not imply remote enrollment. Writes use bounded serialization,
 0600 no-follow temporary files, sync, atomic replacement, and parent-directory
 sync. Malformed or symlinked state fails closed. A completed operation can only
-fence a service restore; migrations and historical records are never reversed or
-deleted.
+fence a service restore; migrations and historical records are never reversed
+or deleted.
+
+## Deferred production gates
+
+This historical v1/v2 foundation is retained for release work only. It is not
+an Internal Test Alpha input, reader, compatibility path, migration path, or
+acceptance gate. Production registry publication, signing, formal
+five-component provenance, DSSE/SLSA evidence, exhaustive crash/restart
+matrices, and X6/X7/X8 gates remain deferred until Internal Test Alpha passes.

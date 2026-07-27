@@ -3,7 +3,12 @@ name: dirextalk-vnext-deployer
 description: Build, assemble, preview, and explicitly publish Dirextalk vNext server, deployer, and multi-Agent Connector releases with the typed Rust CLI.
 ---
 
-# Dirextalk vNext release workflow
+# Dirextalk vNext release workflow (release-only)
+
+This skill is inactive for Internal Test Alpha unless the user explicitly
+invokes it for release work. The active Alpha deployment contract is
+[`references/internal-test-alpha-deployer.md`](references/internal-test-alpha-deployer.md);
+this release workflow must not be used as Alpha acceptance evidence.
 
 Use this skill for Dirextalk vNext release preparation or publication. Run the
 Rust CLI from this repository and treat `release.example.json` as a template,
@@ -37,10 +42,16 @@ not as a hidden source of credentials.
 - A failed or interrupted publication is not proof of release completion.
   Verify each selected registry/release using its authoritative read API.
 
-Read [references/release-manifest.md](references/release-manifest.md) when
+Read [references/deferred-production/release-manifest.md](references/deferred-production/release-manifest.md) when
 editing a manifest, selecting targets, or preparing CI artifact paths.
 
-## Offline deployment contract
+The deferred deployment foundation and release-input composition notes are
+[deployment-manifest.md](references/deferred-production/deployment-manifest.md)
+and
+[release-input-fragments.md](references/deferred-production/release-input-fragments.md).
+Every document in that directory is deferred until Internal Test Alpha passes.
+
+## Offline deployment contract (release-only)
 
 For the durable deployment-contract foundation, use only
 `deployment-validate`, `deployment-plan`, and `deployment-status`. These commands

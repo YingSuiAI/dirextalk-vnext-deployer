@@ -1,3 +1,5 @@
+Deferred until Internal Test Alpha passes
+
 # Release manifest and artifact contract
 
 The JSON manifest is strict (`schema_version: 1`); unknown fields are rejected.
@@ -47,10 +49,9 @@ The Windows GNU example selects the installed
 `1.97.0-x86_64-pc-windows-gnu` toolchain. Other targets normally build on a
 matching native GitHub Actions runner and omit `rust_toolchain`.
 The CLI refuses a native build on a mismatched OS or architecture before it
-starts a compiler.
-Each receipt records the release version, target, exact deployer/Connector
-commits, and both binary SHA-256 digests. Assembly will not infer provenance
-from a filename or package directory.
+starts a compiler. Each receipt records the release version, target, exact
+deployer/Connector commits, and both binary SHA-256 digests. Assembly will not
+infer provenance from a filename or package directory.
 
 ## Assembled output
 
@@ -94,10 +95,9 @@ release records `source_date_epoch` and exactly these components:
 `deployer`. Each component carries a lowercase 40-hex source commit, target,
 and optional explicit `targets` applicability (the singular `target` remains
 the v1 compatibility form), toolchain and build-recipe identities, one
-digest-bound regular-file artifact,
-SBOM, third-party notice, and license evidence. Paths are local, relative to
-the evidence file, bounded, non-empty, non-symlink regular files; recorded
-sizes and SHA-256 digests must match.
+digest-bound regular-file artifact, SBOM, third-party notice, and license
+evidence. Paths are local, relative to the evidence file, bounded, non-empty,
+non-symlink regular files; recorded sizes and SHA-256 digests must match.
 
 Optional DSSE, in-toto, SLSA, and detached-signature references are likewise
 local regular files bound to the component artifact digest. The validator only
@@ -109,8 +109,12 @@ lock at `.git/dirextalk-release-evidence.lock` (creating and persistently
 retaining that empty file under `.git`) and require an unchanged
 HEAD/tree/index/status snapshot for the whole validation. This is the one
 local lock-file side effect; evidence, artifacts, and Git contents remain
-otherwise read-only. It protects cooperating same-user mutations; writers that do
-not take the lock are detected by the before/after snapshot when observable,
+otherwise read-only. It protects cooperating same-user mutations; writers that
+do not take the lock are detected by the before/after snapshot when observable,
 but are not prevented during the read. The command is read-only and does not
 publish or invoke remote commands. Non-Unix hosts fail closed with an
 `unsupported platform` result.
+
+Formal five-component provenance, production registry publication, DSSE/SLSA,
+signing, exhaustive crash/restart matrices, and X6/X7/X8 gates are deferred
+production gates. They cannot block Internal Test Alpha.
