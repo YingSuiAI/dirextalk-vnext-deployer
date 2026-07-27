@@ -96,34 +96,39 @@ plaintext Agent Control input are outside this contract.
 
 ## 5. Executable acceptance
 
-No executable entry currently closes schema-3 end-to-end acceptance. The
-existing offline foundation commands are documented in `COMMANDS.md` as
-non-Alpha only; they consume the historical foundation manifest and must not be
-used as an Alpha substitute. Running them cannot establish any schema-3 state
-or acceptance receipt.
+The CLI now has an isolated schema-3 foundation:
+`deployment-alpha-validate` verifies the canonical manifest and all
+package-local digests, `deployment-alpha-plan` creates the exact `Planned`
+record (persisting it only with `--execute`),
+`deployment-alpha-advance` admits only the next lifecycle edge and requires
+redacted readiness or receipt-observation projections where applicable, and
+`deployment-alpha-status` reads the sealed durable record. These admission
+commands do not independently perform the external effect or verify a receipt
+signature. This path accepts no schema 1/2 input or compatibility fallback.
+
+The existing offline foundation commands documented in `COMMANDS.md` remain
+non-Alpha only and must not be used as an Alpha substitute. Running them cannot
+establish any schema-3 state or acceptance receipt.
 
 The exact target capabilities that still need implementation are:
 
-- schema-3 preflight/plan: accept only the exact manifest and package fields in
-  `deployment-schema3.md`, verify clean exact commits and digests, and persist
-  `Planned` before any install effect;
-- install/start: stage the exact package through the fixed Host Supervisor,
-  persisting `Installed` and `Started` before each corresponding effect;
-- readiness/status: independently verify all four product components and
-  persist `ReadinessVerified` with redacted facts;
-- acceptance observation: consume only the independently signed receipt for
-  the exact target/package, Connector fence, and operation fence, then persist
+- clean exact-commit workspace verification in the schema-3 package preflight;
+- install/start through the fixed Host Supervisor, driving the already typed
+  `Planned -> Installed -> Started` record edges around the real effects;
+- independent four-component readiness collection before admitting the typed
+  `ReadinessVerified` evidence;
+- independent signed-receipt production/observation for the exact target,
+  package, Connector fence, and operation fence before admitting
   `AcceptanceObserved`; and
-- scoped rollback: remove only the affected target package, service state, and
-  test data under the same Connector and operation fences, without restoring or
-  migrating an older schema.
+- target-scoped package, service-state, and test-data rollback under those same
+  fences, without restoring or migrating an older schema.
 
 The one target scenario is fresh registration, encrypted conversation delivery,
 Connector run-lease execution, runtime report, client acknowledgement, and
-observation of that signed receipt. These are target command capabilities, not
-runnable commands at this revision. A focused test, service process, or
-foundation command alone cannot be reported as `AcceptanceObserved` or
-`Completed`.
+observation of that signed receipt. The lifecycle admission commands do not
+perform or infer those external effects. A focused test, service process,
+foundation command, or manually advanced record alone cannot be reported as
+`AcceptanceObserved` or `Completed`.
 
 The acceptance gate is one real fresh-target run that records the exact
 manifest/package digest, all six lifecycle transitions, readiness evidence,

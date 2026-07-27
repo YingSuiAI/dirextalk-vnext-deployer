@@ -9,6 +9,10 @@ use serde_json::json;
 #[cfg(unix)]
 use crate::client_binding::ClientBindingStore;
 use crate::{
+    alpha_deployment::{
+        AcceptanceObservation, AlphaLifecycle, AlphaLifecycleRecord, AlphaManifest,
+        AlphaStateStore, ConnectorFence, OperationFence, ReadinessFacts,
+    },
     archive::assemble,
     aws_ec2::{self, AwsEc2Manifest, ProductionAwsExecutor, ProductionRegistryExecutor},
     connector_apply::{ConnectorApplyInputs, apply},
@@ -147,6 +151,52 @@ enum Commands {
     },
     /// Read one durable offline operation record from the fixed local state directory.
     DeploymentStatus {
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// Validate the sole fresh-only Internal Test Alpha schema-3 package.
+    DeploymentAlphaValidate {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        package_root: PathBuf,
+    },
+    /// Create the exact Alpha Planned record; dry-run unless --execute is present.
+    DeploymentAlphaPlan {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        package_root: PathBuf,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        operation_epoch: u64,
+        #[arg(long)]
+        connector_id: String,
+        #[arg(long)]
+        connector_generation: u64,
+        #[arg(long)]
+        connector_lease_id: String,
+        #[arg(long)]
+        connector_lease_epoch: u64,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Advance exactly one durable Alpha lifecycle edge.
+    DeploymentAlphaAdvance {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        readiness: Option<PathBuf>,
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Read one redacted schema-3 Alpha lifecycle record.
+    DeploymentAlphaStatus {
         #[arg(long)]
         operation_id: String,
     },
@@ -483,6 +533,80 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::DeploymentStatus { operation_id } => {
             print_json(&DeploymentStateStore::fixed()?.read(&operation_id)?)?;
         }
+        Commands::DeploymentAlphaValidate {
+            manifest,
+            package_root,
+        } => {
+            let manifest = AlphaManifest::load(&manifest)?;
+            let package = manifest.verify_package(&package_root)?;
+            print_json(&json!({
+                "valid": true,
+                "schema_version": manifest.contract().schema_version,
+                "target": &manifest.contract().target.id,
+                "manifest_digest": package.manifest_digest,
+                "package_digest": package.package_digest,
+                "component_digests": package.component_digests,
+            }))?;
+        }
+        Commands::DeploymentAlphaPlan {
+            manifest,
+            package_root,
+            operation_id,
+            operation_epoch,
+            connector_id,
+            connector_generation,
+            connector_lease_id,
+            connector_lease_epoch,
+            execute,
+        } => {
+            let manifest = AlphaManifest::load(&manifest)?;
+            let package = manifest.verify_package(&package_root)?;
+            let record = AlphaLifecycleRecord::planned(
+                &manifest,
+                &package,
+                ConnectorFence {
+                    connector_id,
+                    generation: connector_generation,
+                    lease_id: connector_lease_id,
+                    lease_epoch: connector_lease_epoch,
+                },
+                OperationFence {
+                    operation_id,
+                    epoch: operation_epoch,
+                },
+            )?;
+            let record = if execute {
+                AlphaStateStore::fixed()?.create(&record)?
+            } else {
+                record
+            };
+            print_json(&record)?;
+        }
+        Commands::DeploymentAlphaAdvance {
+            operation_id,
+            to,
+            readiness,
+            receipt,
+            execute,
+        } => {
+            if !execute {
+                return Err(crate::error::ReleaseError::Deployment(
+                    "deployment-alpha-advance requires --execute".into(),
+                ));
+            }
+            let next = parse_alpha_lifecycle(&to)?;
+            let readiness = readiness.as_deref().map(ReadinessFacts::load).transpose()?;
+            let acceptance = receipt
+                .as_deref()
+                .map(AcceptanceObservation::load)
+                .transpose()?;
+            let record =
+                AlphaStateStore::fixed()?.advance(&operation_id, next, readiness, acceptance)?;
+            print_json(&record)?;
+        }
+        Commands::DeploymentAlphaStatus { operation_id } => {
+            print_json(&AlphaStateStore::fixed()?.read(&operation_id)?)?;
+        }
         Commands::DeploymentConnectorApply {
             operation_id,
             manifest,
@@ -672,6 +796,19 @@ pub fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_alpha_lifecycle(value: &str) -> Result<AlphaLifecycle> {
+    match value {
+        "installed" => Ok(AlphaLifecycle::Installed),
+        "started" => Ok(AlphaLifecycle::Started),
+        "readiness_verified" => Ok(AlphaLifecycle::ReadinessVerified),
+        "acceptance_observed" => Ok(AlphaLifecycle::AcceptanceObserved),
+        "completed" => Ok(AlphaLifecycle::Completed),
+        _ => Err(crate::error::ReleaseError::Deployment(
+            "invalid Alpha lifecycle target".into(),
+        )),
+    }
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
