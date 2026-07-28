@@ -378,7 +378,6 @@ impl RebindExecutor {
         let mut rules = vec![
             json!({"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk ACME HTTP challenge"}]}),
             json!({"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk public HTTPS"}]}),
-            json!({"IpProtocol":"tcp","FromPort":9443,"ToPort":9445,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk Agent Control TLS"}]}),
         ];
         let operator_ranges = match shape {
             SshIngressShape::Old => {
@@ -644,7 +643,10 @@ impl AwsExecutor for UpdateReplayExecutor {
                     serde_json::from_slice(&fs::read(&self.state_path).expect("state"))?;
                 format!("{{\"Account\":\"{}\"}}", state.account_id.expect("account"))
             }
-            "verify-dns-to-owned-eip" => "203.0.113.8 STREAM x\n".into(),
+            "verify-dns-to-owned-eip" => {
+                r#"{"Status":0,"Answer":[{"name":"x6.example.test.","type":1,"TTL":60,"data":"203.0.113.8"}]}"#
+                    .into()
+            }
             "verify-system-tls-https-health" | "verify-host-ready-receipt-regular-file" => {
                 String::new()
             }
@@ -1011,7 +1013,7 @@ fn bundle_manifest_and_dry_run_are_digest_bound_without_effects() {
     let (dir, manifest) = fixture("1.2.3", 'a');
     let plan = plan(&manifest, Some(100)).expect("plan");
     assert_eq!(plan.region, REGION);
-    assert_eq!(plan.ingress.len(), 4);
+    assert_eq!(plan.ingress.len(), 3);
     assert!(plan.ingress.iter().any(|rule| rule.from_port == 80));
     assert!(
         plan.ingress
@@ -2443,7 +2445,7 @@ fn real_server_bundle_5bf0090_parses_and_plans() {
     );
     assert_eq!(
         plan(&manifest, Some(100)).expect("real plan").ingress.len(),
-        4
+        3
     );
 }
 

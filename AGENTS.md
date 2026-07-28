@@ -24,6 +24,19 @@ whose sole manifest contract is `references/deployment-schema3.md`.
   one accumulated review at stage close. Ordinary fixes do not trigger a full
   re-review unless a high-risk public, persistence, or deployment contract
   changes.
+- Do not create an extra worktree for ordinary single-owner development,
+  verification, review, release, or deployment. At most one temporary
+  auxiliary worktree may exist for an explicitly concurrent non-overlapping
+  writer, and it must be removed as soon as that work is integrated or
+  abandoned.
+- Keep only two versions of generated release or acceptance material: the
+  current version and one immediately previous rollback version. Build caches
+  are disposable and must be cleaned after the stage. Preserve active
+  deployment state, but remove older bundles, binaries, logs, and superseded
+  acceptance artifacts once the newer version is verified.
+- Check disk capacity before builds and releases. Generated material must not
+  exceed 20 GiB in this repository without explicit user approval; stop and
+  clean Cargo and Docker BuildKit outputs before crossing the limit.
 - During Internal Test Alpha, ordinary single-owner work does not auto-load or
   use `$govern-agent-system` and does not delegate; the primary-worktree owner
   performs the full workflow directly. Use governance delegation only when the

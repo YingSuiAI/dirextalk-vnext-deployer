@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::{
     AwsEc2Manifest, Ec2State,
     bundle::{BundleFacts, canonical_json, digest, hash},
-    contract, domain, exact_image,
+    contract, domain, exact_image, token,
 };
 use crate::Result;
 
@@ -110,7 +110,6 @@ impl ProvisionRequest {
     fn validate(&self) -> Result<()> {
         if self.schema != "dirextalk.vnext-host-provision"
             || self.schema_version != 1
-            || !matches!(self.target.as_str(), "x6" | "x7" | "x8")
             || Version::parse(&self.release_version).is_err()
             || self.tenant_id == self.indexer_id
             || !self
@@ -120,6 +119,7 @@ impl ProvisionRequest {
         {
             return Err(contract("host provision request facts are invalid"));
         }
+        token(&self.target, "host provision target")?;
         domain(&self.domain)?;
         for id in [&self.tenant_id, &self.indexer_id] {
             if Uuid::parse_str(id)
