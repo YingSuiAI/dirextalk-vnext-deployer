@@ -22,6 +22,8 @@ use crate::{
     manifest::LoadedManifest,
     plan::ReleasePlan,
     publish::{PublicationPlan, PublicationSelection},
+    rootkey::AwsRootKey,
+    user_deployment,
 };
 
 #[cfg(unix)]
@@ -42,7 +44,170 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum DeployCommands {
+    /// Plan and, with --execute, complete a new-user EC2 deployment.
+    Onboard {
+        /// Strict deployment configuration. The file must never contain AWS credentials.
+        #[arg(long)]
+        config: PathBuf,
+        /// Absolute path to the user-selected AWS root access-key CSV.
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long)]
+        max_monthly_usd: u32,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Read-only inventory of deployment-tagged EC2 resources.
+    Inventory {
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long)]
+        region: String,
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
+    },
+    /// Query the live Lightsail region, Ubuntu blueprint, and bundle catalog.
+    Catalog {
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long)]
+        region: String,
+    },
+    /// Resume an interrupted deployment using a freshly selected rootkey.csv.
+    Resume {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long)]
+        max_monthly_usd: u32,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Read redacted deployment and credential-rotation state.
+    Status {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+    },
+    /// Verify live deployment health using a freshly selected rootkey.csv.
+    Verify {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+    },
+    /// Apply an authenticated forward update.
+    Update {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Replace only the deployment-owned operator SSH /32 after the public IP changes.
+    RebindSsh {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long)]
+        expected_old_cidr: String,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Destroy only resources recorded as owned by this deployment.
+    Destroy {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        purge_volume: bool,
+        #[arg(long, requires = "purge_volume")]
+        purge_volume_id: Option<String>,
+    },
+    /// Client binding issuance and status.
+    Binding {
+        #[command(subcommand)]
+        command: DeployBindingCommands,
+    },
+    /// Root-key replacement verification.
+    Credentials {
+        #[command(subcommand)]
+        command: DeployCredentialCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeployBindingCommands {
+    /// Issue a short-lived deployment binding after the server is verified.
+    Issue {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        execute: bool,
+        /// Return after issuance instead of waiting for the App to consume the ticket.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Query one issued ticket and clean the fallback file after consumption.
+    Status {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeployCredentialCommands {
+    /// Validate rootkey.csv and display only the redacted STS account identity.
+    Identify {
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+    },
+    /// Verify a replacement root key and clear the post-deployment reminder.
+    VerifyRotation {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        aws_rootkey_csv: PathBuf,
+        #[arg(long, default_value_os_t = default_user_state_dir())]
+        state_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Commands {
+    /// New-user deployment, lifecycle, binding, and credential rotation.
+    Deploy {
+        #[command(subcommand)]
+        command: DeployCommands,
+    },
     /// Strictly validate a release manifest and its source paths.
     Validate {
         #[arg(long)]
@@ -350,6 +515,198 @@ enum Commands {
 #[allow(clippy::too_many_lines)]
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::Deploy { command } => match command {
+            DeployCommands::Catalog {
+                aws_rootkey_csv,
+                region,
+            } => {
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::lightsail_catalog(&region, &rootkey)?)?;
+            }
+            DeployCommands::Inventory {
+                aws_rootkey_csv,
+                region,
+                targets,
+            } => {
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::inventory_owned_ec2(
+                    &region, &targets, &rootkey,
+                )?)?;
+            }
+            DeployCommands::Onboard {
+                config,
+                aws_rootkey_csv,
+                state_dir,
+                max_monthly_usd,
+                execute,
+            } => {
+                let manifest = AwsEc2Manifest::load(&config)?;
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::onboard_ec2(
+                    &manifest,
+                    &state_dir,
+                    max_monthly_usd,
+                    execute,
+                    &rootkey,
+                )?)?;
+            }
+            DeployCommands::Resume {
+                config,
+                aws_rootkey_csv,
+                state_dir,
+                max_monthly_usd,
+                execute,
+            } => {
+                let manifest = AwsEc2Manifest::load(&config)?;
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::resume_ec2(
+                    &manifest,
+                    &state_dir,
+                    max_monthly_usd,
+                    execute,
+                    &rootkey,
+                )?)?;
+            }
+            DeployCommands::Status { config, state_dir } => {
+                let manifest = AwsEc2Manifest::load(&config)?;
+                print_json(&user_deployment::status_ec2(&manifest, &state_dir)?)?;
+            }
+            DeployCommands::Verify {
+                config,
+                aws_rootkey_csv,
+                state_dir,
+            } => {
+                let manifest = AwsEc2Manifest::load(&config)?;
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::verify_ec2(
+                    &manifest, &state_dir, &rootkey,
+                )?)?;
+            }
+            DeployCommands::Update {
+                config,
+                aws_rootkey_csv,
+                state_dir,
+                execute,
+            } => {
+                let manifest = AwsEc2Manifest::load(&config)?;
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::update_ec2(
+                    &manifest, &state_dir, execute, &rootkey,
+                )?)?;
+            }
+            DeployCommands::RebindSsh {
+                config,
+                aws_rootkey_csv,
+                state_dir,
+                expected_old_cidr,
+                execute,
+            } => {
+                let manifest = AwsEc2Manifest::load(&config)?;
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::rebind_operator_cidr_ec2(
+                    &manifest,
+                    &state_dir,
+                    &expected_old_cidr,
+                    execute,
+                    &rootkey,
+                )?)?;
+            }
+            DeployCommands::Destroy {
+                config,
+                aws_rootkey_csv,
+                state_dir,
+                execute,
+                purge_volume,
+                purge_volume_id,
+            } => {
+                let manifest = AwsEc2Manifest::load(&config)?;
+                let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                print_json(&user_deployment::destroy_ec2(
+                    &manifest,
+                    &state_dir,
+                    execute,
+                    purge_volume,
+                    purge_volume_id.as_deref(),
+                    &rootkey,
+                )?)?;
+            }
+            DeployCommands::Binding { command } => match command {
+                DeployBindingCommands::Issue {
+                    config,
+                    state_dir,
+                    output,
+                    execute,
+                    no_wait,
+                } => {
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (config, state_dir, output, execute, no_wait);
+                        return Err(crate::ReleaseError::UnsupportedPlatform(
+                            "client binding issuance requires Unix",
+                        ));
+                    }
+                    #[cfg(unix)]
+                    {
+                        if !execute {
+                            return Err(crate::ReleaseError::Deployment(
+                                "deploy binding-issue requires --execute".into(),
+                            ));
+                        }
+                        let manifest = AwsEc2Manifest::load(&config)?;
+                        print_json(&crate::deployment_binding::issue_ec2(
+                            &manifest,
+                            &state_dir,
+                            &output,
+                            &ProductionAwsExecutor,
+                        )?)?;
+                        if !no_wait {
+                            print_json(&crate::deployment_binding::wait_ec2(
+                                &manifest, &state_dir, &output,
+                            )?)?;
+                        }
+                    }
+                }
+                DeployBindingCommands::Status {
+                    config,
+                    state_dir,
+                    output,
+                } => {
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (config, state_dir, output);
+                        return Err(crate::ReleaseError::UnsupportedPlatform(
+                            "deployment binding status requires Unix",
+                        ));
+                    }
+                    #[cfg(unix)]
+                    {
+                        let manifest = AwsEc2Manifest::load(&config)?;
+                        print_json(&crate::deployment_binding::status_ec2(
+                            &manifest, &state_dir, &output,
+                        )?)?;
+                    }
+                }
+            },
+            DeployCommands::Credentials { command } => match command {
+                DeployCredentialCommands::Identify { aws_rootkey_csv } => {
+                    let rootkey = AwsRootKey::load(&aws_rootkey_csv)?;
+                    print_json(&user_deployment::identify_rootkey(&rootkey)?)?;
+                }
+                DeployCredentialCommands::VerifyRotation {
+                    config,
+                    aws_rootkey_csv,
+                    state_dir,
+                } => {
+                    let manifest = AwsEc2Manifest::load(&config)?;
+                    let replacement = AwsRootKey::load(&aws_rootkey_csv)?;
+                    print_json(&user_deployment::verify_rotation(
+                        &manifest,
+                        &state_dir,
+                        &replacement,
+                    )?)?;
+                }
+            },
+        },
         Commands::Validate { manifest } => {
             let loaded = LoadedManifest::load(&manifest)?;
             print_json(&json!({
@@ -796,6 +1153,39 @@ pub fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn default_user_state_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(root).join("Dirextalk").join("deployments");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(root) = std::env::var_os("HOME") {
+            return PathBuf::from(root)
+                .join("Library")
+                .join("Application Support")
+                .join("Dirextalk")
+                .join("deployments");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(root) = std::env::var_os("XDG_STATE_HOME") {
+            return PathBuf::from(root).join("dirextalk").join("deployments");
+        }
+        if let Some(root) = std::env::var_os("HOME") {
+            return PathBuf::from(root)
+                .join(".local")
+                .join("state")
+                .join("dirextalk")
+                .join("deployments");
+        }
+    }
+    PathBuf::from(".dirextalk-state")
 }
 
 fn parse_alpha_lifecycle(value: &str) -> Result<AlphaLifecycle> {

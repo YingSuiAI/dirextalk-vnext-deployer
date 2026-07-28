@@ -3,6 +3,8 @@ use std::{
     fs,
     net::Ipv4Addr,
     path::Path,
+    thread,
+    time::Duration,
 };
 
 use base64::{
@@ -21,8 +23,8 @@ use super::provision::{HostReadyReceipt, ProvisionRequest};
 use super::store::Store;
 use super::{
     AWS, AmiRecord, AwsEc2Manifest, AwsExecutor, BundleRecord, CURL, Ec2State, EipRecord,
-    FixedCommand, GETENT, HEALTH_PATH, HostKeyRecord, InfrastructureRecord, KeyRecord,
-    LifecyclePhase, OwnedRecordSet, REGION, REMOTE_BUNDLE, REMOTE_CROSS_VERSION_BOOTSTRAP,
+    FixedCommand, HEALTH_PATH, HostKeyRecord, InfrastructureRecord, KeyRecord, LifecyclePhase,
+    OwnedRecordSet, REMOTE_BUNDLE, REMOTE_CROSS_VERSION_BOOTSTRAP,
     REMOTE_CROSS_VERSION_BOOTSTRAP_ATOMIC, REMOTE_CROSS_VERSION_BOOTSTRAP_UPLOAD,
     REMOTE_CURRENT_RECEIPT, REMOTE_INSTALLER, REMOTE_INSTALLER_ATOMIC, REMOTE_INSTALLER_UPLOAD,
     REMOTE_PROVISION_REQUEST, REMOTE_PROVISIONER, REMOTE_PROVISIONER_ATOMIC,
@@ -206,7 +208,7 @@ fn new_state(
         client_token_sha256,
         target: manifest.target.clone(),
         account_id: None,
-        region: REGION.into(),
+        region: manifest.region.clone(),
         domain: manifest.domain.clone(),
         tenant_id: Uuid::now_v7().to_string(),
         indexer_id: Uuid::now_v7().to_string(),
@@ -365,7 +367,7 @@ fn resolve_ami(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecutor) 
             "ec2",
             "describe-images",
             "--region",
-            REGION,
+            state.region.as_str(),
             "--owners",
             UBUNTU_OWNER,
             "--filters",
@@ -523,7 +525,7 @@ fn ensure_key(
         persist(store, state)?;
     }
     let key_name = state.key.as_ref().expect("key state").key_name.clone();
-    let existing = describe_key_pairs(&key_name, executor)?;
+    let existing = describe_key_pairs(&state.region, &key_name, executor)?;
     match existing.as_slice() {
         [] => {
             let public = store.artifact_path(PUBLIC_KEY_SUFFIX)?;
@@ -537,7 +539,7 @@ fn ensure_key(
                         "ec2".into(),
                         "import-key-pair".into(),
                         "--region".into(),
-                        REGION.into(),
+                        state.region.clone(),
                         "--key-name".into(),
                         key_name.clone(),
                         "--public-key-material".into(),
@@ -556,7 +558,7 @@ fn ensure_key(
         [pair] => validate_key_pair(pair, state)?,
         _ => return Err(ReleaseError::OperationConflict),
     }
-    let reconciled = describe_key_pairs(&key_name, executor)?;
+    let reconciled = describe_key_pairs(&state.region, &key_name, executor)?;
     if reconciled.len() != 1 {
         return Err(contract("owned EC2 key pair did not reconcile exactly"));
     }
@@ -642,7 +644,11 @@ fn decode_fingerprint(value: &str) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn describe_key_pairs(key_name: &str, executor: &dyn AwsExecutor) -> Result<Vec<Value>> {
+fn describe_key_pairs(
+    region: &str,
+    key_name: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<Vec<Value>> {
     let output = executor.run(&FixedCommand::new(
         "describe-key-pair",
         AWS,
@@ -650,7 +656,7 @@ fn describe_key_pairs(key_name: &str, executor: &dyn AwsExecutor) -> Result<Vec<
             "ec2".into(),
             "describe-key-pairs".into(),
             "--region".into(),
-            REGION.into(),
+            region.into(),
             "--filters".into(),
             format!("Name=key-name,Values={key_name}"),
             "--output".into(),
@@ -689,7 +695,7 @@ fn ensure_security_group(
                 "ec2",
                 "describe-vpcs",
                 "--region",
-                REGION,
+                state.region.as_str(),
                 "--filters",
                 "Name=is-default,Values=true",
                 "--output",
@@ -721,7 +727,7 @@ fn ensure_security_group(
                         "ec2".into(),
                         "create-security-group".into(),
                         "--region".into(),
-                        REGION.into(),
+                        state.region.clone(),
                         "--group-name".into(),
                         format!("dtx-{}", state.operation_id),
                         "--description".into(),
@@ -770,7 +776,7 @@ fn ensure_security_group(
                     "ec2".into(),
                     "authorize-security-group-ingress".into(),
                     "--region".into(),
-                    REGION.into(),
+                    state.region.clone(),
                     "--group-id".into(),
                     id,
                     "--ip-permissions".into(),
@@ -798,7 +804,7 @@ fn describe_owned_security_groups(
         "ec2".into(),
         "describe-security-groups".into(),
         "--region".into(),
-        REGION.into(),
+        state.region.clone(),
         "--filters".into(),
         format!(
             "Name=vpc-id,Values={}",
@@ -825,7 +831,6 @@ fn ingress_permissions(manifest: &AwsEc2Manifest) -> Value {
     json!([
         {"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk ACME HTTP challenge"}]},
         {"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk public HTTPS"}]},
-        {"IpProtocol":"tcp","FromPort":9443,"ToPort":9445,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk Agent Control TLS"}]},
         {"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":manifest.operator_ssh_cidr,"Description":"Dirextalk operator SSH"}]}
     ])
 }
@@ -925,7 +930,7 @@ fn ensure_instance(
                     "ec2".into(),
                     "run-instances".into(),
                     "--region".into(),
-                    REGION.into(),
+                    state.region.clone(),
                     "--client-token".into(),
                     state.client_token.clone(),
                     "--image-id".into(),
@@ -954,6 +959,20 @@ fn ensure_instance(
             executor,
         )?;
         instances = describe_owned_instances(state, executor)?;
+        // `RunInstances` can become visible before the attached root volume is
+        // projected by `DescribeInstances`. Reconcile that bounded eventual
+        // consistency window before validating the immutable volume contract.
+        for _ in 0..12 {
+            if instances.len() == 1
+                && instances[0]["BlockDeviceMappings"]
+                    .as_array()
+                    .is_some_and(|mappings| mappings.len() == 1)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_secs(5));
+            instances = describe_owned_instances(state, executor)?;
+        }
     }
     if instances.len() != 1 {
         return Err(ReleaseError::OperationConflict);
@@ -1013,7 +1032,7 @@ fn ensure_instance(
                     "wait".into(),
                     waiter.into(),
                     "--region".into(),
-                    REGION.into(),
+                    state.region.clone(),
                     "--instance-ids".into(),
                     instance_id.clone(),
                 ],
@@ -1024,7 +1043,7 @@ fn ensure_instance(
         )?;
     }
     verify_owned_volume(state, &volume_id, false, executor)?;
-    let volumes = describe_volumes_by_id(&volume_id, executor)?;
+    let volumes = describe_volumes_by_id(&state.region, &volume_id, executor)?;
     if volumes.len() != 1
         || volumes[0]["Size"].as_u64() != Some(u64::from(manifest.disk_gib))
         || volumes[0]["Encrypted"].as_bool() != Some(true)
@@ -1041,7 +1060,7 @@ fn describe_owned_instances(state: &Ec2State, executor: &dyn AwsExecutor) -> Res
         "ec2".into(),
         "describe-instances".into(),
         "--region".into(),
-        REGION.into(),
+        state.region.clone(),
         "--filters".into(),
         format!("Name=client-token,Values={}", state.client_token),
         "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down".into(),
@@ -1109,7 +1128,7 @@ fn ensure_eip(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecutor) -
                     "ec2".into(),
                     "allocate-address".into(),
                     "--region".into(),
-                    REGION.into(),
+                    state.region.clone(),
                     "--domain".into(),
                     "vpc".into(),
                     "--tag-specifications".into(),
@@ -1154,7 +1173,7 @@ fn ensure_eip(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecutor) -
                     "ec2".into(),
                     "associate-address".into(),
                     "--region".into(),
-                    REGION.into(),
+                    state.region.clone(),
                     "--allocation-id".into(),
                     allocation_id.clone(),
                     "--instance-id".into(),
@@ -1190,7 +1209,7 @@ fn describe_owned_addresses(state: &Ec2State, executor: &dyn AwsExecutor) -> Res
         "ec2".into(),
         "describe-addresses".into(),
         "--region".into(),
-        REGION.into(),
+        state.region.clone(),
         "--filters".into(),
     ];
     append_tag_filters(&mut argv, state);
@@ -1430,28 +1449,48 @@ fn ensure_host_key(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecut
         .as_ref()
         .map(|ami| ami.image_id.as_str())
         .ok_or_else(|| contract("AMI state is missing"))?;
-    let console = executor.run(&FixedCommand::new(
-        "read-authenticated-console-output",
-        AWS,
-        [
-            "ec2",
-            "get-console-output",
-            "--region",
-            REGION,
-            "--instance-id",
-            instance_id,
-            "--latest",
-            "--output",
-            "json",
-        ],
-        false,
-        45,
-    ))?;
-    let value: Value = serde_json::from_str(&console.stdout)?;
-    let encoded_output = value["Output"]
-        .as_str()
-        .ok_or_else(|| contract("EC2 console output is missing"))?;
-    let output = decode_console_output(encoded_output)?;
+    let mut authenticated_output = None;
+    for attempt in 0..60 {
+        let console = executor.run(&FixedCommand::new(
+            "read-authenticated-console-output",
+            AWS,
+            [
+                "ec2",
+                "get-console-output",
+                "--region",
+                state.region.as_str(),
+                "--instance-id",
+                instance_id,
+                "--latest",
+                "--output",
+                "json",
+            ],
+            false,
+            45,
+        ))?;
+        let value: Value = serde_json::from_str(&console.stdout)?;
+        if let Some(encoded_output) = value["Output"].as_str() {
+            let output = decode_console_output(encoded_output)?;
+            let count = output
+                .lines()
+                .filter(|line| line.starts_with("DTXHK01 "))
+                .count();
+            if count > 1 {
+                return Err(contract(
+                    "console host-key attestation is absent or ambiguous",
+                ));
+            }
+            if count == 1 {
+                authenticated_output = Some(output);
+                break;
+            }
+        }
+        if attempt < 59 {
+            thread::sleep(Duration::from_secs(10));
+        }
+    }
+    let output = authenticated_output
+        .ok_or_else(|| contract("console host-key attestation did not become ready"))?;
     let attestation =
         parse_console_host_key(&output, instance_id, &state.client_token_sha256, ami_id)?;
     let ip = state
@@ -1619,6 +1658,28 @@ fn ensure_host_helpers(
     facts: &BundleFacts,
     executor: &dyn AwsExecutor,
 ) -> Result<()> {
+    run_effect(
+        store,
+        state,
+        &ssh_command(
+            "ensure-host-helper-directory",
+            state,
+            store,
+            [
+                "/usr/bin/sudo",
+                "--non-interactive",
+                "/usr/bin/install",
+                "--directory",
+                "--owner=root",
+                "--group=root",
+                "--mode=0755",
+                "/usr/local/libexec/dirextalk",
+            ],
+            true,
+            30,
+        )?,
+        executor,
+    )?;
     let helpers = [
         HostHelperSpec {
             label: "host-installer",
@@ -2257,7 +2318,7 @@ fn validate_runtime_attestation(
         return Err(contract("runtime attestation digest is invalid"));
     }
     if attestation.bundle_sha256 != facts.bundle_sha256
-        || attestation.version != "0.1.4"
+        || attestation.version != facts.manifest.version
         || attestation.server_image != manifest.server_image
         || attestation.migrator_image != manifest.migrator_image
         || state
@@ -3357,15 +3418,42 @@ fn verify_live_locked(
         .ok_or_else(|| contract("owned EIP is absent"))?;
     let dns = executor.run(&FixedCommand::new(
         "verify-dns-to-owned-eip",
-        GETENT,
-        ["ahostsv4", manifest.domain.as_str()],
+        CURL,
+        [
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            "--get",
+            "--header",
+            "accept: application/dns-json",
+            "--data-urlencode",
+            &format!("name={}", manifest.domain),
+            "--data",
+            "type=A",
+            "https://cloudflare-dns.com/dns-query",
+        ],
         false,
-        20,
+        30,
     ))?;
-    let addresses = dns
-        .stdout
-        .lines()
-        .filter_map(|line| line.split_ascii_whitespace().next())
+    let response: Value = serde_json::from_str(&dns.stdout)
+        .map_err(|_| contract("public DNS response is malformed"))?;
+    if response.get("Status").and_then(Value::as_u64) != Some(0) {
+        return Err(contract("public DNS response is not successful"));
+    }
+    let addresses = response
+        .get("Answer")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|answer| answer.get("type").and_then(Value::as_u64) == Some(1))
+        .filter_map(|answer| answer.get("data").and_then(Value::as_str))
         .filter_map(|value| value.parse::<Ipv4Addr>().ok())
         .collect::<BTreeSet<_>>();
     if addresses
@@ -3389,6 +3477,8 @@ fn verify_live_locked(
             "10",
             "--max-time",
             "20",
+            "--resolve",
+            &format!("{}:443:{ip}", manifest.domain),
             "--output",
             "/dev/null",
             &format!("https://{}{HEALTH_PATH}", manifest.domain),
@@ -4227,6 +4317,7 @@ pub fn rebind_operator_cidr(
     );
     match ingress {
         RebindIngress::OldOnly => {
+            let region = state.region.clone();
             let authorize_id = if preserve_bridge {
                 REBIND_AUTHORIZE_PRESERVE_R3_BRIDGE
             } else {
@@ -4239,6 +4330,7 @@ pub fn rebind_operator_cidr(
                 &operator_ingress_command(
                     authorize_id,
                     "authorize-security-group-ingress",
+                    &region,
                     &security_group_id,
                     &manifest.operator_ssh_cidr,
                 )?,
@@ -4393,7 +4485,7 @@ fn describe_exact_owned_security_group(
             "ec2",
             "describe-security-groups",
             "--region",
-            REGION,
+            state.region.as_str(),
             "--group-ids",
             security_group_id,
             "--output",
@@ -4435,7 +4527,6 @@ fn rebind_permissions(operator_cidrs: &[&str]) -> Value {
     let mut permissions = vec![
         json!({"IpProtocol":"tcp","FromPort":80,"ToPort":80,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk ACME HTTP challenge"}]}),
         json!({"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk public HTTPS"}]}),
-        json!({"IpProtocol":"tcp","FromPort":9443,"ToPort":9445,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"Dirextalk Agent Control TLS"}]}),
     ];
     permissions.extend(
         operator_cidrs
@@ -4452,6 +4543,7 @@ fn operator_ingress_permission(cidr: &str) -> Value {
 fn operator_ingress_command(
     id: &str,
     action: &str,
+    region: &str,
     security_group_id: &str,
     cidr: &str,
 ) -> Result<FixedCommand> {
@@ -4462,7 +4554,7 @@ fn operator_ingress_command(
             "ec2".into(),
             action.into(),
             "--region".into(),
-            REGION.into(),
+            region.into(),
             "--group-id".into(),
             security_group_id.into(),
             "--ip-permissions".into(),
@@ -4494,6 +4586,7 @@ fn revoke_old_operator_ingress(
         &operator_ingress_command(
             revoke_id,
             "revoke-security-group-ingress",
+            &state.region,
             security_group_id,
             old_cidr,
         )?,
@@ -4591,7 +4684,7 @@ pub fn destroy(
             return Ok(state);
         }
         verify_caller_account(&state, executor)?;
-        let volumes = describe_volumes_by_id(&expected, executor)?;
+        let volumes = describe_volumes_by_id(&state.region, &expected, executor)?;
         if volumes.is_empty()
             && state.pending_effect.as_deref() == Some("purge-explicit-retained-volume")
         {
@@ -4610,7 +4703,7 @@ pub fn destroy(
                 "ec2",
                 "delete-volume",
                 "--region",
-                REGION,
+                state.region.as_str(),
                 "--volume-id",
                 expected.as_str(),
             ],
@@ -4739,7 +4832,7 @@ fn destroy_eip_association(
     let Some(eip) = state.eip.clone() else {
         return Ok(());
     };
-    let addresses = describe_addresses_by_allocation(&eip.allocation_id, executor)?;
+    let addresses = describe_addresses_by_allocation(&state.region, &eip.allocation_id, executor)?;
     if addresses.is_empty() {
         state.eip = None;
         return persist(store, state);
@@ -4761,7 +4854,7 @@ fn destroy_eip_association(
                     "ec2",
                     "disassociate-address",
                     "--region",
-                    REGION,
+                    state.region.as_str(),
                     "--association-id",
                     association,
                 ],
@@ -4794,7 +4887,7 @@ fn retain_and_terminate_instance(
                 "ec2".into(),
                 "create-tags".into(),
                 "--region".into(),
-                REGION.into(),
+                state.region.clone(),
                 "--resources".into(),
                 volume_id.clone(),
                 "--tags".into(),
@@ -4807,7 +4900,7 @@ fn retain_and_terminate_instance(
     )?;
     verify_owned_volume(state, &volume_id, true, executor)?;
     if let Some(instance_id) = state.instance_id.clone() {
-        let instances = describe_instance_by_id(&instance_id, executor)?;
+        let instances = describe_instance_by_id(&state.region, &instance_id, executor)?;
         if let Some(instance) = instances.first() {
             if instances.len() != 1 || !tags_match(&instance["Tags"], state) {
                 return Err(ReleaseError::OperationConflict);
@@ -4823,7 +4916,7 @@ fn retain_and_terminate_instance(
                             "ec2".into(),
                             "terminate-instances".into(),
                             "--region".into(),
-                            REGION.into(),
+                            state.region.clone(),
                             "--instance-ids".into(),
                             instance_id.clone(),
                         ],
@@ -4843,7 +4936,7 @@ fn retain_and_terminate_instance(
                             "wait".into(),
                             "instance-terminated".into(),
                             "--region".into(),
-                            REGION.into(),
+                            state.region.clone(),
                             "--instance-ids".into(),
                             instance_id,
                         ],
@@ -4864,7 +4957,7 @@ fn destroy_eip(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecutor) 
     let Some(eip) = state.eip.clone() else {
         return Ok(());
     };
-    let addresses = describe_addresses_by_allocation(&eip.allocation_id, executor)?;
+    let addresses = describe_addresses_by_allocation(&state.region, &eip.allocation_id, executor)?;
     if addresses.is_empty() {
         state.eip = None;
         return persist(store, state);
@@ -4885,7 +4978,7 @@ fn destroy_eip(store: &Store, state: &mut Ec2State, executor: &dyn AwsExecutor) 
                 "ec2".into(),
                 "release-address".into(),
                 "--region".into(),
-                REGION.into(),
+                state.region.clone(),
                 "--allocation-id".into(),
                 eip.allocation_id,
             ],
@@ -4906,7 +4999,7 @@ fn destroy_security_group(
     let Some(id) = state.security_group_id.clone() else {
         return Ok(());
     };
-    let groups = describe_group_by_id(&id, executor)?;
+    let groups = describe_group_by_id(&state.region, &id, executor)?;
     if groups.is_empty() {
         state.security_group_id = None;
         return persist(store, state);
@@ -4924,7 +5017,7 @@ fn destroy_security_group(
                 "ec2".into(),
                 "delete-security-group".into(),
                 "--region".into(),
-                REGION.into(),
+                state.region.clone(),
                 "--group-id".into(),
                 id,
             ],
@@ -4945,7 +5038,7 @@ fn destroy_cloud_key(
     let Some(key) = state.key.clone() else {
         return Ok(());
     };
-    let pairs = describe_key_pairs(&key.key_name, executor)?;
+    let pairs = describe_key_pairs(&state.region, &key.key_name, executor)?;
     if pairs.is_empty() {
         state.key = None;
         return persist(store, state);
@@ -4963,7 +5056,7 @@ fn destroy_cloud_key(
                 "ec2".into(),
                 "delete-key-pair".into(),
                 "--region".into(),
-                REGION.into(),
+                state.region.clone(),
                 "--key-name".into(),
                 key.key_name,
             ],
@@ -4982,7 +5075,7 @@ fn verify_owned_volume(
     retained: bool,
     executor: &dyn AwsExecutor,
 ) -> Result<()> {
-    let volumes = describe_volumes_by_id(volume_id, executor)?;
+    let volumes = describe_volumes_by_id(&state.region, volume_id, executor)?;
     if volumes.len() != 1
         || volumes[0]["VolumeId"].as_str() != Some(volume_id)
         || !tags_match(&volumes[0]["Tags"], state)
@@ -4996,7 +5089,11 @@ fn verify_owned_volume(
     Ok(())
 }
 
-fn describe_volumes_by_id(volume_id: &str, executor: &dyn AwsExecutor) -> Result<Vec<Value>> {
+fn describe_volumes_by_id(
+    region: &str,
+    volume_id: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<Vec<Value>> {
     let output = executor.run(&FixedCommand::new(
         "describe-exact-volume",
         AWS,
@@ -5004,7 +5101,7 @@ fn describe_volumes_by_id(volume_id: &str, executor: &dyn AwsExecutor) -> Result
             "ec2",
             "describe-volumes",
             "--region",
-            REGION,
+            region,
             "--filters",
             &format!("Name=volume-id,Values={volume_id}"),
             "--output",
@@ -5022,6 +5119,7 @@ fn describe_volumes_by_id(volume_id: &str, executor: &dyn AwsExecutor) -> Result
 }
 
 fn describe_addresses_by_allocation(
+    region: &str,
     allocation_id: &str,
     executor: &dyn AwsExecutor,
 ) -> Result<Vec<Value>> {
@@ -5032,7 +5130,7 @@ fn describe_addresses_by_allocation(
             "ec2",
             "describe-addresses",
             "--region",
-            REGION,
+            region,
             "--filters",
             &format!("Name=allocation-id,Values={allocation_id}"),
             "--output",
@@ -5048,7 +5146,11 @@ fn describe_addresses_by_allocation(
         .ok_or_else(|| contract("EIP response is malformed"))
 }
 
-fn describe_instance_by_id(instance_id: &str, executor: &dyn AwsExecutor) -> Result<Vec<Value>> {
+fn describe_instance_by_id(
+    region: &str,
+    instance_id: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<Vec<Value>> {
     let output = executor.run(&FixedCommand::new(
         "describe-exact-instance",
         AWS,
@@ -5056,7 +5158,7 @@ fn describe_instance_by_id(instance_id: &str, executor: &dyn AwsExecutor) -> Res
             "ec2",
             "describe-instances",
             "--region",
-            REGION,
+            region,
             "--filters",
             &format!("Name=instance-id,Values={instance_id}"),
             "--output",
@@ -5081,7 +5183,11 @@ fn describe_instance_by_id(instance_id: &str, executor: &dyn AwsExecutor) -> Res
         .collect())
 }
 
-fn describe_group_by_id(group_id: &str, executor: &dyn AwsExecutor) -> Result<Vec<Value>> {
+fn describe_group_by_id(
+    region: &str,
+    group_id: &str,
+    executor: &dyn AwsExecutor,
+) -> Result<Vec<Value>> {
     let output = executor.run(&FixedCommand::new(
         "describe-exact-security-group",
         AWS,
@@ -5089,7 +5195,7 @@ fn describe_group_by_id(group_id: &str, executor: &dyn AwsExecutor) -> Result<Ve
             "ec2",
             "describe-security-groups",
             "--region",
-            REGION,
+            region,
             "--filters",
             &format!("Name=group-id,Values={group_id}"),
             "--output",

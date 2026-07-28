@@ -1,60 +1,67 @@
 ---
 name: dirextalk-vnext-deployer
-description: Build, assemble, preview, and explicitly publish Dirextalk vNext server, deployer, and multi-Agent Connector releases with the typed Rust CLI.
+description: Orchestrate typed Dirextalk RootKey onboarding, EC2 lifecycle, App binding, verification, rotation, and scoped destruction commands.
 ---
 
-# Dirextalk vNext release workflow (release-only)
+# Dirextalk vNext deployer
 
-This skill is inactive for Internal Test Alpha unless the user explicitly
-invokes it for release work. The active Alpha deployment contract is
-[`references/internal-test-alpha-deployer.md`](references/internal-test-alpha-deployer.md);
-this release workflow must not be used as Alpha acceptance evidence.
+Use this project Skill to guide a user through the typed CLI. Do not
+reimplement the deployment in shell and do not substitute the legacy
+`dirextalk-connect` deployer.
 
-Use this skill for Dirextalk vNext release preparation or publication. Run the
-Rust CLI from this repository and treat `release.example.json` as a template,
-not as a hidden source of credentials.
+Read
+[`references/rootkey-onboarding-alpha.md`](references/rootkey-onboarding-alpha.md)
+before onboarding, resuming, binding, rotating credentials, or
+destroying a deployment.
 
-## Required sequence
+## RootKey rules
 
-1. Read the selected manifest and run `validate`.
-2. Run `plan` and inspect the resolved image, target matrix, source commits,
-   local output paths, and command programs. Do not translate commands into a
-   shell script.
-3. Run `build --execute` only for targets supported by the selected builder, or
-   let CI populate the documented `artifacts/<target>/` layout.
-4. Run `assemble` into a new or empty output directory. Inspect
-   `checksums-sha256.txt`, `github-assets.json`, and the generated npm package.
-5. Run `publish` without `--execute` and report its credential-readiness
-   booleans. Never reveal environment values or Docker configuration content.
-6. Add `--execute` only when the user explicitly authorizes the named registry,
-   npm, and/or GitHub mutations. Select each destination with its own flag.
+- Ask the App/runtime for the absolute local path selected by the user.
+- Pass only that path to `--aws-rootkey-csv`.
+- Never read, print, summarize, copy, upload, source, or parse the CSV in the
+  agent/model layer.
+- Never place credential values in a command, environment variable,
+  configuration, state, log, message, QR payload, or artifact.
+- Run `deploy credentials identify` first and show only its redacted STS
+  account/principal result.
+- Require the user to review the account, region, resources, cost ceiling, and
+  RootKey warning before adding `--execute`.
+- Require a freshly selected valid CSV for every resume, verify,
+  rotation check, or destruction.
 
-## Hard rules
+## Onboarding sequence
 
-- Never infer permission to publish from permission to build or assemble.
-- Never use a floating server image tag. The default image repository is
-  `dirextalk/vent`, but it remains manifest-configurable.
-- Never pass secrets on a command line or write them into a manifest, plan,
-  artifact, npm wrapper, log, or GitHub asset.
-- Never bypass dirty-worktree or source-revision checks for a release.
-- Never reuse legacy `dirextalk-deployer` shell orchestration. New install and
-  lifecycle operations belong in typed Rust commands with durable state.
-- A failed or interrupted publication is not proof of release completion.
-  Verify each selected registry/release using its authoritative read API.
+1. Validate that the configuration is non-secret and selects EC2 plus an
+   existing Route53 hostname.
+2. Run `deploy onboard` without `--execute` and present the plan.
+3. Run the same command with `--execute` only after explicit confirmation.
+4. If interrupted, use `deploy status` and then `deploy resume`; never create a
+   second deployment for the same durable operation.
+5. Run `deploy verify`.
+6. Run `deploy binding issue --execute`, present the canonical QR/file to the
+   user, and wait for `consumed/ready`. Use `--no-wait` only when a separate
+   status loop is intentional.
+7. Remind the user to create a different AWS key, verify it with
+   `deploy credentials verify-rotation`, and deactivate/delete the old key in
+   AWS.
 
-Read [references/deferred-production/release-manifest.md](references/deferred-production/release-manifest.md) when
-editing a manifest, selecting targets, or preparing CI artifact paths.
+Do not offer `deploy update` as a general release updater. In this Alpha it is
+limited to the separately authenticated historical 0.1.1-to-0.1.4 repair.
 
-The deferred deployment foundation and release-input composition notes are
-[deployment-manifest.md](references/deferred-production/deployment-manifest.md)
-and
-[release-input-fragments.md](references/deferred-production/release-input-fragments.md).
-Every document in that directory is deferred until Internal Test Alpha passes.
+## Safety
 
-## Offline deployment contract (release-only)
+- EC2 is the only deployable provider in this Alpha. Lightsail catalog output
+  is discovery evidence, not deployment support.
+- Do not buy a domain, change nameservers, overwrite an occupied record, or
+  accept an external DNS provider.
+- Do not accept arbitrary remote commands, scripts, paths, or environment
+  variables.
+- Treat `destroy` as two explicit operations: infrastructure removal, then
+  volume purge with the exact reviewed volume ID.
+- Stop on account, region, tag, operation, resource identity, or DNS-value
+  mismatch.
+- Never describe a dry run, local test, catalog query, or issued-but-unconsumed
+  ticket as a completed deployment.
 
-For the durable deployment-contract foundation, use only
-`deployment-validate`, `deployment-plan`, and `deployment-status`. These commands
-are offline and do not provide `--execute`. Do not claim production transport,
-privileged migration, service mutation, provider activation, deployment, or
-X3/X4/X5 topology acceptance; all remain unimplemented.
+Release assembly/publication remains a separate workflow. It does not grant
+authority to mutate AWS resources and is not App binding evidence.

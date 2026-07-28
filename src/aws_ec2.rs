@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{ReleaseError, Result, error::io_error};
+use crate::{aws_sdk::AwsSdkExecutor, rootkey::AwsRootKey};
 use bundle::{
     BundleFacts, CrossVersionCompatibility, InstalledReceipt, ReceiptState, digest, image,
     load_bundle,
@@ -41,6 +42,12 @@ pub use workflow::{
     resume, rollback_update, status, status_with_registry, update, verify,
 };
 
+/// Default region retained for examples and legacy low-level EC2 commands.
+/// New-user deployment accepts any normalized AWS region in its manifest.
+#[allow(
+    dead_code,
+    reason = "legacy low-level commands still use the example region"
+)]
 pub(super) const REGION: &str = "ap-east-1";
 pub(super) const PROVIDER: &str = "aws";
 pub(super) const UBUNTU_OWNER: &str = "099720109477";
@@ -52,7 +59,6 @@ pub(super) const SCP: &str = "scp";
 pub(super) const SSH_KEYGEN: &str = "ssh-keygen";
 pub(super) const SSH_KEYSCAN: &str = "ssh-keyscan";
 pub(super) const CURL: &str = "curl";
-pub(super) const GETENT: &str = "getent";
 pub(super) const DOCKER: &str = "docker";
 pub(super) const DOCKER_HUB_LATEST: &str = "docker.io/dirextalk/vnet-server:latest";
 pub(super) const REMOTE_BUNDLE: &str = "/home/ubuntu/dirextalk-vnext.bundle";
@@ -174,16 +180,15 @@ impl AwsEc2Manifest {
         if self.schema_version != 1 {
             return Err(contract("EC2 schema_version must be 1"));
         }
-        if self.provider != PROVIDER || self.region != REGION {
-            return Err(contract("provider/region must be aws/ap-east-1"));
+        if self.provider != PROVIDER {
+            return Err(contract("provider must be aws"));
         }
+        aws_region(&self.region)?;
         token(&self.target, "target")?;
         domain(&self.domain)?;
-        if !matches!(self.instance_type.as_str(), "t3.small" | "t3.medium") {
-            return Err(contract("instance_type must be t3.small or t3.medium"));
-        }
-        if !(30..=200).contains(&self.disk_gib) {
-            return Err(contract("disk_gib must be between 30 and 200 GiB"));
+        instance_type(&self.instance_type)?;
+        if !(30..=2048).contains(&self.disk_gib) {
+            return Err(contract("disk_gib must be between 30 and 2048 GiB"));
         }
         operator_cidr(&self.operator_ssh_cidr)?;
         digest(&self.stack_bundle_sha256, "stack bundle")?;
@@ -315,6 +320,38 @@ impl AwsExecutor for ProductionAwsExecutor {
     }
 }
 
+/// AWS command executor whose credentials are supplied only through the
+/// selected child process environment. Credential values never enter a
+/// [`FixedCommand`], plan, state record, argument vector, or diagnostic.
+///
+/// This is the compatibility transport for the existing EC2 lifecycle while
+/// its AWS calls move behind the in-process provider boundary.
+pub struct RootKeyAwsExecutor {
+    sdk: AwsSdkExecutor,
+}
+
+impl RootKeyAwsExecutor {
+    pub fn new(rootkey: &AwsRootKey) -> Result<Self> {
+        Ok(Self {
+            sdk: AwsSdkExecutor::new(rootkey)?,
+        })
+    }
+}
+
+impl AwsExecutor for RootKeyAwsExecutor {
+    fn run(&self, command: &FixedCommand) -> Result<ExecOutput> {
+        if command.program == AWS {
+            self.sdk.run(command)
+        } else {
+            run_process(
+                &command.program,
+                &command.argv.iter().map(String::as_str).collect::<Vec<_>>(),
+                Duration::from_secs(command.timeout_seconds),
+            )
+        }
+    }
+}
+
 pub trait RegistryExecutor {
     fn inspect_latest(&self) -> Result<ExecOutput>;
 }
@@ -335,6 +372,15 @@ impl RegistryExecutor for ProductionRegistryExecutor {
 }
 
 fn run_process(program: &str, argv: &[&str], timeout: Duration) -> Result<ExecOutput> {
+    run_process_inner(program, argv, timeout, None)
+}
+
+fn run_process_inner(
+    program: &str,
+    argv: &[&str],
+    timeout: Duration,
+    aws_credentials: Option<(&str, &str, Option<&str>)>,
+) -> Result<ExecOutput> {
     enum Completion {
         Status(std::process::ExitStatus),
         Timeout,
@@ -347,6 +393,18 @@ fn run_process(program: &str, argv: &[&str], timeout: Duration) -> Result<ExecOu
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some((access_key_id, secret_access_key, session_token)) = aws_credentials {
+        command
+            .env("AWS_ACCESS_KEY_ID", access_key_id)
+            .env("AWS_SECRET_ACCESS_KEY", secret_access_key)
+            .env_remove("AWS_PROFILE")
+            .env_remove("AWS_DEFAULT_PROFILE");
+        if let Some(session_token) = session_token {
+            command.env("AWS_SESSION_TOKEN", session_token);
+        } else {
+            command.env_remove("AWS_SESSION_TOKEN");
+        }
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command
@@ -553,7 +611,7 @@ pub fn plan(manifest: &AwsEc2Manifest, max_monthly_usd: Option<u32>) -> Result<E
     Ok(Ec2Plan {
         target: manifest.target.clone(),
         provider: PROVIDER.into(),
-        region: REGION.into(),
+        region: manifest.region.clone(),
         dry_run: true,
         monthly_estimate_usd: format!("{}.{:02}", estimate / 100, estimate % 100),
         max_monthly_usd,
@@ -596,10 +654,10 @@ pub(super) fn enforce_cost_guard(manifest: &AwsEc2Manifest, limit: u32) -> Resul
 fn monthly_estimate_cents(manifest: &AwsEc2Manifest) -> u64 {
     // Deliberately conservative planning ceilings, not an AWS quote: compute,
     // gp3, one public IPv4 address, and a small Route53 allowance.
-    let compute = if manifest.instance_type == "t3.small" {
-        3_600
-    } else {
-        7_200
+    let compute = match manifest.instance_type.as_str() {
+        "t3.small" => 3_600,
+        "t3.medium" => 7_200,
+        _ => 10_000,
     };
     compute + u64::from(manifest.disk_gib) * 14 + 500 + 100
 }
@@ -619,13 +677,6 @@ pub(super) fn ingress_rules(manifest: &AwsEc2Manifest) -> Vec<IngressRule> {
             to_port: 443,
             cidr: "0.0.0.0/0".into(),
             purpose: "public HTTPS".into(),
-        },
-        IngressRule {
-            protocol: "tcp".into(),
-            from_port: 9443,
-            to_port: 9445,
-            cidr: "0.0.0.0/0".into(),
-            purpose: "Agent Control native TLS".into(),
         },
         IngressRule {
             protocol: "tcp".into(),
@@ -930,12 +981,10 @@ impl Ec2State {
     }
 
     pub(super) fn verify(&self) -> Result<()> {
-        if self.schema != "dirextalk.aws-ec2-lifecycle"
-            || self.schema_version != 1
-            || self.region != REGION
-        {
+        if self.schema != "dirextalk.aws-ec2-lifecycle" || self.schema_version != 1 {
             return Err(contract("EC2 state schema or region is invalid"));
         }
+        aws_region(&self.region)?;
         let mut copy = self.clone();
         let digest = std::mem::take(&mut copy.integrity_sha256);
         if digest != hex::encode(Sha256::digest(serde_json::to_vec(&copy)?)) {
@@ -1060,13 +1109,13 @@ impl Ec2State {
 }
 
 fn validate_infrastructure_record(record: &InfrastructureRecord) -> Result<()> {
-    if !matches!(record.instance_type.as_str(), "t3.small" | "t3.medium")
-        || !(30..=200).contains(&record.disk_gib)
+    if !(30..=2048).contains(&record.disk_gib)
         || record.ubuntu_ami_owner != UBUNTU_OWNER
         || record.ubuntu_ami_pattern != UBUNTU_PATTERN
     {
         return Err(ReleaseError::StateUnsafe(PathBuf::from("EC2 state")));
     }
+    instance_type(&record.instance_type)?;
     operator_cidr(&record.operator_ssh_cidr)?;
     token(&record.key_name, "state key_name")
 }
@@ -1189,6 +1238,41 @@ fn operator_cidr(value: &str) -> Result<()> {
     address
         .parse::<Ipv4Addr>()
         .map_err(|_| contract("operator_ssh_cidr must be an IPv4 /32"))?;
+    Ok(())
+}
+
+fn aws_region(value: &str) -> Result<()> {
+    let parts = value.split('-').collect::<Vec<_>>();
+    if value.len() < 9
+        || value.len() > 32
+        || parts.len() < 3
+        || !parts
+            .last()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        || value
+            .bytes()
+            .any(|byte| !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+    {
+        return Err(contract(
+            "region must be a normalized AWS region identifier",
+        ));
+    }
+    Ok(())
+}
+
+fn instance_type(value: &str) -> Result<()> {
+    let Some((family, size)) = value.split_once('.') else {
+        return Err(contract("instance_type is invalid"));
+    };
+    if family.is_empty()
+        || size.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.')
+    {
+        return Err(contract("instance_type is invalid"));
+    }
     Ok(())
 }
 
